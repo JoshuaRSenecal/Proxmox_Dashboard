@@ -4,9 +4,9 @@ import urllib3
 urllib3.disable_warnings()
 
 # Configuration
-HOST = "192.168.1.100"  # Change this
+HOST = "192.168.1.222"  # Change this
 USER = "root@pam"        # Change this
-PASSWORD = "your_password"  # Change this
+PASSWORD = "Password1!"  # Change this
 
 class Proxmox:
     def __init__(self, host, user, password):
