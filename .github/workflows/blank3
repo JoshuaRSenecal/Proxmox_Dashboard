@@ -97,6 +97,11 @@ sub show {
             my $balloon = ($cfg->{balloon} || 0) * 1024 * 1024;
             my $maxmem = ($cfg->{memory} || 0) * 1024 * 1024;
             
+            # CPU info
+            my $cores = $cfg->{cores} || 'N/A';
+            my $sockets = $cfg->{sockets} || 'N/A';
+            my $cpu_type = $cfg->{cpu} || 'N/A';
+            
             # Total disk from config
             my $total_disk = 0;
             for my $key (sort keys %$cfg) {
@@ -159,7 +164,9 @@ sub show {
                 type => 'VM',
                 status => $vm->{status},
                 node => $n,
-                cores => $cfg->{cores} || 'N/A',
+                cores => $cores,
+                sockets => $sockets,
+                cpu_type => $cpu_type,
                 mem => fmt($balloon) . " - " . fmt($maxmem),
                 total_disk => $total_disk > 0 ? fmt($total_disk) : 'N/A',
                 total_filesystem => $total_filesystem,
@@ -177,6 +184,11 @@ sub show {
             # Memory
             my $memory = ($cfg->{memory} || 0) * 1024 * 1024;
             my $swap = ($cfg->{swap} || 0) * 1024 * 1024;
+            
+            # CPU info
+            my $cores = $cfg->{cores} || 'N/A';
+            my $sockets = 'N/A';  # Containers don't have sockets
+            my $cpu_type = 'N/A';  # Containers don't have CPU type
             
             # Total disk from rootfs
             my $total_disk = 0;
@@ -214,7 +226,9 @@ sub show {
                 type => 'CT',
                 status => $ct->{status},
                 node => $n,
-                cores => $cfg->{cores} || 'N/A',
+                cores => $cores,
+                sockets => $sockets,
+                cpu_type => $cpu_type,
                 mem => fmt($memory) . " - " . fmt($swap),
                 total_disk => $total_disk > 0 ? fmt($total_disk) : 'N/A',
                 total_filesystem => $total_filesystem,
@@ -226,20 +240,20 @@ sub show {
     
     @items = sort { $a->{id} <=> $b->{id} } @items;
     
-    print "\n" . "=" x 150 . "\n";
-    printf "%-6s %-4s %-10s %-20s %-12s %-6s %-20s %-12s %-12s %-12s %-8s\n",
-        'ID', 'Type', 'Status', 'Name', 'Node', 'Cores', 'Memory', 'Total Disk', 'Total FS', 'Free Disk', 'Free%';
-    print "-" x 150 . "\n";
+    print "\n" . "=" x 170 . "\n";
+    printf "%-6s %-4s %-10s %-20s %-12s %-6s %-8s %-15s %-20s %-12s %-12s %-12s %-8s\n",
+        'ID', 'Type', 'Status', 'Name', 'Node', 'Cores', 'Sockets', 'CPU Type', 'Memory', 'Total Disk', 'Total FS', 'Free Disk', 'Free%';
+    print "-" x 170 . "\n";
     
     for my $i (@items) {
         my $free_display = (ref $i->{free} || $i->{free} =~ /^\d/) ? sprintf("%.1f%%", $i->{free}) : $i->{free};
-        printf "%-6s %-4s %-10s %-20s %-12s %-6s %-20s %-12s %-12s %-12s %-8s\n",
+        printf "%-6s %-4s %-10s %-20s %-12s %-6s %-8s %-15s %-20s %-12s %-12s %-12s %-8s\n",
             $i->{id}, $i->{type}, $i->{status}, $i->{name}, $i->{node},
-            $i->{cores}, $i->{mem}, $i->{total_disk}, $i->{total_filesystem},
+            $i->{cores}, $i->{sockets}, $i->{cpu_type}, $i->{mem}, $i->{total_disk}, $i->{total_filesystem},
             $i->{free_disk}, $free_display;
     }
     
-    print "=" x 150 . "\n";
+    print "=" x 170 . "\n";
     return \@items;
 }
 
