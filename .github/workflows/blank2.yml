@@ -82,7 +82,6 @@ def show(px):
                         for fs in agent_data['result']:
                             mp = fs.get('mountpoint', fs.get('target', ''))
                             fs_type = fs.get('type', '')
-                            fs_name = fs.get('name', '')
                             
                             # Skip CD-ROM/ISO mounts and tmpfs/devtmpfs (RAM filesystems)
                             if fs_type in ['iso9660', 'udf', 'tmpfs', 'devtmpfs']:
@@ -94,7 +93,6 @@ def show(px):
                                 used = fs.get('used-bytes', 0)
                                 if total > 0 and used >= 0:
                                     total_fs += total
-                                    # Simple calculation: total - used = available
                                     avail_fs += (total - used)
                         
                         if total_fs > 0 and avail_fs > 0:
@@ -139,12 +137,14 @@ def show(px):
             # Disk usage - containers report this reliably when running
             disk_free = 'N/A'
             disk_free_pct = 'N/A'
+            total_filesystem = 'N/A'
             
             if ct['status'] == 'running':
                 disk_used = stat.get('disk', 0)
                 disk_max = stat.get('maxdisk', 0)
                 if disk_max > 0:
                     free_bytes = disk_max - disk_used
+                    total_filesystem = fmt(disk_max)
                     disk_free = fmt(free_bytes)
                     disk_free_pct = (free_bytes / disk_max * 100)
             
@@ -154,19 +154,20 @@ def show(px):
                 'cores': cfg.get('cores', 'N/A'),
                 'mem': f"{fmt(memory)} - {fmt(swap)}",
                 'total_disk': fmt(total_disk) if total_disk > 0 else 'N/A',
+                'total_filesystem': total_filesystem,
                 'free_disk': disk_free,
                 'free': disk_free_pct
             })
     
     items.sort(key=lambda x: x['id'])
     
-    print("\n" + "="*130)
-    print(f"{'ID':<6} {'Type':<4} {'Status':<10} {'Name':<20} {'Node':<12} {'Cores':<6} {'Memory':<20} {'Total Disk':<12} {'Free Disk':<12} {'Free%':<8}")
-    print("-"*130)
+    print("\n" + "="*150)
+    print(f"{'ID':<6} {'Type':<4} {'Status':<10} {'Name':<20} {'Node':<12} {'Cores':<6} {'Memory':<20} {'Total Disk':<12} {'Total FS':<12} {'Free Disk':<12} {'Free%':<8}")
+    print("-"*150)
     for i in items:
         free_display = f"{i['free']:.1f}%" if isinstance(i['free'], (int, float)) else i['free']
-        print(f"{i['id']:<6} {i['type']:<4} {i['status']:<10} {i['name']:<20} {i['node']:<12} {i['cores']:<6} {i['mem']:<20} {i['total_disk']:<12} {i['free_disk']:<12} {free_display:<8}")
-    print("="*130)
+        print(f"{i['id']:<6} {i['type']:<4} {i['status']:<10} {i['name']:<20} {i['node']:<12} {i['cores']:<6} {i['mem']:<20} {i['total_disk']:<12} {i['total_filesystem']:<12} {i['free_disk']:<12} {free_display:<8}")
+    print("="*150)
     return items
 
 def menu(px, items):
