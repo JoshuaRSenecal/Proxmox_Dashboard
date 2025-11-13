@@ -44,18 +44,26 @@ def show(px):
             balloon = int(cfg.get('balloon', 0)) * 1024 * 1024 if cfg.get('balloon') else 0
             maxmem = int(cfg.get('memory', 0)) * 1024 * 1024 if cfg.get('memory') else 0
             
-            # Get total disk size from config
+            # Get total disk size from config - look for the primary disk
             total_disk = 0
-            for key, value in cfg.items():
-                if key.startswith(('scsi', 'sata', 'ide', 'virtio')):
-                    if 'size=' in str(value):
-                        size_str = str(value).split('size=')[1].split(',')[0].strip()
-                        if size_str.endswith('G'):
-                            total_disk += float(size_str[:-1]) * 1024 * 1024 * 1024
-                        elif size_str.endswith('M'):
-                            total_disk += float(size_str[:-1]) * 1024 * 1024
-                        elif size_str.endswith('T'):
-                            total_disk += float(size_str[:-1]) * 1024 * 1024 * 1024 * 1024
+            for key in sorted(cfg.keys()):
+                if key.startswith(('scsi0', 'sata0', 'ide0', 'virtio0')):
+                    value = str(cfg[key])
+                    # Parse the disk config string
+                    if ':' in value:
+                        parts = value.split(',')
+                        for part in parts:
+                            if 'size=' in part:
+                                size_str = part.split('size=')[1].strip()
+                                if size_str.endswith('G'):
+                                    total_disk = float(size_str[:-1]) * 1024 * 1024 * 1024
+                                elif size_str.endswith('M'):
+                                    total_disk = float(size_str[:-1]) * 1024 * 1024
+                                elif size_str.endswith('T'):
+                                    total_disk = float(size_str[:-1]) * 1024 * 1024 * 1024 * 1024
+                                break
+                    if total_disk > 0:
+                        break
             
             # Disk usage - VMs need agent for accurate disk usage
             disk_free = 'N/A'
@@ -67,13 +75,17 @@ def show(px):
                     agent_data = px.get(f'/nodes/{n}/qemu/{vm["vmid"]}/agent/get-fsinfo')
                     if agent_data and 'result' in agent_data:
                         for fs in agent_data['result']:
-                            if fs.get('mountpoint') == '/' or fs.get('target') == '/':
+                            mp = fs.get('mountpoint', fs.get('target', ''))
+                            if mp == '/':
                                 total = fs.get('total-bytes', 0)
                                 used = fs.get('used-bytes', 0)
                                 if total > 0:
                                     free_bytes = total - used
                                     disk_free = fmt(free_bytes)
                                     disk_free_pct = (free_bytes / total * 100)
+                                    # Also use the real total from filesystem if available
+                                    if total_disk == 0:
+                                        total_disk = total
                                 break
                 except:
                     pass
