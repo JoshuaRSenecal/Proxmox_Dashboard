@@ -44,29 +44,39 @@ def show(px):
             balloon = int(cfg.get('balloon', 0)) * 1024 * 1024 if cfg.get('balloon') else 0
             maxmem = int(cfg.get('memory', 0)) * 1024 * 1024 if cfg.get('memory') else 0
             
-            # Disk usage - get from RRD data for actual filesystem usage
-            disk_total = 0
+            # Disk usage - VMs need agent for accurate disk usage
             disk_used = 0
-            disk_free_pct = 0
+            disk_total = 0
+            disk_free_pct = 'N/A'
             
-            # Parse disk configurations to get sizes
-            for key, value in cfg.items():
-                if key.startswith(('scsi', 'sata', 'ide', 'virtio')):
-                    # Format: storage:size or storage:vmid/disk.qcow2,size=32G
-                    if 'size=' in str(value):
-                        size_str = str(value).split('size=')[1].split(',')[0].strip()
-                        if size_str.endswith('G'):
-                            disk_total += float(size_str[:-1]) * 1024 * 1024 * 1024
-                        elif size_str.endswith('M'):
-                            disk_total += float(size_str[:-1]) * 1024 * 1024
+            if vm['status'] == 'running':
+                # Try to get filesystem info from agent
+                try:
+                    agent_data = px.get(f'/nodes/{n}/qemu/{vm["vmid"]}/agent/get-fsinfo')
+                    if agent_data and 'result' in agent_data:
+                        for fs in agent_data['result']:
+                            if fs.get('mountpoint') == '/' or fs.get('target') == '/':
+                                total = fs.get('total-bytes', 0)
+                                used = fs.get('used-bytes', 0)
+                                if total > 0:
+                                    disk_total = total
+                                    disk_used = used
+                                    disk_free_pct = ((total - used) / total * 100)
+                                break
+                except:
+                    # Agent not available, show N/A
+                    pass
             
-            # Get actual disk usage if VM is running
-            if vm['status'] == 'running' and 'disk' in stat:
-                disk_used = stat.get('disk', 0)
-                disk_total = stat.get('maxdisk', disk_total) if stat.get('maxdisk', 0) > 0 else disk_total
-            
-            if disk_total > 0:
-                disk_free_pct = ((disk_total - disk_used) / disk_total * 100)
+            # Fallback to disk allocation size from config if no agent data
+            if disk_total == 0:
+                for key, value in cfg.items():
+                    if key.startswith(('scsi', 'sata', 'ide', 'virtio')):
+                        if 'size=' in str(value):
+                            size_str = str(value).split('size=')[1].split(',')[0].strip()
+                            if size_str.endswith('G'):
+                                disk_total += float(size_str[:-1]) * 1024 * 1024 * 1024
+                            elif size_str.endswith('M'):
+                                disk_total += float(size_str[:-1]) * 1024 * 1024
             
             items.append({
                 'id': vm['vmid'], 'name': vm['name'], 'type': 'VM',
@@ -74,7 +84,7 @@ def show(px):
                 'cores': cfg.get('cores', 'N/A'),
                 'mem': f"{fmt(balloon)} - {fmt(maxmem)}",
                 'disk': fmt(disk_total),
-                'free': disk_free_pct if vm['status'] == 'running' else 'N/A'
+                'free': disk_free_pct
             })
         
         # Containers
