@@ -4,9 +4,9 @@ import urllib3
 urllib3.disable_warnings()
 
 # Configuration
-HOST = "192.168.1.222"  # Change this
+HOST = "192.168.1.100"  # Change this
 USER = "root@pam"        # Change this
-PASSWORD = "Password1!"  # Change this
+PASSWORD = "your_password"  # Change this
 
 class Proxmox:
     def __init__(self, host, user, password):
@@ -74,19 +74,30 @@ def show(px):
                 try:
                     agent_data = px.get(f'/nodes/{n}/qemu/{vm["vmid"]}/agent/get-fsinfo')
                     if agent_data and 'result' in agent_data:
+                        total_fs = 0
+                        used_fs = 0
+                        
+                        # Sum up all real filesystems (skip ISO/cdrom)
                         for fs in agent_data['result']:
                             mp = fs.get('mountpoint', fs.get('target', ''))
-                            if mp == '/':
+                            fs_type = fs.get('type', '')
+                            
+                            # Skip CD-ROM/ISO mounts
+                            if fs_type in ['iso9660', 'udf']:
+                                continue
+                            
+                            # Include root and boot partitions
+                            if mp in ['/', '/boot', '/home', '/var', '/tmp', '/usr']:
                                 total = fs.get('total-bytes', 0)
                                 used = fs.get('used-bytes', 0)
-                                if total > 0:
-                                    free_bytes = total - used
-                                    disk_free = fmt(free_bytes)
-                                    disk_free_pct = (free_bytes / total * 100)
-                                    # Also use the real total from filesystem if available
-                                    if total_disk == 0:
-                                        total_disk = total
-                                break
+                                if total > 0 and used >= 0:
+                                    total_fs += total
+                                    used_fs += used
+                        
+                        if total_fs > 0:
+                            free_bytes = total_fs - used_fs
+                            disk_free = fmt(free_bytes)
+                            disk_free_pct = (free_bytes / total_fs * 100)
                 except:
                     pass
             
