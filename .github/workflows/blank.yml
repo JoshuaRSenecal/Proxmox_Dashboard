@@ -1,1 +1,124 @@
+#!/usr/bin/env python3
+import requests
+import urllib3
+urllib3.disable_warnings()
 
+# Configuration
+HOST = "192.168.1.222"  # Change this
+USER = "root@pam"        # Change this
+PASSWORD = "Password1!"  # Change this
+
+class Proxmox:
+    def __init__(self, host, user, password):
+        self.base = f"https://{host}:8006/api2/json"
+        r = requests.post(f"{self.base}/access/ticket", 
+                         data={'username': user, 'password': password}, verify=False)
+        d = r.json()['data']
+        self.cookies = {'PVEAuthCookie': d['ticket']}
+        self.headers = {'CSRFPreventionToken': d['CSRFPreventionToken']}
+    
+    def get(self, path):
+        return requests.get(f"{self.base}{path}", cookies=self.cookies, verify=False).json()['data']
+    
+    def post(self, path):
+        return requests.post(f"{self.base}{path}", headers=self.headers, cookies=self.cookies, verify=False)
+
+def fmt(b):
+    if not b or b == 'N/A': return 'N/A'
+    b = float(b)
+    for u in ['B','KB','MB','GB','TB']:
+        if b < 1024: return f"{b:.1f}{u}"
+        b /= 1024
+
+def show(px):
+    items = []
+    for node in px.get('/nodes'):
+        n = node['node']
+        
+        # VMs
+        for vm in px.get(f'/nodes/{n}/qemu'):
+            cfg = px.get(f'/nodes/{n}/qemu/{vm["vmid"]}/config')
+            stat = px.get(f'/nodes/{n}/qemu/{vm["vmid"]}/status/current')
+            
+            # Memory: balloon (min) to maxmem (max) - both in bytes, need conversion
+            balloon = int(cfg.get('balloon', 0)) * 1024 * 1024 if cfg.get('balloon') else 0
+            maxmem = int(cfg.get('memory', 0)) * 1024 * 1024 if cfg.get('memory') else 0
+            
+            # Disk usage from status
+            disk_used = stat.get('disk', 0)
+            disk_max = stat.get('maxdisk', 0)
+            disk_free_pct = ((disk_max - disk_used) / disk_max * 100) if disk_max > 0 else 0
+            
+            items.append({
+                'id': vm['vmid'], 'name': vm['name'], 'type': 'VM',
+                'status': vm['status'], 'node': n,
+                'cores': cfg.get('cores', 'N/A'),
+                'mem': f"{fmt(balloon)} - {fmt(maxmem)}",
+                'disk': fmt(disk_max),
+                'free': disk_free_pct
+            })
+        
+        # Containers
+        for ct in px.get(f'/nodes/{n}/lxc'):
+            cfg = px.get(f'/nodes/{n}/lxc/{ct["vmid"]}/config')
+            stat = px.get(f'/nodes/{n}/lxc/{ct["vmid"]}/status/current')
+            
+            # Memory and swap - already in bytes
+            memory = int(cfg.get('memory', 0)) * 1024 * 1024 if cfg.get('memory') else 0
+            swap = int(cfg.get('swap', 0)) * 1024 * 1024 if cfg.get('swap') else 0
+            
+            # Disk usage from status
+            disk_used = stat.get('disk', 0)
+            disk_max = stat.get('maxdisk', 0)
+            disk_free_pct = ((disk_max - disk_used) / disk_max * 100) if disk_max > 0 else 0
+            
+            items.append({
+                'id': ct['vmid'], 'name': ct['name'], 'type': 'CT',
+                'status': ct['status'], 'node': n,
+                'cores': cfg.get('cores', 'N/A'),
+                'mem': f"{fmt(memory)} - {fmt(swap)}",
+                'disk': fmt(disk_max),
+                'free': disk_free_pct
+            })
+    
+    items.sort(key=lambda x: x['id'])
+    
+    print("\n" + "="*110)
+    print(f"{'ID':<6} {'Type':<4} {'Status':<10} {'Name':<20} {'Node':<12} {'Cores':<6} {'Memory':<20} {'Disk':<10} {'Free%':<6}")
+    print("-"*110)
+    for i in items:
+        print(f"{i['id']:<6} {i['type']:<4} {i['status']:<10} {i['name']:<20} {i['node']:<12} {i['cores']:<6} {i['mem']:<20} {i['disk']:<10} {i['free']:<5.1f}%")
+    print("="*110)
+    return items
+
+def menu(px, items):
+    print("\n1. Start VM/CT  2. Stop VM/CT  3. Start all stopped  4. Refresh  5. Exit")
+    c = input("Choice: ").strip()
+    
+    if c == '1':
+        vid = input("ID: ").strip()
+        i = next((x for x in items if str(x['id'])==vid), None)
+        if i:
+            px.post(f"/nodes/{i['node']}/{'qemu' if i['type']=='VM' else 'lxc'}/{i['id']}/status/start")
+            print(f"✓ Started {i['type']} {i['id']}")
+    
+    elif c == '2':
+        vid = input("ID: ").strip()
+        i = next((x for x in items if str(x['id'])==vid), None)
+        if i:
+            px.post(f"/nodes/{i['node']}/{'qemu' if i['type']=='VM' else 'lxc'}/{i['id']}/status/stop")
+            print(f"✓ Stopped {i['type']} {i['id']}")
+    
+    elif c == '3':
+        for i in [x for x in items if x['status']!='running']:
+            px.post(f"/nodes/{i['node']}/{'qemu' if i['type']=='VM' else 'lxc'}/{i['id']}/status/start")
+            print(f"✓ Started {i['type']} {i['id']}")
+    
+    elif c == '5':
+        return False
+    
+    return True
+
+px = Proxmox(HOST, USER, PASSWORD)
+while True:
+    if not menu(px, show(px)): break
