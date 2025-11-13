@@ -2,6 +2,7 @@
 import requests
 import urllib3
 import sys
+import getpass
 urllib3.disable_warnings()
 
 # Get credentials from command line or prompt
@@ -14,7 +15,7 @@ else:
     print("-" * 50)
     HOST = input("Proxmox host (e.g., 192.168.1.100): ").strip()
     USER = input("Username (e.g., root@pam): ").strip()
-    PASSWORD = input("Password: ").strip()
+    PASSWORD = getpass.getpass("Password: ")
 
 if not HOST or not USER or not PASSWORD:
     print("Error: Host, username, and password are required.")
@@ -23,11 +24,23 @@ if not HOST or not USER or not PASSWORD:
 class Proxmox:
     def __init__(self, host, user, password):
         self.base = f"https://{host}:8006/api2/json"
+        print(f"Attempting to connect to: {self.base}")
+        print(f"Username: {user}")
         r = requests.post(f"{self.base}/access/ticket", 
-                         data={'username': user, 'password': password}, verify=False)
+                         data={'username': user, 'password': password}, 
+                         verify=False)
+        if r.status_code != 200:
+            print(f"Authentication failed: {r.status_code}")
+            print(f"Response: {r.text}")
+            print("\nPlease verify:")
+            print("1. Username includes realm (e.g., root@pam)")
+            print("2. Password is correct")
+            print("3. Host is accessible on port 8006")
+            sys.exit(1)
         d = r.json()['data']
         self.cookies = {'PVEAuthCookie': d['ticket']}
         self.headers = {'CSRFPreventionToken': d['CSRFPreventionToken']}
+        print("✓ Authentication successful!")
     
     def get(self, path):
         return requests.get(f"{self.base}{path}", cookies=self.cookies, verify=False).json()['data']
@@ -225,5 +238,12 @@ def menu(px, items):
     return True
 
 px = Proxmox(HOST, USER, PASSWORD)
-while True:
-    if not menu(px, show(px)): break
+print("\nConnecting to Proxmox...")
+try:
+    while True:
+        if not menu(px, show(px)): break
+except KeyboardInterrupt:
+    print("\n\nExiting...")
+except Exception as e:
+    print(f"\nError: {e}")
+    sys.exit(1)
