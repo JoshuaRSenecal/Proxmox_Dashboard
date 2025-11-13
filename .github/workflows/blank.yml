@@ -44,6 +44,11 @@ def show(px):
             balloon = int(cfg.get('balloon', 0)) * 1024 * 1024 if cfg.get('balloon') else 0
             maxmem = int(cfg.get('memory', 0)) * 1024 * 1024 if cfg.get('memory') else 0
             
+            # CPU info
+            cores = cfg.get('cores', 'N/A')
+            sockets = cfg.get('sockets', 'N/A')
+            cpu_type = cfg.get('cpu', 'N/A')
+            
             # Get total disk size from config - look for the primary disk
             total_disk = 0
             for key in sorted(cfg.keys()):
@@ -68,6 +73,7 @@ def show(px):
             # Disk usage - VMs need agent for accurate disk usage
             disk_free = 'N/A'
             disk_free_pct = 'N/A'
+            total_filesystem = 'N/A'
             
             if vm['status'] == 'running':
                 # Try to get filesystem info from agent
@@ -75,38 +81,41 @@ def show(px):
                     agent_data = px.get(f'/nodes/{n}/qemu/{vm["vmid"]}/agent/get-fsinfo')
                     if agent_data and 'result' in agent_data:
                         total_fs = 0
-                        used_fs = 0
+                        avail_fs = 0
                         
-                        # Sum up all real filesystems (skip ISO/cdrom)
+                        # Sum up all real filesystems (skip ISO/cdrom and tmpfs)
                         for fs in agent_data['result']:
                             mp = fs.get('mountpoint', fs.get('target', ''))
                             fs_type = fs.get('type', '')
                             
-                            # Skip CD-ROM/ISO mounts
-                            if fs_type in ['iso9660', 'udf']:
+                            # Skip CD-ROM/ISO mounts and tmpfs/devtmpfs (RAM filesystems)
+                            if fs_type in ['iso9660', 'udf', 'tmpfs', 'devtmpfs']:
                                 continue
                             
-                            # Include root and boot partitions
+                            # Include only real disk-based filesystems
                             if mp in ['/', '/boot', '/home', '/var', '/tmp', '/usr']:
                                 total = fs.get('total-bytes', 0)
                                 used = fs.get('used-bytes', 0)
                                 if total > 0 and used >= 0:
                                     total_fs += total
-                                    used_fs += used
+                                    avail_fs += (total - used)
                         
-                        if total_fs > 0:
-                            free_bytes = total_fs - used_fs
-                            disk_free = fmt(free_bytes)
-                            disk_free_pct = (free_bytes / total_fs * 100)
+                        if total_fs > 0 and avail_fs > 0:
+                            total_filesystem = fmt(total_fs)
+                            disk_free = fmt(avail_fs)
+                            disk_free_pct = (avail_fs / total_fs * 100)
                 except:
                     pass
             
             items.append({
                 'id': vm['vmid'], 'name': vm['name'], 'type': 'VM',
                 'status': vm['status'], 'node': n,
-                'cores': cfg.get('cores', 'N/A'),
+                'cores': cores,
+                'sockets': sockets,
+                'cpu_type': cpu_type,
                 'mem': f"{fmt(balloon)} - {fmt(maxmem)}",
                 'total_disk': fmt(total_disk) if total_disk > 0 else 'N/A',
+                'total_filesystem': total_filesystem,
                 'free_disk': disk_free,
                 'free': disk_free_pct
             })
@@ -119,6 +128,11 @@ def show(px):
             # Memory and swap - already in bytes
             memory = int(cfg.get('memory', 0)) * 1024 * 1024 if cfg.get('memory') else 0
             swap = int(cfg.get('swap', 0)) * 1024 * 1024 if cfg.get('swap') else 0
+            
+            # CPU info
+            cores = cfg.get('cores', 'N/A')
+            sockets = 'N/A'  # Containers don't have sockets
+            cpu_type = 'N/A'  # Containers don't have CPU type
             
             # Get total disk from rootfs config
             total_disk = 0
@@ -135,34 +149,39 @@ def show(px):
             # Disk usage - containers report this reliably when running
             disk_free = 'N/A'
             disk_free_pct = 'N/A'
+            total_filesystem = 'N/A'
             
             if ct['status'] == 'running':
                 disk_used = stat.get('disk', 0)
                 disk_max = stat.get('maxdisk', 0)
                 if disk_max > 0:
                     free_bytes = disk_max - disk_used
+                    total_filesystem = fmt(disk_max)
                     disk_free = fmt(free_bytes)
                     disk_free_pct = (free_bytes / disk_max * 100)
             
             items.append({
                 'id': ct['vmid'], 'name': ct['name'], 'type': 'CT',
                 'status': ct['status'], 'node': n,
-                'cores': cfg.get('cores', 'N/A'),
+                'cores': cores,
+                'sockets': sockets,
+                'cpu_type': cpu_type,
                 'mem': f"{fmt(memory)} - {fmt(swap)}",
                 'total_disk': fmt(total_disk) if total_disk > 0 else 'N/A',
+                'total_filesystem': total_filesystem,
                 'free_disk': disk_free,
                 'free': disk_free_pct
             })
     
     items.sort(key=lambda x: x['id'])
     
-    print("\n" + "="*130)
-    print(f"{'ID':<6} {'Type':<4} {'Status':<10} {'Name':<20} {'Node':<12} {'Cores':<6} {'Memory':<20} {'Total Disk':<12} {'Free Disk':<12} {'Free%':<8}")
-    print("-"*130)
+    print("\n" + "="*170)
+    print(f"{'ID':<6} {'Type':<4} {'Status':<10} {'Name':<20} {'Node':<12} {'Cores':<6} {'Sockets':<8} {'CPU Type':<15} {'Memory':<20} {'Total Disk':<12} {'Total FS':<12} {'Free Disk':<12} {'Free%':<8}")
+    print("-"*170)
     for i in items:
         free_display = f"{i['free']:.1f}%" if isinstance(i['free'], (int, float)) else i['free']
-        print(f"{i['id']:<6} {i['type']:<4} {i['status']:<10} {i['name']:<20} {i['node']:<12} {i['cores']:<6} {i['mem']:<20} {i['total_disk']:<12} {i['free_disk']:<12} {free_display:<8}")
-    print("="*130)
+        print(f"{i['id']:<6} {i['type']:<4} {i['status']:<10} {i['name']:<20} {i['node']:<12} {i['cores']:<6} {i['sockets']:<8} {i['cpu_type']:<15} {i['mem']:<20} {i['total_disk']:<12} {i['total_filesystem']:<12} {i['free_disk']:<12} {free_display:<8}")
+    print("="*170)
     return items
 
 def menu(px, items):
