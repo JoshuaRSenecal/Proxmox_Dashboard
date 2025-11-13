@@ -1,1 +1,335 @@
+#!/usr/bin/env perl
+use strict;
+use warnings;
+use LWP::UserAgent;
+use JSON;
+use HTTP::Request;
+use Term::ReadKey;
 
+# Get credentials from command line or prompt
+my ($HOST, $USER, $PASSWORD);
+
+if (@ARGV == 3) {
+    ($HOST, $USER, $PASSWORD) = @ARGV;
+} else {
+    print "Proxmox VM/Container Dashboard\n";
+    print "-" x 50 . "\n";
+    print "Proxmox host (e.g., 192.168.1.100): ";
+    $HOST = <STDIN>;
+    chomp $HOST;
+    
+    print "Username (e.g., root\@pam): ";
+    $USER = <STDIN>;
+    chomp $USER;
+    
+    print "Password: ";
+    ReadMode('noecho');
+    $PASSWORD = <STDIN>;
+    ReadMode('restore');
+    chomp $PASSWORD;
+    print "\n";
+}
+
+unless ($HOST && $USER && $PASSWORD) {
+    die "Error: Host, username, and password are required.\n";
+}
+
+# Proxmox API Class
+package Proxmox {
+    sub new {
+        my ($class, $host, $user, $password) = @_;
+        my $self = {
+            base => "https://$host:8006/api2/json",
+            ua => LWP::UserAgent->new(ssl_opts => { verify_hostname => 0, SSL_verify_mode => 0 }),
+            cookies => {},
+            headers => {}
+        };
+        bless $self, $class;
+        $self->authenticate($user, $password);
+        return $self;
+    }
+    
+    sub authenticate {
+        my ($self, $user, $password) = @_;
+        my $url = "$self->{base}/access/ticket";
+        my $response = $self->{ua}->post($url, {
+            username => $user,
+            password => $password
+        });
+        die "Auth failed: " . $response->status_line unless $response->is_success;
+        
+        my $json = JSON->new;
+        my $data = $json->decode($response->content)->{data};
+        $self->{cookies} = { PVEAuthCookie => $data->{ticket} };
+        $self->{headers} = { CSRFPreventionToken => $data->{CSRFPreventionToken} };
+    }
+    
+    sub get {
+        my ($self, $path) = @_;
+        my $url = "$self->{base}$path";
+        my $req = HTTP::Request->new(GET => $url);
+        $req->header('Cookie' => "PVEAuthCookie=$self->{cookies}{PVEAuthCookie}");
+        my $response = $self->{ua}->request($req);
+        die "GET failed: " . $response->status_line unless $response->is_success;
+        my $json = JSON->new;
+        return $json->decode($response->content)->{data};
+    }
+    
+    sub post {
+        my ($self, $path) = @_;
+        my $url = "$self->{base}$path";
+        my $req = HTTP::Request->new(POST => $url);
+        $req->header('Cookie' => "PVEAuthCookie=$self->{cookies}{PVEAuthCookie}");
+        $req->header('CSRFPreventionToken' => $self->{headers}{CSRFPreventionToken});
+        my $response = $self->{ua}->request($req);
+        die "POST failed: " . $response->status_line unless $response->is_success;
+        return $response;
+    }
+}
+
+package main;
+
+# Format bytes to human readable
+sub fmt {
+    my ($b) = @_;
+    return 'N/A' unless defined $b && $b ne 'N/A';
+    $b = 0 + $b;  # Convert to number
+    for my $u ('B', 'KB', 'MB', 'GB', 'TB') {
+        return sprintf("%.1f%s", $b, $u) if $b < 1024;
+        $b /= 1024;
+    }
+    return sprintf("%.1fPB", $b);
+}
+
+# Show dashboard
+sub show {
+    my ($px) = @_;
+    my @items;
+    
+    my $nodes = $px->get('/nodes');
+    
+    for my $node (@$nodes) {
+        my $n = $node->{node};
+        
+        # VMs
+        my $vms = $px->get("/nodes/$n/qemu");
+        for my $vm (@$vms) {
+            my $cfg = $px->get("/nodes/$n/qemu/$vm->{vmid}/config");
+            my $stat = $px->get("/nodes/$n/qemu/$vm->{vmid}/status/current");
+            
+            # Memory
+            my $balloon = ($cfg->{balloon} || 0) * 1024 * 1024;
+            my $maxmem = ($cfg->{memory} || 0) * 1024 * 1024;
+            
+            # CPU info
+            my $cores = $cfg->{cores} || 'N/A';
+            my $sockets = $cfg->{sockets} || 'N/A';
+            my $cpu_type = $cfg->{cpu} || 'N/A';
+            
+            # Total disk from config
+            my $total_disk = 0;
+            for my $key (sort keys %$cfg) {
+                if ($key =~ /^(scsi0|sata0|ide0|virtio0)$/) {
+                    my $value = $cfg->{$key};
+                    if ($value =~ /size=(\d+\.?\d*)([GMT])/) {
+                        my ($size, $unit) = ($1, $2);
+                        if ($unit eq 'G') {
+                            $total_disk = $size * 1024 * 1024 * 1024;
+                        } elsif ($unit eq 'M') {
+                            $total_disk = $size * 1024 * 1024;
+                        } elsif ($unit eq 'T') {
+                            $total_disk = $size * 1024 * 1024 * 1024 * 1024;
+                        }
+                        last if $total_disk > 0;
+                    }
+                }
+            }
+            
+            # Disk usage from agent
+            my $disk_free = 'N/A';
+            my $disk_free_pct = 'N/A';
+            my $total_filesystem = 'N/A';
+            
+            if ($vm->{status} eq 'running') {
+                eval {
+                    my $agent_data = $px->get("/nodes/$n/qemu/$vm->{vmid}/agent/get-fsinfo");
+                    if ($agent_data && ref $agent_data->{result} eq 'ARRAY') {
+                        my $total_fs = 0;
+                        my $avail_fs = 0;
+                        
+                        for my $fs (@{$agent_data->{result}}) {
+                            my $mp = $fs->{mountpoint} || $fs->{target} || '';
+                            my $fs_type = $fs->{type} || '';
+                            
+                            next if $fs_type =~ /^(iso9660|udf|tmpfs|devtmpfs)$/;
+                            
+                            if ($mp =~ /^(\/$|\/boot$|\/home$|\/var$|\/tmp$|\/usr$)/) {
+                                my $total = $fs->{'total-bytes'} || 0;
+                                my $used = $fs->{'used-bytes'} || 0;
+                                if ($total > 0 && $used >= 0) {
+                                    $total_fs += $total;
+                                    $avail_fs += ($total - $used);
+                                }
+                            }
+                        }
+                        
+                        if ($total_fs > 0 && $avail_fs > 0) {
+                            $total_filesystem = fmt($total_fs);
+                            $disk_free = fmt($avail_fs);
+                            $disk_free_pct = ($avail_fs / $total_fs * 100);
+                        }
+                    }
+                };
+            }
+            
+            push @items, {
+                id => $vm->{vmid},
+                name => $vm->{name},
+                type => 'VM',
+                status => $vm->{status},
+                node => $n,
+                cores => $cores,
+                sockets => $sockets,
+                cpu_type => $cpu_type,
+                mem => fmt($balloon) . " - " . fmt($maxmem),
+                total_disk => $total_disk > 0 ? fmt($total_disk) : 'N/A',
+                total_filesystem => $total_filesystem,
+                free_disk => $disk_free,
+                free => $disk_free_pct
+            };
+        }
+        
+        # Containers
+        my $cts = $px->get("/nodes/$n/lxc");
+        for my $ct (@$cts) {
+            my $cfg = $px->get("/nodes/$n/lxc/$ct->{vmid}/config");
+            my $stat = $px->get("/nodes/$n/lxc/$ct->{vmid}/status/current");
+            
+            # Memory
+            my $memory = ($cfg->{memory} || 0) * 1024 * 1024;
+            my $swap = ($cfg->{swap} || 0) * 1024 * 1024;
+            
+            # CPU info
+            my $cores = $cfg->{cores} || 'N/A';
+            my $sockets = 'N/A';  # Containers don't have sockets
+            my $cpu_type = 'N/A';  # Containers don't have CPU type
+            
+            # Total disk from rootfs
+            my $total_disk = 0;
+            my $rootfs = $cfg->{rootfs} || '';
+            if ($rootfs =~ /size=(\d+\.?\d*)([GMT])/) {
+                my ($size, $unit) = ($1, $2);
+                if ($unit eq 'G') {
+                    $total_disk = $size * 1024 * 1024 * 1024;
+                } elsif ($unit eq 'M') {
+                    $total_disk = $size * 1024 * 1024;
+                } elsif ($unit eq 'T') {
+                    $total_disk = $size * 1024 * 1024 * 1024 * 1024;
+                }
+            }
+            
+            # Disk usage
+            my $disk_free = 'N/A';
+            my $disk_free_pct = 'N/A';
+            my $total_filesystem = 'N/A';
+            
+            if ($ct->{status} eq 'running') {
+                my $disk_used = $stat->{disk} || 0;
+                my $disk_max = $stat->{maxdisk} || 0;
+                if ($disk_max > 0) {
+                    my $free_bytes = $disk_max - $disk_used;
+                    $total_filesystem = fmt($disk_max);
+                    $disk_free = fmt($free_bytes);
+                    $disk_free_pct = ($free_bytes / $disk_max * 100);
+                }
+            }
+            
+            push @items, {
+                id => $ct->{vmid},
+                name => $ct->{name},
+                type => 'CT',
+                status => $ct->{status},
+                node => $n,
+                cores => $cores,
+                sockets => $sockets,
+                cpu_type => $cpu_type,
+                mem => fmt($memory) . " - " . fmt($swap),
+                total_disk => $total_disk > 0 ? fmt($total_disk) : 'N/A',
+                total_filesystem => $total_filesystem,
+                free_disk => $disk_free,
+                free => $disk_free_pct
+            };
+        }
+    }
+    
+    @items = sort { $a->{id} <=> $b->{id} } @items;
+    
+    print "\n" . "=" x 170 . "\n";
+    printf "%-6s %-4s %-10s %-20s %-12s %-6s %-8s %-15s %-20s %-12s %-12s %-12s %-8s\n",
+        'ID', 'Type', 'Status', 'Name', 'Node', 'Cores', 'Sockets', 'CPU Type', 'Memory', 'Total Disk', 'Total FS', 'Free Disk', 'Free%';
+    print "-" x 170 . "\n";
+    
+    for my $i (@items) {
+        my $free_display = (ref $i->{free} || $i->{free} =~ /^\d/) ? sprintf("%.1f%%", $i->{free}) : $i->{free};
+        printf "%-6s %-4s %-10s %-20s %-12s %-6s %-8s %-15s %-20s %-12s %-12s %-12s %-8s\n",
+            $i->{id}, $i->{type}, $i->{status}, $i->{name}, $i->{node},
+            $i->{cores}, $i->{sockets}, $i->{cpu_type}, $i->{mem}, $i->{total_disk}, $i->{total_filesystem},
+            $i->{free_disk}, $free_display;
+    }
+    
+    print "=" x 170 . "\n";
+    return \@items;
+}
+
+# Menu
+sub menu {
+    my ($px, $items) = @_;
+    
+    print "\n1. Start VM/CT  2. Stop VM/CT  3. Start all stopped  4. Refresh  5. Exit\n";
+    print "Choice: ";
+    my $c = <STDIN>;
+    chomp $c;
+    
+    if ($c eq '1') {
+        print "ID: ";
+        my $vid = <STDIN>;
+        chomp $vid;
+        my ($item) = grep { $_->{id} eq $vid } @$items;
+        if ($item) {
+            my $type = $item->{type} eq 'VM' ? 'qemu' : 'lxc';
+            $px->post("/nodes/$item->{node}/$type/$item->{id}/status/start");
+            print "✓ Started $item->{type} $item->{id}\n";
+        }
+    }
+    elsif ($c eq '2') {
+        print "ID: ";
+        my $vid = <STDIN>;
+        chomp $vid;
+        my ($item) = grep { $_->{id} eq $vid } @$items;
+        if ($item) {
+            my $type = $item->{type} eq 'VM' ? 'qemu' : 'lxc';
+            $px->post("/nodes/$item->{node}/$type/$item->{id}/status/stop");
+            print "✓ Stopped $item->{type} $item->{id}\n";
+        }
+    }
+    elsif ($c eq '3') {
+        for my $item (grep { $_->{status} ne 'running' } @$items) {
+            my $type = $item->{type} eq 'VM' ? 'qemu' : 'lxc';
+            $px->post("/nodes/$item->{node}/$type/$item->{id}/status/start");
+            print "✓ Started $item->{type} $item->{id}\n";
+        }
+    }
+    elsif ($c eq '5') {
+        return 0;
+    }
+    
+    return 1;
+}
+
+# Main
+print "\nConnecting to Proxmox...\n";
+my $px = Proxmox->new($HOST, $USER, $PASSWORD);
+while (1) {
+    my $items = show($px);
+    last unless menu($px, $items);
+}
