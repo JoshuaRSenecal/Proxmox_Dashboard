@@ -1,0 +1,150 @@
+graph TD
+    Start([Start Perl Script]) --> UseModules[Load Modules:<br/>strict, warnings, LWP::UserAgent,<br/>JSON, HTTP::Request, Term::ReadKey]
+    
+    UseModules --> DeclareVars[Declare Variables:<br/>HOST, USER, PASSWORD]
+    
+    DeclareVars --> CheckArgs{@ARGV == 3?<br/>Command Line Args?}
+    
+    CheckArgs -->|Yes| AssignArgs[Assign from @ARGV]
+    CheckArgs -->|No| PromptUser[Prompt User:<br/>- Host<br/>- Username<br/>- Password with ReadMode noecho]
+    
+    AssignArgs --> ValidateCreds{All Variables<br/>Defined?}
+    PromptUser --> ValidateCreds
+    
+    ValidateCreds -->|No| Die1[die with Error Message]
+    ValidateCreds -->|Yes| NewProxmox[Create Proxmox Object<br/>Proxmox->new]
+    
+    NewProxmox --> InitObj[Initialize Object Hash:<br/>- base URL<br/>- LWP::UserAgent<br/>- empty cookies/headers]
+    
+    InitObj --> Bless[bless self, class]
+    Bless --> CallAuth[Call authenticate Method]
+    
+    CallAuth --> PostAuth[POST /access/ticket<br/>with username & password]
+    PostAuth --> AuthSuccess{is_success?}
+    
+    AuthSuccess -->|No| Die2[die with Status Line<br/>and Response Content]
+    AuthSuccess -->|Yes| ParseJSON[JSON->new->decode<br/>Extract data->ticket & CSRFToken]
+    
+    ParseJSON --> StoreCookies[Store in Object:<br/>cookies hash<br/>headers hash]
+    StoreCookies --> ReturnObj[Return Blessed Object]
+    
+    ReturnObj --> PackageMain[Return to package main]
+    PackageMain --> PrintConnect[Print Connecting Message]
+    
+    PrintConnect --> WhileLoop{while 1<br/>Infinite Loop}
+    
+    WhileLoop --> CallShow[Call show subroutine]
+    
+    CallShow --> InitArray[Initialize @items array]
+    InitArray --> GetNodes[get /nodes]
+    GetNodes --> ForNodes[for each node]
+    
+    ForNodes --> GetVMList[get /nodes/node/qemu]
+    GetVMList --> ForVMs[for each VM]
+    
+    ForVMs --> FetchVMData[get config & status]
+    FetchVMData --> CalcMemory[Calculate Memory:<br/>balloon * 1MB<br/>maxmem * 1MB]
+    
+    CalcMemory --> ExtractCPU[Extract CPU Info:<br/>cores, sockets, cpu type]
+    ExtractCPU --> ParseDisk[Parse Disk Config:<br/>Regex match scsi0/sata0/etc<br/>Extract size with unit]
+    
+    ParseDisk --> ConvertDisk[Convert to Bytes:<br/>G->bytes, M->bytes, T->bytes]
+    ConvertDisk --> VMCheck{VM Status<br/>eq running?}
+    
+    VMCheck -->|Yes| EvalBlock[eval block<br/>try-catch]
+    VMCheck -->|No| VMSetNA[Set disk vars to N/A]
+    
+    EvalBlock --> GetFSInfo[get agent/get-fsinfo]
+    GetFSInfo --> CheckArray{ref result<br/>eq ARRAY?}
+    
+    CheckArray -->|Yes| InitFS[Initialize total_fs, avail_fs]
+    CheckArray -->|No| VMSetNA
+    
+    InitFS --> ForFS[for each filesystem]
+    ForFS --> CheckType{fs_type matches<br/>iso9660/tmpfs?}
+    
+    CheckType -->|Yes| NextFS[next - skip]
+    CheckType -->|No| CheckMP{mountpoint<br/>in list?}
+    
+    CheckMP -->|Yes| AddToTotal[Add total-bytes<br/>Add available bytes]
+    CheckMP -->|No| NextFS
+    
+    AddToTotal --> MoreFS{More<br/>filesystems?}
+    MoreFS -->|Yes| ForFS
+    MoreFS -->|No| CalcFS[Calculate:<br/>format totals<br/>calculate percentage]
+    
+    CalcFS --> PushVM[push VM hash to @items]
+    VMSetNA --> PushVM
+    
+    PushVM --> MoreVMs{More VMs?}
+    MoreVMs -->|Yes| ForVMs
+    MoreVMs -->|No| GetCTList[get /nodes/node/lxc]
+    
+    GetCTList --> ForCTs[for each container]
+    ForCTs --> FetchCTData[get config & status]
+    FetchCTData --> CalcCTMem[Calculate:<br/>memory * 1MB<br/>swap * 1MB]
+    
+    CalcCTMem --> ExtractCTCPU[Extract cores<br/>Set sockets/type to N/A]
+    ExtractCTCPU --> ParseRootFS[Parse rootfs:<br/>Regex match size=]
+    
+    ParseRootFS --> ConvertCTDisk[Convert to Bytes]
+    ConvertCTDisk --> CTCheck{CT Status<br/>eq running?}
+    
+    CTCheck -->|Yes| GetCTStatus[Get disk/maxdisk<br/>from status]
+    CTCheck -->|No| CTSetNA[Set disk vars to N/A]
+    
+    GetCTStatus --> CalcCTDisk[Calculate free bytes<br/>and percentage]
+    CalcCTDisk --> PushCT[push CT hash to @items]
+    CTSetNA --> PushCT
+    
+    PushCT --> MoreCTs{More<br/>containers?}
+    MoreCTs -->|Yes| ForCTs
+    MoreCTs -->|No| CheckNodes{More<br/>nodes?}
+    
+    CheckNodes -->|Yes| ForNodes
+    CheckNodes -->|No| SortArray[sort @items by ID<br/>using spaceship operator]
+    
+    SortArray --> PrintHeader[print header with printf]
+    PrintHeader --> ForItems[for each item in @items]
+    
+    ForItems --> FormatFree[Format free %:<br/>Check if numeric<br/>sprintf or N/A]
+    FormatFree --> PrintRow[printf row with all fields]
+    
+    PrintRow --> MoreItems{More<br/>items?}
+    MoreItems -->|Yes| ForItems
+    MoreItems -->|No| PrintFooter[print footer separator]
+    
+    PrintFooter --> ReturnRef[return \@items<br/>array reference]
+    
+    ReturnRef --> CallMenu[Call menu subroutine]
+    
+    CallMenu --> DisplayMenu[Print menu options]
+    DisplayMenu --> ReadChoice[Read from STDIN<br/>chomp input]
+    
+    ReadChoice --> MenuChoice{Which<br/>choice?}
+    
+    MenuChoice -->|1| StartOpt[Read ID<br/>grep to find item<br/>POST start]
+    MenuChoice -->|2| StopOpt[Read ID<br/>grep to find item<br/>POST stop]
+    MenuChoice -->|3| StartAllOpt[grep stopped items<br/>POST start for each]
+    MenuChoice -->|4| RefreshOpt[Return 1 to continue]
+    MenuChoice -->|5| ExitOpt[Return 0 to exit]
+    
+    StartOpt --> Return1[return 1]
+    StopOpt --> Return1
+    StartAllOpt --> Return1
+    RefreshOpt --> Return1
+    
+    Return1 --> CheckReturn{unless<br/>return value}
+    ExitOpt --> CheckReturn
+    
+    CheckReturn -->|0| End([Program Ends])
+    CheckReturn -->|1| WhileLoop
+    
+    style Start fill:#90EE90
+    style End fill:#FFB6C1
+    style Die1 fill:#FF6B6B
+    style Die2 fill:#FF6B6B
+    style PostAuth fill:#87CEEB
+    style GetFSInfo fill:#DDA0DD
+    style DisplayMenu fill:#F0E68C
+    style Bless fill:#FFD700
