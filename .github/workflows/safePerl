@@ -56,7 +56,11 @@ package Proxmox {
             username => $user,
             password => $password
         });
-        die "Auth failed: " . $response->status_line unless $response->is_success;
+        
+        unless ($response->is_success) {
+            die "Authentication failed: " . $response->status_line . "\n" . 
+                "Response: " . $response->content . "\n";
+        }
         
         my $json = JSON->new;
         my $data = $json->decode($response->content)->{data};
