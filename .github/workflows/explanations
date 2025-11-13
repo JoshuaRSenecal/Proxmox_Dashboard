@@ -1,1 +1,2051 @@
+# Proxmox Dashboard Scripts - Line by Line Explanation
 
+## Perl Script Explanation
+
+### Initial Setup and Module Imports
+
+```perl
+#!/usr/bin/env perl
+```
+**Shebang line** - Tells the system to use the Perl interpreter to run this script.
+
+```perl
+use strict;
+```
+**Enables strict mode** - Requires all variables to be declared with `my`, `our`, or `use vars`. Helps catch typos and enforces good coding practices.
+
+```perl
+use warnings;
+```
+**Enables warnings** - Perl will warn about potentially problematic code like undefined variables or deprecated features.
+
+```perl
+use LWP::UserAgent;
+```
+**Imports LWP::UserAgent module** - Provides HTTP client functionality for making web requests to the Proxmox API.
+
+```perl
+use JSON;
+```
+**Imports JSON module** - Allows parsing and encoding JSON data returned by the Proxmox API.
+
+```perl
+use HTTP::Request;
+```
+**Imports HTTP::Request module** - Creates HTTP request objects with custom headers and methods.
+
+### Configuration Variables
+
+```perl
+my $HOST = "192.168.1.100";  # Change this
+```
+**Defines Proxmox host** - IP address or hostname of your Proxmox server. The `my` keyword declares a lexically scoped variable.
+
+```perl
+my $USER = "root\@pam";      # Change this
+```
+**Defines username** - Proxmox username with realm (e.g., `root@pam` for PAM authentication). The `\@` escapes the @ symbol.
+
+```perl
+my $PASSWORD = "your_password";  # Change this
+```
+**Defines password** - Password for authenticating with Proxmox.
+
+### Proxmox API Class Definition
+
+```perl
+package Proxmox {
+```
+**Starts package definition** - Creates a new namespace called "Proxmox" to encapsulate the API client code.
+
+```perl
+    sub new {
+        my ($class, $host, $user, $password) = @_;
+```
+**Constructor method** - Creates a new Proxmox object. `$class` is the class name, followed by the parameters. `@_` contains all arguments passed to the function.
+
+```perl
+        my $self = {
+            base => "https://$host:8006/api2/json",
+            ua => LWP::UserAgent->new(ssl_opts => { verify_hostname => 0, SSL_verify_mode => 0 }),
+            cookies => {},
+            headers => {}
+        };
+```
+**Creates object hash** - `$self` is a hash reference containing:
+- `base`: The base URL for Proxmox API calls
+- `ua`: A new LWP::UserAgent with SSL verification disabled (for self-signed certificates)
+- `cookies`: Empty hash to store authentication cookie
+- `headers`: Empty hash to store CSRF token
+
+```perl
+        bless $self, $class;
+```
+**Blesses the object** - Associates the hash reference with the Proxmox class, making it an object.
+
+```perl
+        $self->authenticate($user, $password);
+```
+**Calls authenticate method** - Immediately authenticates when creating the object.
+
+```perl
+        return $self;
+```
+**Returns the object** - Returns the newly created and authenticated Proxmox object.
+
+```perl
+    sub authenticate {
+        my ($self, $user, $password) = @_;
+```
+**Authentication method** - Logs into Proxmox and stores the authentication ticket.
+
+```perl
+        my $url = "$self->{base}/access/ticket";
+```
+**Constructs authentication URL** - Creates the full URL for the ticket endpoint.
+
+```perl
+        my $response = $self->{ua}->post($url, {
+            username => $user,
+            password => $password
+        });
+```
+**Sends POST request** - Posts credentials to get an authentication ticket.
+
+```perl
+        die "Auth failed: " . $response->status_line unless $response->is_success;
+```
+**Error checking** - If authentication fails, the script dies with an error message.
+
+```perl
+        my $json = JSON->new;
+        my $data = $json->decode($response->content)->{data};
+```
+**Parses JSON response** - Creates a JSON parser and decodes the response body, then extracts the `data` field.
+
+```perl
+        $self->{cookies} = { PVEAuthCookie => $data->{ticket} };
+        $self->{headers} = { CSRFPreventionToken => $data->{CSRFPreventionToken} };
+```
+**Stores authentication data** - Saves the authentication ticket as a cookie and the CSRF token as a header.
+
+```perl
+    sub get {
+        my ($self, $path) = @_;
+```
+**GET request method** - Makes a GET request to the specified API path.
+
+```perl
+        my $url = "$self->{base}$path";
+```
+**Constructs full URL** - Combines base URL with the path.
+
+```perl
+        my $req = HTTP::Request->new(GET => $url);
+```
+**Creates GET request** - Instantiates a new HTTP GET request object.
+
+```perl
+        $req->header('Cookie' => "PVEAuthCookie=$self->{cookies}{PVEAuthCookie}");
+```
+**Adds authentication cookie** - Adds the authentication cookie to the request header.
+
+```perl
+        my $response = $self->{ua}->request($req);
+```
+**Executes request** - Sends the request using the user agent.
+
+```perl
+        die "GET failed: " . $response->status_line unless $response->is_success;
+```
+**Error checking** - Dies if the request fails.
+
+```perl
+        my $json = JSON->new;
+        return $json->decode($response->content)->{data};
+```
+**Returns parsed data** - Parses the JSON response and returns the `data` field.
+
+```perl
+    sub post {
+        my ($self, $path) = @_;
+```
+**POST request method** - Makes a POST request to the specified API path.
+
+```perl
+        my $url = "$self->{base}$path";
+        my $req = HTTP::Request->new(POST => $url);
+```
+**Creates POST request** - Constructs the URL and creates a POST request object.
+
+```perl
+        $req->header('Cookie' => "PVEAuthCookie=$self->{cookies}{PVEAuthCookie}");
+        $req->header('CSRFPreventionToken' => $self->{headers}{CSRFPreventionToken});
+```
+**Adds authentication headers** - Adds both the authentication cookie and CSRF token (required for POST requests).
+
+```perl
+        my $response = $self->{ua}->request($req);
+        die "POST failed: " . $response->status_line unless $response->is_success;
+        return $response;
+```
+**Executes and returns** - Sends the POST request, checks for errors, and returns the response.
+
+```perl
+package main;
+```
+**Returns to main namespace** - Exits the Proxmox package and returns to the main program namespace.
+
+### Helper Functions
+
+```perl
+sub fmt {
+    my ($b) = @_;
+```
+**Format bytes function** - Converts bytes to human-readable format (KB, MB, GB, etc.).
+
+```perl
+    return 'N/A' unless defined $b && $b ne 'N/A';
+```
+**Handle undefined values** - Returns 'N/A' if the value is undefined or already 'N/A'.
+
+```perl
+    $b = 0 + $b;  # Convert to number
+```
+**Force numeric conversion** - Ensures the value is treated as a number.
+
+```perl
+    for my $u ('B', 'KB', 'MB', 'GB', 'TB') {
+        return sprintf("%.1f%s", $b, $u) if $b < 1024;
+        $b /= 1024;
+    }
+```
+**Unit conversion loop** - Divides by 1024 until the value is less than 1024, then formats with 1 decimal place and the appropriate unit.
+
+```perl
+    return sprintf("%.1fPB", $b);
+```
+**Petabyte fallback** - If the loop completes, format as petabytes.
+
+### Display Dashboard Function
+
+```perl
+sub show {
+    my ($px) = @_;
+    my @items;
+```
+**Show function** - Retrieves and displays all VM and container information. `@items` will store all the data.
+
+```perl
+    my $nodes = $px->get('/nodes');
+```
+**Get all nodes** - Retrieves the list of all Proxmox nodes in the cluster.
+
+```perl
+    for my $node (@$nodes) {
+        my $n = $node->{node};
+```
+**Loop through nodes** - Iterates over each node, extracting the node name.
+
+#### Processing VMs
+
+```perl
+        my $vms = $px->get("/nodes/$n/qemu");
+```
+**Get VMs on this node** - Retrieves all QEMU VMs on the current node.
+
+```perl
+        for my $vm (@$vms) {
+```
+**Loop through VMs** - Iterates over each VM.
+
+```perl
+            my $cfg = $px->get("/nodes/$n/qemu/$vm->{vmid}/config");
+            my $stat = $px->get("/nodes/$n/qemu/$vm->{vmid}/status/current");
+```
+**Get VM details** - Fetches the VM's configuration and current status.
+
+```perl
+            my $balloon = ($cfg->{balloon} || 0) * 1024 * 1024;
+            my $maxmem = ($cfg->{memory} || 0) * 1024 * 1024;
+```
+**Calculate memory values** - Gets balloon (minimum) memory and maximum memory, converting from MB to bytes. The `||` operator provides a default of 0 if the value is undefined.
+
+```perl
+            my $total_disk = 0;
+            for my $key (sort keys %$cfg) {
+                if ($key =~ /^(scsi0|sata0|ide0|virtio0)$/) {
+```
+**Find primary disk** - Loops through config keys looking for the primary disk (scsi0, sata0, ide0, or virtio0). The regex `=~` matches the pattern.
+
+```perl
+                    my $value = $cfg->{$key};
+                    if ($value =~ /size=(\d+\.?\d*)([GMT])/) {
+                        my ($size, $unit) = ($1, $2);
+```
+**Parse disk size** - Uses regex to extract the size number and unit (G, M, or T). `$1` and `$2` are capture groups from the regex.
+
+```perl
+                        if ($unit eq 'G') {
+                            $total_disk = $size * 1024 * 1024 * 1024;
+                        } elsif ($unit eq 'M') {
+                            $total_disk = $size * 1024 * 1024;
+                        } elsif ($unit eq 'T') {
+                            $total_disk = $size * 1024 * 1024 * 1024 * 1024;
+                        }
+```
+**Convert to bytes** - Converts the disk size to bytes based on the unit.
+
+```perl
+                        last if $total_disk > 0;
+```
+**Exit loop if found** - Stops looking once we've found and parsed the primary disk.
+
+```perl
+            my $disk_free = 'N/A';
+            my $disk_free_pct = 'N/A';
+            my $total_filesystem = 'N/A';
+```
+**Initialize disk variables** - Sets default values for disk usage information.
+
+```perl
+            if ($vm->{status} eq 'running') {
+```
+**Check if VM is running** - Only try to get filesystem info if the VM is running.
+
+```perl
+                eval {
+```
+**Error handling block** - `eval` catches any errors that occur inside, preventing the script from crashing.
+
+```perl
+                    my $agent_data = $px->get("/nodes/$n/qemu/$vm->{vmid}/agent/get-fsinfo");
+```
+**Get filesystem info from agent** - Queries the QEMU guest agent for filesystem information.
+
+```perl
+                    if ($agent_data && ref $agent_data->{result} eq 'ARRAY') {
+```
+**Validate agent data** - Checks that we got data and that the result is an array reference.
+
+```perl
+                        my $total_fs = 0;
+                        my $avail_fs = 0;
+```
+**Initialize totals** - Will accumulate filesystem totals and available space.
+
+```perl
+                        for my $fs (@{$agent_data->{result}}) {
+```
+**Loop through filesystems** - Iterates over each filesystem reported by the agent. `@{...}` dereferences the array reference.
+
+```perl
+                            my $mp = $fs->{mountpoint} || $fs->{target} || '';
+                            my $fs_type = $fs->{type} || '';
+```
+**Extract filesystem info** - Gets the mountpoint and filesystem type, with empty string as fallback.
+
+```perl
+                            next if $fs_type =~ /^(iso9660|udf|tmpfs|devtmpfs)$/;
+```
+**Skip non-disk filesystems** - Skips CD-ROMs, ISOs, and RAM-based filesystems.
+
+```perl
+                            if ($mp =~ /^(\/$|\/boot$|\/home$|\/var$|\/tmp$|\/usr$)/) {
+```
+**Filter important mountpoints** - Only processes root and common system partitions.
+
+```perl
+                                my $total = $fs->{'total-bytes'} || 0;
+                                my $used = $fs->{'used-bytes'} || 0;
+```
+**Get size values** - Extracts total and used bytes from the filesystem info.
+
+```perl
+                                if ($total > 0 && $used >= 0) {
+                                    $total_fs += $total;
+                                    $avail_fs += ($total - $used);
+                                }
+```
+**Accumulate totals** - Adds this filesystem's total and available space to the running totals.
+
+```perl
+                        if ($total_fs > 0 && $avail_fs > 0) {
+                            $total_filesystem = fmt($total_fs);
+                            $disk_free = fmt($avail_fs);
+                            $disk_free_pct = ($avail_fs / $total_fs * 100);
+                        }
+```
+**Calculate final values** - Formats the totals and calculates the percentage free.
+
+```perl
+                };
+```
+**End eval block** - Closes the error-catching block (any errors are silently ignored).
+
+```perl
+            push @items, {
+                id => $vm->{vmid},
+                name => $vm->{name},
+                type => 'VM',
+                status => $vm->{status},
+                node => $n,
+                cores => $cfg->{cores} || 'N/A',
+                mem => fmt($balloon) . " - " . fmt($maxmem),
+                total_disk => $total_disk > 0 ? fmt($total_disk) : 'N/A',
+                total_filesystem => $total_filesystem,
+                free_disk => $disk_free,
+                free => $disk_free_pct
+            };
+```
+**Add VM to items array** - Creates a hash with all the VM information and adds it to the items array. The ternary operator `? :` provides conditional values.
+
+#### Processing Containers
+
+```perl
+        my $cts = $px->get("/nodes/$n/lxc");
+```
+**Get containers on this node** - Retrieves all LXC containers on the current node.
+
+```perl
+        for my $ct (@$cts) {
+```
+**Loop through containers** - Iterates over each container.
+
+```perl
+            my $cfg = $px->get("/nodes/$n/lxc/$ct->{vmid}/config");
+            my $stat = $px->get("/nodes/$n/lxc/$ct->{vmid}/status/current");
+```
+**Get container details** - Fetches the container's configuration and current status.
+
+```perl
+            my $memory = ($cfg->{memory} || 0) * 1024 * 1024;
+            my $swap = ($cfg->{swap} || 0) * 1024 * 1024;
+```
+**Calculate memory values** - Gets memory and swap, converting from MB to bytes.
+
+```perl
+            my $total_disk = 0;
+            my $rootfs = $cfg->{rootfs} || '';
+```
+**Initialize disk parsing** - Prepares to parse the rootfs (root filesystem) configuration.
+
+```perl
+            if ($rootfs =~ /size=(\d+\.?\d*)([GMT])/) {
+                my ($size, $unit) = ($1, $2);
+                if ($unit eq 'G') {
+                    $total_disk = $size * 1024 * 1024 * 1024;
+                } elsif ($unit eq 'M') {
+                    $total_disk = $size * 1024 * 1024;
+                } elsif ($unit eq 'T') {
+                    $total_disk = $size * 1024 * 1024 * 1024 * 1024;
+                }
+            }
+```
+**Parse container disk size** - Extracts and converts the rootfs size to bytes (same logic as VMs).
+
+```perl
+            my $disk_free = 'N/A';
+            my $disk_free_pct = 'N/A';
+            my $total_filesystem = 'N/A';
+```
+**Initialize disk variables** - Sets default values for disk usage information.
+
+```perl
+            if ($ct->{status} eq 'running') {
+```
+**Check if container is running** - Only get disk usage if the container is running.
+
+```perl
+                my $disk_used = $stat->{disk} || 0;
+                my $disk_max = $stat->{maxdisk} || 0;
+```
+**Get disk usage from status** - Containers report disk usage directly in the status (no agent needed).
+
+```perl
+                if ($disk_max > 0) {
+                    my $free_bytes = $disk_max - $disk_used;
+                    $total_filesystem = fmt($disk_max);
+                    $disk_free = fmt($free_bytes);
+                    $disk_free_pct = ($free_bytes / $disk_max * 100);
+                }
+```
+**Calculate disk values** - Calculates free space and percentage.
+
+```perl
+            push @items, {
+                id => $ct->{vmid},
+                name => $ct->{name},
+                type => 'CT',
+                status => $ct->{status},
+                node => $n,
+                cores => $cfg->{cores} || 'N/A',
+                mem => fmt($memory) . " - " . fmt($swap),
+                total_disk => $total_disk > 0 ? fmt($total_disk) : 'N/A',
+                total_filesystem => $total_filesystem,
+                free_disk => $disk_free,
+                free => $disk_free_pct
+            };
+```
+**Add container to items array** - Creates a hash with all container information and adds it to the array.
+
+#### Display Items
+
+```perl
+    @items = sort { $a->{id} <=> $b->{id} } @items;
+```
+**Sort by ID** - Sorts all items (VMs and containers) by their numeric ID. `<=>` is the numeric comparison operator.
+
+```perl
+    print "\n" . "=" x 150 . "\n";
+```
+**Print separator** - Prints a newline, then 150 equal signs, then another newline. The `x` operator repeats a string.
+
+```perl
+    printf "%-6s %-4s %-10s %-20s %-12s %-6s %-20s %-12s %-12s %-12s %-8s\n",
+        'ID', 'Type', 'Status', 'Name', 'Node', 'Cores', 'Memory', 'Total Disk', 'Total FS', 'Free Disk', 'Free%';
+```
+**Print header row** - Uses `printf` with format specifiers. `%-6s` means left-aligned string in 6-character field.
+
+```perl
+    print "-" x 150 . "\n";
+```
+**Print separator line** - Prints 150 dashes.
+
+```perl
+    for my $i (@items) {
+        my $free_display = (ref $i->{free} || $i->{free} =~ /^\d/) ? sprintf("%.1f%%", $i->{free}) : $i->{free};
+```
+**Format free percentage** - If the value is a reference (number) or starts with a digit, format it with 1 decimal place and % sign. Otherwise, show it as-is (for 'N/A').
+
+```perl
+        printf "%-6s %-4s %-10s %-20s %-12s %-6s %-20s %-12s %-12s %-12s %-8s\n",
+            $i->{id}, $i->{type}, $i->{status}, $i->{name}, $i->{node},
+            $i->{cores}, $i->{mem}, $i->{total_disk}, $i->{total_filesystem},
+            $i->{free_disk}, $free_display;
+    }
+```
+**Print each item** - Formats and prints each row with proper column alignment.
+
+```perl
+    print "=" x 150 . "\n";
+    return \@items;
+```
+**Print footer and return** - Prints the bottom separator and returns a reference to the items array.
+
+### Menu Function
+
+```perl
+sub menu {
+    my ($px, $items) = @_;
+```
+**Menu function** - Displays interactive menu and handles user choices.
+
+```perl
+    print "\n1. Start VM/CT  2. Stop VM/CT  3. Start all stopped  4. Refresh  5. Exit\n";
+    print "Choice: ";
+    my $c = <STDIN>;
+    chomp $c;
+```
+**Get user input** - Displays menu, prompts for choice, reads from STDIN, and removes the trailing newline with `chomp`.
+
+```perl
+    if ($c eq '1') {
+        print "ID: ";
+        my $vid = <STDIN>;
+        chomp $vid;
+```
+**Start VM/CT option** - If user chose 1, prompt for the VM/container ID.
+
+```perl
+        my ($item) = grep { $_->{id} eq $vid } @$items;
+```
+**Find item by ID** - Uses `grep` to filter the items array, finding the one with matching ID.
+
+```perl
+        if ($item) {
+            my $type = $item->{type} eq 'VM' ? 'qemu' : 'lxc';
+```
+**Determine API path** - Uses ternary operator to select 'qemu' for VMs or 'lxc' for containers.
+
+```perl
+            $px->post("/nodes/$item->{node}/$type/$item->{id}/status/start");
+            print "✓ Started $item->{type} $item->{id}\n";
+        }
+    }
+```
+**Start the VM/CT** - Makes a POST request to start it and prints confirmation.
+
+```perl
+    elsif ($c eq '2') {
+        print "ID: ";
+        my $vid = <STDIN>;
+        chomp $vid;
+        my ($item) = grep { $_->{id} eq $vid } @$items;
+        if ($item) {
+            my $type = $item->{type} eq 'VM' ? 'qemu' : 'lxc';
+            $px->post("/nodes/$item->{node}/$type/$item->{id}/status/stop");
+            print "✓ Stopped $item->{type} $item->{id}\n";
+        }
+    }
+```
+**Stop VM/CT option** - Same as start but calls the stop endpoint.
+
+```perl
+    elsif ($c eq '3') {
+        for my $item (grep { $_->{status} ne 'running' } @$items) {
+```
+**Start all stopped option** - Filters items to only non-running ones.
+
+```perl
+            my $type = $item->{type} eq 'VM' ? 'qemu' : 'lxc';
+            $px->post("/nodes/$item->{node}/$type/$item->{id}/status/start");
+            print "✓ Started $item->{type} $item->{id}\n";
+        }
+    }
+```
+**Start each stopped VM/CT** - Loops through all stopped items and starts them.
+
+```perl
+    elsif ($c eq '5') {
+        return 0;
+    }
+```
+**Exit option** - Returns 0 to signal exit.
+
+```perl
+    return 1;
+```
+**Continue loop** - Returns 1 to continue the main loop for all other options.
+
+### Main Program
+
+```perl
+my $px = Proxmox->new($HOST, $USER, $PASSWORD);
+```
+**Create Proxmox object** - Instantiates and authenticates with the Proxmox API.
+
+```perl
+while (1) {
+    my $items = show($px);
+    last unless menu($px, $items);
+}
+```
+**Main loop** - Infinite loop that displays the dashboard and menu. `last` exits the loop when menu returns 0 (exit choice). `unless` is the negative form of `if`.
+
+---
+
+## Python Script Explanation
+
+### Shebang and Imports
+
+```python
+#!/usr/bin/env python3
+```
+**Shebang line** - Tells the system to use Python 3 interpreter to run this script.
+
+```python
+import requests
+```
+**Import requests library** - Provides HTTP client functionality for making API calls.
+
+```python
+import urllib3
+```
+**Import urllib3** - Used to disable SSL warnings.
+
+```python
+urllib3.disable_warnings()
+```
+**Disable SSL warnings** - Suppresses warnings about unverified HTTPS requests (necessary for self-signed certificates).
+
+### Configuration
+
+```python
+HOST = "192.168.1.100"  # Change this
+USER = "root@pam"        # Change this
+PASSWORD = "your_password"  # Change this
+```
+**Configuration constants** - Global variables storing connection details. Python uses `ALL_CAPS` convention for constants.
+
+### Proxmox Class
+
+```python
+class Proxmox:
+```
+**Define Proxmox class** - Creates a class to encapsulate API interactions.
+
+```python
+    def __init__(self, host, user, password):
+```
+**Constructor method** - Python's special method for initializing objects. `self` is the instance reference (like `$self` in Perl).
+
+```python
+        self.base = f"https://{host}:8006/api2/json"
+```
+**Set base URL** - Uses f-string (formatted string literal) to create the API base URL. The `f` prefix allows embedding variables with `{}`.
+
+```python
+        r = requests.post(f"{self.base}/access/ticket", 
+                         data={'username': user, 'password': password}, verify=False)
+```
+**POST authentication request** - Sends credentials to get ticket. `verify=False` disables SSL verification. `data=` sends form-encoded data.
+
+```python
+        d = r.json()['data']
+```
+**Parse JSON response** - `.json()` automatically parses JSON, then extracts the 'data' key.
+
+```python
+        self.cookies = {'PVEAuthCookie': d['ticket']}
+        self.headers = {'CSRFPreventionToken': d['CSRFPreventionToken']}
+```
+**Store authentication data** - Saves cookie and CSRF token as instance variables.
+
+```python
+    def get(self, path):
+        return requests.get(f"{self.base}{path}", cookies=self.cookies, verify=False).json()['data']
+```
+**GET request method** - Makes GET request with authentication cookie, parses JSON, and returns the data. Method chaining: `.get().json()['data']`.
+
+```python
+    def post(self, path):
+        return requests.post(f"{self.base}{path}", headers=self.headers, cookies=self.cookies, verify=False)
+```
+**POST request method** - Makes POST request with both headers (CSRF token) and cookies.
+
+### Helper Function
+
+```python
+def fmt(b):
+```
+**Format bytes function** - Converts bytes to human-readable format.
+
+```python
+    if not b or b == 'N/A': return 'N/A'
+```
+**Check for invalid values** - Returns 'N/A' if value is falsy (None, 0, empty) or already 'N/A'.
+
+```python
+    b = float(b)
+```
+**Convert to float** - Ensures the value is a floating-point number.
+
+```python
+    for u in ['B','KB','MB','GB','TB']:
+        if b < 1024: return f"{b:.1f}{u}"
+        b /= 1024
+```
+**Unit conversion** - Iterates through units, dividing by 1024 each time. `:.1f` formats with 1 decimal place.
+
+### Show Function
+
+```python
+def show(px):
+    items = []
+```
+**Show function** - Displays dashboard. Creates empty list to store all items.
+
+```python
+    for node in px.get('/nodes'):
+        n = node['node']
+```
+**Loop through nodes** - Iterates over each node, extracting the node name.
+
+#### Processing VMs
+
+```python
+        for vm in px.get(f'/nodes/{n}/qemu'):
+```
+**Loop through VMs** - Gets all VMs on this node and iterates.
+
+```python
+            cfg = px.get(f'/nodes/{n}/qemu/{vm["vmid"]}/config')
+            stat = px.get(f'/nodes/{n}/qemu/{vm["vmid"]}/status/current')
+```
+**Get VM details** - Fetches configuration and current status.
+
+```python
+            balloon = int(cfg.get('balloon', 0)) * 1024 * 1024 if cfg.get('balloon') else 0
+            maxmem = int(cfg.get('memory', 0)) * 1024 * 1024 if cfg.get('memory') else 0
+```
+**Calculate memory** - Uses `.get()` method with default value 0. Conditional expression converts to bytes if value exists. `int()` ensures numeric type.
+
+```python
+            total_disk = 0
+            for key in sorted(cfg.keys()):
+```
+**Find primary disk** - Sorts config keys and loops through them.
+
+```python
+                if key.startswith(('scsi0', 'sata0', 'ide0', 'virtio0')):
+```
+**Check for disk key** - `.startswith()` checks if key begins with any of these strings. Python tuple allows multiple values.
+
+```python
+                    value = str(cfg[key])
+                    if ':' in value:
+```
+**Parse disk config** - Converts value to string and checks if it contains a colon (disk format indicator).
+
+```python
+                        parts = value.split(',')
+                        for part in parts:
+```
+**Split config string** - `.split(',')` creates a list of parts separated by commas.
+
+```python
+                            if 'size=' in part:
+                                size_str = part.split('size=')[1].strip()
+```
+**Extract size** - Splits on 'size=' and takes the second part ([1]), then `.strip()` removes whitespace.
+
+```python
+                                if size_str.endswith('G'):
+                                    total_disk = float(size_str[:-1]) * 1024 * 1024 * 1024
+```
+**Convert size** - `.endswith()` checks last character. `[:-1]` slices off last character. Converts to bytes.
+
+```python
+                                elif size_str.endswith('M'):
+                                    total_disk = float(size_str[:-1]) * 1024 * 1024
+                                elif size_str.endswith('T'):
+                                    total_disk = float(size_str[:-1]) * 1024 * 1024 * 1024 * 1024
+                                break
+```
+**Handle other units** - Same logic for MB and TB. `break` exits the inner loop.
+
+```python
+                    if total_disk > 0:
+                        break
+```
+**Exit if found** - Exits the outer loop once disk is found.
+
+```python
+            disk_free = 'N/A'
+            disk_free_pct = 'N/A'
+            total_filesystem = 'N/A'
+```
+**Initialize disk variables** - Sets default values for disk usage information.
+
+```python
+            if vm['status'] == 'running':
+```
+**Check if VM is running** - Only query agent if VM is active. Python uses `==` for equality comparison.
+
+```python
+                try:
+```
+**Start error handling** - `try` block catches exceptions without crashing the script.
+
+```python
+                    agent_data = px.get(f'/nodes/{n}/qemu/{vm["vmid"]}/agent/get-fsinfo')
+```
+**Query guest agent** - Gets filesystem information from QEMU guest agent.
+
+```python
+                    if agent_data and 'result' in agent_data:
+```
+**Validate response** - Checks that we got data and it has a 'result' key. `in` checks for key existence.
+
+```python
+                        total_fs = 0
+                        avail_fs = 0
+```
+**Initialize accumulators** - Variables to sum up all filesystem totals.
+
+```python
+                        for fs in agent_data['result']:
+```
+**Loop through filesystems** - Iterates over the list of filesystems.
+
+```python
+                            mp = fs.get('mountpoint', fs.get('target', ''))
+                            fs_type = fs.get('type', '')
+```
+**Extract filesystem info** - Uses `.get()` with defaults. Nested `.get()` provides fallback chain.
+
+```python
+                            if fs_type in ['iso9660', 'udf', 'tmpfs', 'devtmpfs']:
+                                continue
+```
+**Skip non-disk filesystems** - `in` checks if value is in the list. `continue` skips to next iteration.
+
+```python
+                            if mp in ['/', '/boot', '/home', '/var', '/tmp', '/usr']:
+```
+**Filter important mountpoints** - Only processes standard system partitions.
+
+```python
+                                total = fs.get('total-bytes', 0)
+                                used = fs.get('used-bytes', 0)
+```
+**Get size values** - Extracts total and used bytes with 0 as default.
+
+```python
+                                if total > 0 and used >= 0:
+```
+**Validate values** - Ensures we have valid data before calculating.
+
+```python
+                                    total_fs += total
+                                    avail_fs += (total - used)
+```
+**Accumulate totals** - Adds to running totals. `+=` is shorthand for `total_fs = total_fs + total`.
+
+```python
+                        if total_fs > 0 and avail_fs > 0:
+                            total_filesystem = fmt(total_fs)
+                            disk_free = fmt(avail_fs)
+                            disk_free_pct = (avail_fs / total_fs * 100)
+```
+**Calculate final values** - Formats sizes and calculates percentage. Python `/` does float division.
+
+```python
+                except:
+                    pass
+```
+**Catch all errors** - Bare `except` catches any exception. `pass` does nothing (silently continues).
+
+```python
+            items.append({
+                'id': vm['vmid'], 'name': vm['name'], 'type': 'VM',
+                'status': vm['status'], 'node': n,
+                'cores': cfg.get('cores', 'N/A'),
+                'mem': f"{fmt(balloon)} - {fmt(maxmem)}",
+                'total_disk': fmt(total_disk) if total_disk > 0 else 'N/A',
+                'total_filesystem': total_filesystem,
+                'free_disk': disk_free,
+                'free': disk_free_pct
+            })
+```
+**Add VM to list** - Creates a dictionary with all VM info and appends to items list. Uses inline `if/else` (ternary operator).
+
+#### Processing Containers
+
+```python
+        for ct in px.get(f'/nodes/{n}/lxc'):
+```
+**Loop through containers** - Gets all LXC containers on this node.
+
+```python
+            cfg = px.get(f'/nodes/{n}/lxc/{ct["vmid"]}/config')
+            stat = px.get(f'/nodes/{n}/lxc/{ct["vmid"]}/status/current')
+```
+**Get container details** - Fetches configuration and status.
+
+```python
+            memory = int(cfg.get('memory', 0)) * 1024 * 1024 if cfg.get('memory') else 0
+            swap = int(cfg.get('swap', 0)) * 1024 * 1024 if cfg.get('swap') else 0
+```
+**Calculate memory values** - Gets memory and swap, converting MB to bytes.
+
+```python
+            total_disk = 0
+            rootfs = cfg.get('rootfs', '')
+```
+**Get rootfs config** - Retrieves the root filesystem configuration string.
+
+```python
+            if 'size=' in str(rootfs):
+```
+**Check for size specification** - Converts to string and checks if it contains 'size='.
+
+```python
+                size_str = str(rootfs).split('size=')[1].split(',')[0].strip()
+```
+**Extract size string** - Splits on 'size=', takes second part, splits on comma, takes first part, strips whitespace. Method chaining.
+
+```python
+                if size_str.endswith('G'):
+                    total_disk = float(size_str[:-1]) * 1024 * 1024 * 1024
+                elif size_str.endswith('M'):
+                    total_disk = float(size_str[:-1]) * 1024 * 1024
+                elif size_str.endswith('T'):
+                    total_disk = float(size_str[:-1]) * 1024 * 1024 * 1024 * 1024
+```
+**Convert size to bytes** - Same logic as VM disk parsing.
+
+```python
+            disk_free = 'N/A'
+            disk_free_pct = 'N/A'
+            total_filesystem = 'N/A'
+```
+**Initialize disk variables** - Default values for disk info.
+
+```python
+            if ct['status'] == 'running':
+```
+**Check if container is running** - Only get disk usage for running containers.
+
+```python
+                disk_used = stat.get('disk', 0)
+                disk_max = stat.get('maxdisk', 0)
+```
+**Get disk usage** - Containers report usage directly in status (no agent needed).
+
+```python
+                if disk_max > 0:
+                    free_bytes = disk_max - disk_used
+                    total_filesystem = fmt(disk_max)
+                    disk_free = fmt(free_bytes)
+                    disk_free_pct = (free_bytes / disk_max * 100)
+```
+**Calculate disk values** - Simple subtraction to get free space and percentage.
+
+```python
+            items.append({
+                'id': ct['vmid'], 'name': ct['name'], 'type': 'CT',
+                'status': ct['status'], 'node': n,
+                'cores': cfg.get('cores', 'N/A'),
+                'mem': f"{fmt(memory)} - {fmt(swap)}",
+                'total_disk': fmt(total_disk) if total_disk > 0 else 'N/A',
+                'total_filesystem': total_filesystem,
+                'free_disk': disk_free,
+                'free': disk_free_pct
+            })
+```
+**Add container to list** - Creates dictionary with container info and appends to list.
+
+#### Display Items
+
+```python
+    items.sort(key=lambda x: x['id'])
+```
+**Sort by ID** - Sorts list in-place by ID. `lambda` creates anonymous function. `x['id']` is the sort key.
+
+```python
+    print("\n" + "="*150)
+```
+**Print separator** - Newline plus 150 equal signs. `*` operator repeats strings.
+
+```python
+    print(f"{'ID':<6} {'Type':<4} {'Status':<10} {'Name':<20} {'Node':<12} {'Cores':<6} {'Memory':<20} {'Total Disk':<12} {'Total FS':<12} {'Free Disk':<12} {'Free%':<8}")
+```
+**Print header** - F-string with format specifications. `:<6` means left-aligned in 6-character field.
+
+```python
+    print("-"*150)
+```
+**Print separator line** - 150 dashes.
+
+```python
+    for i in items:
+```
+**Loop through items** - Iterates over all VMs and containers.
+
+```python
+        free_display = f"{i['free']:.1f}%" if isinstance(i['free'], (int, float)) else i['free']
+```
+**Format percentage** - `isinstance()` checks if value is int or float. `:.1f` formats with 1 decimal. Ternary operator for conditional formatting.
+
+```python
+        print(f"{i['id']:<6} {i['type']:<4} {i['status']:<10} {i['name']:<20} {i['node']:<12} {i['cores']:<6} {i['mem']:<20} {i['total_disk']:<12} {i['total_filesystem']:<12} {i['free_disk']:<12} {free_display:<8}")
+```
+**Print row** - F-string formats all values with proper alignment using format specifications.
+
+```python
+    print("="*150)
+    return items
+```
+**Print footer and return** - Prints separator and returns the items list.
+
+### Menu Function
+
+```python
+def menu(px, items):
+```
+**Menu function** - Handles user interaction and VM/container control.
+
+```python
+    print("\n1. Start VM/CT  2. Stop VM/CT  3. Start all stopped  4. Refresh  5. Exit")
+    c = input("Choice: ").strip()
+```
+**Get user input** - Displays menu and reads input. `.strip()` removes leading/trailing whitespace.
+
+```python
+    if c == '1':
+```
+**Start option** - Python uses `==` for comparison (not assignment).
+
+```python
+        vid = input("ID: ").strip()
+```
+**Get VM/CT ID** - Prompts and reads input.
+
+```python
+        i = next((x for x in items if str(x['id'])==vid), None)
+```
+**Find item** - `next()` gets first matching item from generator expression. `None` is default if not found. Generator `(x for x in items if ...)` is memory-efficient.
+
+```python
+        if i:
+```
+**Check if found** - Proceeds only if item exists (not None).
+
+```python
+            px.post(f"/nodes/{i['node']}/{'qemu' if i['type']=='VM' else 'lxc'}/{i['id']}/status/start")
+```
+**Start VM/CT** - Inline conditional selects 'qemu' or 'lxc'. F-string constructs API path.
+
+```python
+            print(f"✓ Started {i['type']} {i['id']}")
+```
+**Print confirmation** - Uses checkmark character for visual feedback.
+
+```python
+    elif c == '2':
+        vid = input("ID: ").strip()
+        i = next((x for x in items if str(x['id'])==vid), None)
+        if i:
+            px.post(f"/nodes/{i['node']}/{'qemu' if i['type']=='VM' else 'lxc'}/{i['id']}/status/stop")
+            print(f"✓ Stopped {i['type']} {i['id']}")
+```
+**Stop option** - Same logic as start but calls stop endpoint.
+
+```python
+    elif c == '3':
+```
+**Start all stopped** - Third menu option.
+
+```python
+        for i in [x for x in items if x['status']!='running']:
+```
+**Filter stopped items** - List comprehension creates new list of only non-running items. More Pythonic than filter().
+
+```python
+            px.post(f"/nodes/{i['node']}/{'qemu' if i['type']=='VM' else 'lxc'}/{i['id']}/status/start")
+            print(f"✓ Started {i['type']} {i['id']}")
+```
+**Start each item** - Loops through and starts each stopped VM/container.
+
+```python
+    elif c == '5':
+        return False
+```
+**Exit option** - Returns False to signal exit from main loop.
+
+```python
+    return True
+```
+**Continue loop** - Returns True for all other options to continue main loop.
+
+### Main Program
+
+```python
+px = Proxmox(HOST, USER, PASSWORD)
+```
+**Create Proxmox object** - Instantiates the API client and authenticates.
+
+```python
+while True:
+```
+**Infinite loop** - `while True` runs forever until explicitly broken.
+
+```python
+    if not menu(px, show(px)): break
+```
+**Main loop logic** - Calls `show()` to display dashboard, passes result to `menu()`. If menu returns False (exit), `not` makes it True, triggering `break` to exit loop. This is Python's way of "loop while menu returns True".
+
+---
+
+## Key Differences Between Perl and Python
+
+### 1. **Variable Declaration**
+- **Perl**: Requires `my` keyword: `my $var = 5;`
+- **Python**: No keyword needed: `var = 5`
+
+### 2. **String Interpolation**
+- **Perl**: `"Value: $var"` or `"Path: $self->{base}"`
+- **Python**: `f"Value: {var}"` (f-strings in Python 3.6+)
+
+### 3. **Hash/Dictionary Access**
+- **Perl**: `$hash->{key}` (arrow operator for references)
+- **Python**: `dict['key']` (square brackets)
+
+### 4. **Arrays/Lists**
+- **Perl**: `@array` (array), `$array[0]` (element), `\@array` (reference)
+- **Python**: `list` (list), `list[0]` (element), lists are already references
+
+### 5. **Conditionals**
+- **Perl**: `if ($x > 5) { }` or `statement if condition;`
+- **Python**: `if x > 5:` (uses indentation, not braces)
+
+### 6. **Loops**
+- **Perl**: `for my $item (@array) { }` or `foreach`
+- **Python**: `for item in list:` (more intuitive syntax)
+
+### 7. **Object Creation**
+- **Perl**: `bless $self, $class;` (manual blessing)
+- **Python**: `__init__` method (automatic object creation)
+
+### 8. **Self Reference**
+- **Perl**: First parameter `my ($self) = @_;`
+- **Python**: Always first parameter: `def method(self):`
+
+### 9. **Error Handling**
+- **Perl**: `eval { }` (eval block)
+- **Python**: `try: ... except:` (more explicit)
+
+### 10. **List Comprehensions**
+- **Perl**: `grep { condition } @array` or `map { expression } @array`
+- **Python**: `[x for x in list if condition]` (more readable)
+
+### 11. **Boolean Values**
+- **Perl**: 0, '', undef are false; everything else is true
+- **Python**: False, None, 0, empty containers are false; True and everything else is true
+
+### 12. **Method Chaining**
+- **Perl**: Less common, but possible
+- **Python**: Very common: `str.strip().split().join()`
+
+### 13. **String Operations**
+- **Perl**: `$str =~ /pattern/` (regex binding)
+- **Python**: `'pattern' in str` or `str.startswith('pattern')`
+
+### 14. **Print Formatting**
+- **Perl**: `printf` or `sprintf` (C-style)
+- **Python**: F-strings `f"{var}"` or `.format()` method
+
+### 15. **Package/Module System**
+- **Perl**: `package Name;` and `use Module;`
+- **Python**: `import module` (file-based modules)
+
+---
+
+## Summary
+
+Both scripts accomplish the same task with similar logic:
+1. Authenticate with Proxmox API
+2. Query all nodes for VMs and containers
+3. Extract configuration and status information
+4. Parse disk sizes from configuration strings
+5. Query QEMU guest agent for filesystem usage (VMs only)
+6. Format and display all information in a table
+7. Provide interactive menu for starting/stopping
+
+The main differences are syntactic - Perl's sigils (`# Proxmox Dashboard Scripts - Line by Line Explanation
+
+## Perl Script Explanation
+
+### Initial Setup and Module Imports
+
+```perl
+#!/usr/bin/env perl
+```
+**Shebang line** - Tells the system to use the Perl interpreter to run this script.
+
+```perl
+use strict;
+```
+**Enables strict mode** - Requires all variables to be declared with `my`, `our`, or `use vars`. Helps catch typos and enforces good coding practices.
+
+```perl
+use warnings;
+```
+**Enables warnings** - Perl will warn about potentially problematic code like undefined variables or deprecated features.
+
+```perl
+use LWP::UserAgent;
+```
+**Imports LWP::UserAgent module** - Provides HTTP client functionality for making web requests to the Proxmox API.
+
+```perl
+use JSON;
+```
+**Imports JSON module** - Allows parsing and encoding JSON data returned by the Proxmox API.
+
+```perl
+use HTTP::Request;
+```
+**Imports HTTP::Request module** - Creates HTTP request objects with custom headers and methods.
+
+### Configuration Variables
+
+```perl
+my $HOST = "192.168.1.100";  # Change this
+```
+**Defines Proxmox host** - IP address or hostname of your Proxmox server. The `my` keyword declares a lexically scoped variable.
+
+```perl
+my $USER = "root\@pam";      # Change this
+```
+**Defines username** - Proxmox username with realm (e.g., `root@pam` for PAM authentication). The `\@` escapes the @ symbol.
+
+```perl
+my $PASSWORD = "your_password";  # Change this
+```
+**Defines password** - Password for authenticating with Proxmox.
+
+### Proxmox API Class Definition
+
+```perl
+package Proxmox {
+```
+**Starts package definition** - Creates a new namespace called "Proxmox" to encapsulate the API client code.
+
+```perl
+    sub new {
+        my ($class, $host, $user, $password) = @_;
+```
+**Constructor method** - Creates a new Proxmox object. `$class` is the class name, followed by the parameters. `@_` contains all arguments passed to the function.
+
+```perl
+        my $self = {
+            base => "https://$host:8006/api2/json",
+            ua => LWP::UserAgent->new(ssl_opts => { verify_hostname => 0, SSL_verify_mode => 0 }),
+            cookies => {},
+            headers => {}
+        };
+```
+**Creates object hash** - `$self` is a hash reference containing:
+- `base`: The base URL for Proxmox API calls
+- `ua`: A new LWP::UserAgent with SSL verification disabled (for self-signed certificates)
+- `cookies`: Empty hash to store authentication cookie
+- `headers`: Empty hash to store CSRF token
+
+```perl
+        bless $self, $class;
+```
+**Blesses the object** - Associates the hash reference with the Proxmox class, making it an object.
+
+```perl
+        $self->authenticate($user, $password);
+```
+**Calls authenticate method** - Immediately authenticates when creating the object.
+
+```perl
+        return $self;
+```
+**Returns the object** - Returns the newly created and authenticated Proxmox object.
+
+```perl
+    sub authenticate {
+        my ($self, $user, $password) = @_;
+```
+**Authentication method** - Logs into Proxmox and stores the authentication ticket.
+
+```perl
+        my $url = "$self->{base}/access/ticket";
+```
+**Constructs authentication URL** - Creates the full URL for the ticket endpoint.
+
+```perl
+        my $response = $self->{ua}->post($url, {
+            username => $user,
+            password => $password
+        });
+```
+**Sends POST request** - Posts credentials to get an authentication ticket.
+
+```perl
+        die "Auth failed: " . $response->status_line unless $response->is_success;
+```
+**Error checking** - If authentication fails, the script dies with an error message.
+
+```perl
+        my $json = JSON->new;
+        my $data = $json->decode($response->content)->{data};
+```
+**Parses JSON response** - Creates a JSON parser and decodes the response body, then extracts the `data` field.
+
+```perl
+        $self->{cookies} = { PVEAuthCookie => $data->{ticket} };
+        $self->{headers} = { CSRFPreventionToken => $data->{CSRFPreventionToken} };
+```
+**Stores authentication data** - Saves the authentication ticket as a cookie and the CSRF token as a header.
+
+```perl
+    sub get {
+        my ($self, $path) = @_;
+```
+**GET request method** - Makes a GET request to the specified API path.
+
+```perl
+        my $url = "$self->{base}$path";
+```
+**Constructs full URL** - Combines base URL with the path.
+
+```perl
+        my $req = HTTP::Request->new(GET => $url);
+```
+**Creates GET request** - Instantiates a new HTTP GET request object.
+
+```perl
+        $req->header('Cookie' => "PVEAuthCookie=$self->{cookies}{PVEAuthCookie}");
+```
+**Adds authentication cookie** - Adds the authentication cookie to the request header.
+
+```perl
+        my $response = $self->{ua}->request($req);
+```
+**Executes request** - Sends the request using the user agent.
+
+```perl
+        die "GET failed: " . $response->status_line unless $response->is_success;
+```
+**Error checking** - Dies if the request fails.
+
+```perl
+        my $json = JSON->new;
+        return $json->decode($response->content)->{data};
+```
+**Returns parsed data** - Parses the JSON response and returns the `data` field.
+
+```perl
+    sub post {
+        my ($self, $path) = @_;
+```
+**POST request method** - Makes a POST request to the specified API path.
+
+```perl
+        my $url = "$self->{base}$path";
+        my $req = HTTP::Request->new(POST => $url);
+```
+**Creates POST request** - Constructs the URL and creates a POST request object.
+
+```perl
+        $req->header('Cookie' => "PVEAuthCookie=$self->{cookies}{PVEAuthCookie}");
+        $req->header('CSRFPreventionToken' => $self->{headers}{CSRFPreventionToken});
+```
+**Adds authentication headers** - Adds both the authentication cookie and CSRF token (required for POST requests).
+
+```perl
+        my $response = $self->{ua}->request($req);
+        die "POST failed: " . $response->status_line unless $response->is_success;
+        return $response;
+```
+**Executes and returns** - Sends the POST request, checks for errors, and returns the response.
+
+```perl
+package main;
+```
+**Returns to main namespace** - Exits the Proxmox package and returns to the main program namespace.
+
+### Helper Functions
+
+```perl
+sub fmt {
+    my ($b) = @_;
+```
+**Format bytes function** - Converts bytes to human-readable format (KB, MB, GB, etc.).
+
+```perl
+    return 'N/A' unless defined $b && $b ne 'N/A';
+```
+**Handle undefined values** - Returns 'N/A' if the value is undefined or already 'N/A'.
+
+```perl
+    $b = 0 + $b;  # Convert to number
+```
+**Force numeric conversion** - Ensures the value is treated as a number.
+
+```perl
+    for my $u ('B', 'KB', 'MB', 'GB', 'TB') {
+        return sprintf("%.1f%s", $b, $u) if $b < 1024;
+        $b /= 1024;
+    }
+```
+**Unit conversion loop** - Divides by 1024 until the value is less than 1024, then formats with 1 decimal place and the appropriate unit.
+
+```perl
+    return sprintf("%.1fPB", $b);
+```
+**Petabyte fallback** - If the loop completes, format as petabytes.
+
+### Display Dashboard Function
+
+```perl
+sub show {
+    my ($px) = @_;
+    my @items;
+```
+**Show function** - Retrieves and displays all VM and container information. `@items` will store all the data.
+
+```perl
+    my $nodes = $px->get('/nodes');
+```
+**Get all nodes** - Retrieves the list of all Proxmox nodes in the cluster.
+
+```perl
+    for my $node (@$nodes) {
+        my $n = $node->{node};
+```
+**Loop through nodes** - Iterates over each node, extracting the node name.
+
+#### Processing VMs
+
+```perl
+        my $vms = $px->get("/nodes/$n/qemu");
+```
+**Get VMs on this node** - Retrieves all QEMU VMs on the current node.
+
+```perl
+        for my $vm (@$vms) {
+```
+**Loop through VMs** - Iterates over each VM.
+
+```perl
+            my $cfg = $px->get("/nodes/$n/qemu/$vm->{vmid}/config");
+            my $stat = $px->get("/nodes/$n/qemu/$vm->{vmid}/status/current");
+```
+**Get VM details** - Fetches the VM's configuration and current status.
+
+```perl
+            my $balloon = ($cfg->{balloon} || 0) * 1024 * 1024;
+            my $maxmem = ($cfg->{memory} || 0) * 1024 * 1024;
+```
+**Calculate memory values** - Gets balloon (minimum) memory and maximum memory, converting from MB to bytes. The `||` operator provides a default of 0 if the value is undefined.
+
+```perl
+            my $total_disk = 0;
+            for my $key (sort keys %$cfg) {
+                if ($key =~ /^(scsi0|sata0|ide0|virtio0)$/) {
+```
+**Find primary disk** - Loops through config keys looking for the primary disk (scsi0, sata0, ide0, or virtio0). The regex `=~` matches the pattern.
+
+```perl
+                    my $value = $cfg->{$key};
+                    if ($value =~ /size=(\d+\.?\d*)([GMT])/) {
+                        my ($size, $unit) = ($1, $2);
+```
+**Parse disk size** - Uses regex to extract the size number and unit (G, M, or T). `$1` and `$2` are capture groups from the regex.
+
+```perl
+                        if ($unit eq 'G') {
+                            $total_disk = $size * 1024 * 1024 * 1024;
+                        } elsif ($unit eq 'M') {
+                            $total_disk = $size * 1024 * 1024;
+                        } elsif ($unit eq 'T') {
+                            $total_disk = $size * 1024 * 1024 * 1024 * 1024;
+                        }
+```
+**Convert to bytes** - Converts the disk size to bytes based on the unit.
+
+```perl
+                        last if $total_disk > 0;
+```
+**Exit loop if found** - Stops looking once we've found and parsed the primary disk.
+
+```perl
+            my $disk_free = 'N/A';
+            my $disk_free_pct = 'N/A';
+            my $total_filesystem = 'N/A';
+```
+**Initialize disk variables** - Sets default values for disk usage information.
+
+```perl
+            if ($vm->{status} eq 'running') {
+```
+**Check if VM is running** - Only try to get filesystem info if the VM is running.
+
+```perl
+                eval {
+```
+**Error handling block** - `eval` catches any errors that occur inside, preventing the script from crashing.
+
+```perl
+                    my $agent_data = $px->get("/nodes/$n/qemu/$vm->{vmid}/agent/get-fsinfo");
+```
+**Get filesystem info from agent** - Queries the QEMU guest agent for filesystem information.
+
+```perl
+                    if ($agent_data && ref $agent_data->{result} eq 'ARRAY') {
+```
+**Validate agent data** - Checks that we got data and that the result is an array reference.
+
+```perl
+                        my $total_fs = 0;
+                        my $avail_fs = 0;
+```
+**Initialize totals** - Will accumulate filesystem totals and available space.
+
+```perl
+                        for my $fs (@{$agent_data->{result}}) {
+```
+**Loop through filesystems** - Iterates over each filesystem reported by the agent. `@{...}` dereferences the array reference.
+
+```perl
+                            my $mp = $fs->{mountpoint} || $fs->{target} || '';
+                            my $fs_type = $fs->{type} || '';
+```
+**Extract filesystem info** - Gets the mountpoint and filesystem type, with empty string as fallback.
+
+```perl
+                            next if $fs_type =~ /^(iso9660|udf|tmpfs|devtmpfs)$/;
+```
+**Skip non-disk filesystems** - Skips CD-ROMs, ISOs, and RAM-based filesystems.
+
+```perl
+                            if ($mp =~ /^(\/$|\/boot$|\/home$|\/var$|\/tmp$|\/usr$)/) {
+```
+**Filter important mountpoints** - Only processes root and common system partitions.
+
+```perl
+                                my $total = $fs->{'total-bytes'} || 0;
+                                my $used = $fs->{'used-bytes'} || 0;
+```
+**Get size values** - Extracts total and used bytes from the filesystem info.
+
+```perl
+                                if ($total > 0 && $used >= 0) {
+                                    $total_fs += $total;
+                                    $avail_fs += ($total - $used);
+                                }
+```
+**Accumulate totals** - Adds this filesystem's total and available space to the running totals.
+
+```perl
+                        if ($total_fs > 0 && $avail_fs > 0) {
+                            $total_filesystem = fmt($total_fs);
+                            $disk_free = fmt($avail_fs);
+                            $disk_free_pct = ($avail_fs / $total_fs * 100);
+                        }
+```
+**Calculate final values** - Formats the totals and calculates the percentage free.
+
+```perl
+                };
+```
+**End eval block** - Closes the error-catching block (any errors are silently ignored).
+
+```perl
+            push @items, {
+                id => $vm->{vmid},
+                name => $vm->{name},
+                type => 'VM',
+                status => $vm->{status},
+                node => $n,
+                cores => $cfg->{cores} || 'N/A',
+                mem => fmt($balloon) . " - " . fmt($maxmem),
+                total_disk => $total_disk > 0 ? fmt($total_disk) : 'N/A',
+                total_filesystem => $total_filesystem,
+                free_disk => $disk_free,
+                free => $disk_free_pct
+            };
+```
+**Add VM to items array** - Creates a hash with all the VM information and adds it to the items array. The ternary operator `? :` provides conditional values.
+
+#### Processing Containers
+
+```perl
+        my $cts = $px->get("/nodes/$n/lxc");
+```
+**Get containers on this node** - Retrieves all LXC containers on the current node.
+
+```perl
+        for my $ct (@$cts) {
+```
+**Loop through containers** - Iterates over each container.
+
+```perl
+            my $cfg = $px->get("/nodes/$n/lxc/$ct->{vmid}/config");
+            my $stat = $px->get("/nodes/$n/lxc/$ct->{vmid}/status/current");
+```
+**Get container details** - Fetches the container's configuration and current status.
+
+```perl
+            my $memory = ($cfg->{memory} || 0) * 1024 * 1024;
+            my $swap = ($cfg->{swap} || 0) * 1024 * 1024;
+```
+**Calculate memory values** - Gets memory and swap, converting from MB to bytes.
+
+```perl
+            my $total_disk = 0;
+            my $rootfs = $cfg->{rootfs} || '';
+```
+**Initialize disk parsing** - Prepares to parse the rootfs (root filesystem) configuration.
+
+```perl
+            if ($rootfs =~ /size=(\d+\.?\d*)([GMT])/) {
+                my ($size, $unit) = ($1, $2);
+                if ($unit eq 'G') {
+                    $total_disk = $size * 1024 * 1024 * 1024;
+                } elsif ($unit eq 'M') {
+                    $total_disk = $size * 1024 * 1024;
+                } elsif ($unit eq 'T') {
+                    $total_disk = $size * 1024 * 1024 * 1024 * 1024;
+                }
+            }
+```
+**Parse container disk size** - Extracts and converts the rootfs size to bytes (same logic as VMs).
+
+```perl
+            my $disk_free = 'N/A';
+            my $disk_free_pct = 'N/A';
+            my $total_filesystem = 'N/A';
+```
+**Initialize disk variables** - Sets default values for disk usage information.
+
+```perl
+            if ($ct->{status} eq 'running') {
+```
+**Check if container is running** - Only get disk usage if the container is running.
+
+```perl
+                my $disk_used = $stat->{disk} || 0;
+                my $disk_max = $stat->{maxdisk} || 0;
+```
+**Get disk usage from status** - Containers report disk usage directly in the status (no agent needed).
+
+```perl
+                if ($disk_max > 0) {
+                    my $free_bytes = $disk_max - $disk_used;
+                    $total_filesystem = fmt($disk_max);
+                    $disk_free = fmt($free_bytes);
+                    $disk_free_pct = ($free_bytes / $disk_max * 100);
+                }
+```
+**Calculate disk values** - Calculates free space and percentage.
+
+```perl
+            push @items, {
+                id => $ct->{vmid},
+                name => $ct->{name},
+                type => 'CT',
+                status => $ct->{status},
+                node => $n,
+                cores => $cfg->{cores} || 'N/A',
+                mem => fmt($memory) . " - " . fmt($swap),
+                total_disk => $total_disk > 0 ? fmt($total_disk) : 'N/A',
+                total_filesystem => $total_filesystem,
+                free_disk => $disk_free,
+                free => $disk_free_pct
+            };
+```
+**Add container to items array** - Creates a hash with all container information and adds it to the array.
+
+#### Display Items
+
+```perl
+    @items = sort { $a->{id} <=> $b->{id} } @items;
+```
+**Sort by ID** - Sorts all items (VMs and containers) by their numeric ID. `<=>` is the numeric comparison operator.
+
+```perl
+    print "\n" . "=" x 150 . "\n";
+```
+**Print separator** - Prints a newline, then 150 equal signs, then another newline. The `x` operator repeats a string.
+
+```perl
+    printf "%-6s %-4s %-10s %-20s %-12s %-6s %-20s %-12s %-12s %-12s %-8s\n",
+        'ID', 'Type', 'Status', 'Name', 'Node', 'Cores', 'Memory', 'Total Disk', 'Total FS', 'Free Disk', 'Free%';
+```
+**Print header row** - Uses `printf` with format specifiers. `%-6s` means left-aligned string in 6-character field.
+
+```perl
+    print "-" x 150 . "\n";
+```
+**Print separator line** - Prints 150 dashes.
+
+```perl
+    for my $i (@items) {
+        my $free_display = (ref $i->{free} || $i->{free} =~ /^\d/) ? sprintf("%.1f%%", $i->{free}) : $i->{free};
+```
+**Format free percentage** - If the value is a reference (number) or starts with a digit, format it with 1 decimal place and % sign. Otherwise, show it as-is (for 'N/A').
+
+```perl
+        printf "%-6s %-4s %-10s %-20s %-12s %-6s %-20s %-12s %-12s %-12s %-8s\n",
+            $i->{id}, $i->{type}, $i->{status}, $i->{name}, $i->{node},
+            $i->{cores}, $i->{mem}, $i->{total_disk}, $i->{total_filesystem},
+            $i->{free_disk}, $free_display;
+    }
+```
+**Print each item** - Formats and prints each row with proper column alignment.
+
+```perl
+    print "=" x 150 . "\n";
+    return \@items;
+```
+**Print footer and return** - Prints the bottom separator and returns a reference to the items array.
+
+### Menu Function
+
+```perl
+sub menu {
+    my ($px, $items) = @_;
+```
+**Menu function** - Displays interactive menu and handles user choices.
+
+```perl
+    print "\n1. Start VM/CT  2. Stop VM/CT  3. Start all stopped  4. Refresh  5. Exit\n";
+    print "Choice: ";
+    my $c = <STDIN>;
+    chomp $c;
+```
+**Get user input** - Displays menu, prompts for choice, reads from STDIN, and removes the trailing newline with `chomp`.
+
+```perl
+    if ($c eq '1') {
+        print "ID: ";
+        my $vid = <STDIN>;
+        chomp $vid;
+```
+**Start VM/CT option** - If user chose 1, prompt for the VM/container ID.
+
+```perl
+        my ($item) = grep { $_->{id} eq $vid } @$items;
+```
+**Find item by ID** - Uses `grep` to filter the items array, finding the one with matching ID.
+
+```perl
+        if ($item) {
+            my $type = $item->{type} eq 'VM' ? 'qemu' : 'lxc';
+```
+**Determine API path** - Uses ternary operator to select 'qemu' for VMs or 'lxc' for containers.
+
+```perl
+            $px->post("/nodes/$item->{node}/$type/$item->{id}/status/start");
+            print "✓ Started $item->{type} $item->{id}\n";
+        }
+    }
+```
+**Start the VM/CT** - Makes a POST request to start it and prints confirmation.
+
+```perl
+    elsif ($c eq '2') {
+        print "ID: ";
+        my $vid = <STDIN>;
+        chomp $vid;
+        my ($item) = grep { $_->{id} eq $vid } @$items;
+        if ($item) {
+            my $type = $item->{type} eq 'VM' ? 'qemu' : 'lxc';
+            $px->post("/nodes/$item->{node}/$type/$item->{id}/status/stop");
+            print "✓ Stopped $item->{type} $item->{id}\n";
+        }
+    }
+```
+**Stop VM/CT option** - Same as start but calls the stop endpoint.
+
+```perl
+    elsif ($c eq '3') {
+        for my $item (grep { $_->{status} ne 'running' } @$items) {
+```
+**Start all stopped option** - Filters items to only non-running ones.
+
+```perl
+            my $type = $item->{type} eq 'VM' ? 'qemu' : 'lxc';
+            $px->post("/nodes/$item->{node}/$type/$item->{id}/status/start");
+            print "✓ Started $item->{type} $item->{id}\n";
+        }
+    }
+```
+**Start each stopped VM/CT** - Loops through all stopped items and starts them.
+
+```perl
+    elsif ($c eq '5') {
+        return 0;
+    }
+```
+**Exit option** - Returns 0 to signal exit.
+
+```perl
+    return 1;
+```
+**Continue loop** - Returns 1 to continue the main loop for all other options.
+
+### Main Program
+
+```perl
+my $px = Proxmox->new($HOST, $USER, $PASSWORD);
+```
+**Create Proxmox object** - Instantiates and authenticates with the Proxmox API.
+
+```perl
+while (1) {
+    my $items = show($px);
+    last unless menu($px, $items);
+}
+```
+**Main loop** - Infinite loop that displays the dashboard and menu. `last` exits the loop when menu returns 0 (exit choice). `unless` is the negative form of `if`.
+
+---
+
+## Python Script Explanation
+
+### Shebang and Imports
+
+```python
+#!/usr/bin/env python3
+```
+**Shebang line** - Tells the system to use Python 3 interpreter to run this script.
+
+```python
+import requests
+```
+**Import requests library** - Provides HTTP client functionality for making API calls.
+
+```python
+import urllib3
+```
+**Import urllib3** - Used to disable SSL warnings.
+
+```python
+urllib3.disable_warnings()
+```
+**Disable SSL warnings** - Suppresses warnings about unverified HTTPS requests (necessary for self-signed certificates).
+
+### Configuration
+
+```python
+HOST = "192.168.1.100"  # Change this
+USER = "root@pam"        # Change this
+PASSWORD = "your_password"  # Change this
+```
+**Configuration constants** - Global variables storing connection details. Python uses `ALL_CAPS` convention for constants.
+
+### Proxmox Class
+
+```python
+class Proxmox:
+```
+**Define Proxmox class** - Creates a class to encapsulate API interactions.
+
+```python
+    def __init__(self, host, user, password):
+```
+**Constructor method** - Python's special method for initializing objects. `self` is the instance reference (like `$self` in Perl).
+
+```python
+        self.base = f"https://{host}:8006/api2/json"
+```
+**Set base URL** - Uses f-string (formatted string literal) to create the API base URL. The `f` prefix allows embedding variables with `{}`.
+
+```python
+        r = requests.post(f"{self.base}/access/ticket", 
+                         data={'username': user, 'password': password}, verify=False)
+```
+**POST authentication request** - Sends credentials to get ticket. `verify=False` disables SSL verification. `data=` sends form-encoded data.
+
+```python
+        d = r.json()['data']
+```
+**Parse JSON response** - `.json()` automatically parses JSON, then extracts the 'data' key.
+
+```python
+        self.cookies = {'PVEAuthCookie': d['ticket']}
+        self.headers = {'CSRFPreventionToken': d['CSRFPreventionToken']}
+```
+**Store authentication data** - Saves cookie and CSRF token as instance variables.
+
+```python
+    def get(self, path):
+        return requests.get(f"{self.base}{path}", cookies=self.cookies, verify=False).json()['data']
+```
+**GET request method** - Makes GET request with authentication cookie, parses JSON, and returns the data. Method chaining: `.get().json()['data']`.
+
+```python
+    def post(self, path):
+        return requests.post(f"{self.base}{path}", headers=self.headers, cookies=self.cookies, verify=False)
+```
+**POST request method** - Makes POST request with both headers (CSRF token) and cookies.
+
+### Helper Function
+
+```python
+def fmt(b):
+```
+**Format bytes function** - Converts bytes to human-readable format.
+
+```python
+    if not b or b == 'N/A': return 'N/A'
+```
+**Check for invalid values** - Returns 'N/A' if value is falsy (None, 0, empty) or already 'N/A'.
+
+```python
+    b = float(b)
+```
+**Convert to float** - Ensures the value is a floating-point number.
+
+```python
+    for u in ['B','KB','MB','GB','TB']:
+        if b < 1024: return f"{b:.1f}{u}"
+        b /= 1024
+```
+**Unit conversion** - Iterates through units, dividing by 1024 each time. `:.1f` formats with 1 decimal place.
+
+### Show Function
+
+```python
+def show(px):
+    items = []
+```
+**Show function** - Displays dashboard. Creates empty list to store all items.
+
+```python
+    for node in px.get('/nodes'):
+        n = node['node']
+```
+**Loop through nodes** - Iterates over each node, extracting the node name.
+
+#### Processing VMs
+
+```python
+        for vm in px.get(f'/nodes/{n}/qemu'):
+```
+**Loop through VMs** - Gets all VMs on this node and iterates.
+
+```python
+            cfg = px.get(f'/nodes/{n}/qemu/{vm["vmid"]}/config')
+            stat = px.get(f'/nodes/{n}/qemu/{vm["vmid"]}/status/current')
+```
+**Get VM details** - Fetches configuration and current status.
+
+```python
+            balloon = int(cfg.get('balloon', 0)) * 1024 * 1024 if cfg.get('balloon') else 0
+            maxmem = int(cfg.get('memory', 0)) * 1024 * 1024 if cfg.get('memory') else 0
+```
+**Calculate memory** - Uses `.get()` method with default value 0. Conditional expression converts to bytes if value exists. `int()` ensures numeric type.
+
+```python
+            total_disk = 0
+            for key in sorted(cfg.keys()):
+```
+**Find primary disk** - Sorts config keys and loops through them.
+
+```python
+                if key.startswith(('scsi0', 'sata0', 'ide0', 'virtio0')):
+```
+**Check for disk key** - `.startswith()` checks if key begins with any of these strings. Python tuple allows multiple values.
+
+```python
+                    value = str(cfg[key])
+                    if ':' in value:
+```
+**Parse disk config** - Converts value to string and checks if it contains a colon (disk format indicator).
+
+```python
+                        parts = value.split(',')
+                        for part in parts:
+```
+**Split config string** - `.split(',')` creates a list of parts separated by commas.
+
+```python
+                            if 'size=' in part:
+                                size_str = part.split('size=')[1].strip()
+```
+**Extract size** - Splits on 'size=' and takes the second part ([1]), then `.strip()` removes whitespace.
+
+```python
+                                if size_str.endswith('G'):
+                                    total_disk = float(size_str[:-1]) * 1024 * 1024 * 1024
+```
+**Convert size** - `.endswith()` checks last character. `[:-1]` slices off last character. Converts to bytes.
+
+```python
+                                elif size_str.endswith('M'):
+                                    total_disk = float(size_str[:-1]) * 1024 * 1024
+                                elif size_str.endswith('T'):
+                                    total_disk = float(size_str[:-1]) * 1024 * 1024 * 1024 * 1024
+                                break
+```
+**Handle other units** - Same logic for MB and TB. `break` exits the inner loop.
+
+```python
+                    if total_disk > 0:
+                        break
+```
+**Exit if found** - Exits the outer loop once disk is found.
+
+```python
+, `@`, `%`) and explicit dereferencing vs Python's cleaner syntax and mandatory indentation. Both languages handle the same data structures (hashes/dicts, arrays/lists) and perform identical API operations.
