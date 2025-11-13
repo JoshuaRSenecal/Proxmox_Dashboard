@@ -83,7 +83,7 @@ def show(px):
                 'status': vm['status'], 'node': n,
                 'cores': cfg.get('cores', 'N/A'),
                 'mem': f"{fmt(balloon)} - {fmt(maxmem)}",
-                'total_disk': fmt(total_disk),
+                'total_disk': fmt(total_disk) if total_disk > 0 else 'N/A',
                 'free_disk': disk_free,
                 'free': disk_free_pct
             })
@@ -97,29 +97,49 @@ def show(px):
             memory = int(cfg.get('memory', 0)) * 1024 * 1024 if cfg.get('memory') else 0
             swap = int(cfg.get('swap', 0)) * 1024 * 1024 if cfg.get('swap') else 0
             
-            # Disk usage - containers report this more reliably
-            disk_used = stat.get('disk', 0)
-            disk_max = stat.get('maxdisk', 0)
-            disk_free_pct = ((disk_max - disk_used) / disk_max * 100) if disk_max > 0 and ct['status'] == 'running' else 0
+            # Get total disk from rootfs config
+            total_disk = 0
+            rootfs = cfg.get('rootfs', '')
+            if 'size=' in str(rootfs):
+                size_str = str(rootfs).split('size=')[1].split(',')[0].strip()
+                if size_str.endswith('G'):
+                    total_disk = float(size_str[:-1]) * 1024 * 1024 * 1024
+                elif size_str.endswith('M'):
+                    total_disk = float(size_str[:-1]) * 1024 * 1024
+                elif size_str.endswith('T'):
+                    total_disk = float(size_str[:-1]) * 1024 * 1024 * 1024 * 1024
+            
+            # Disk usage - containers report this reliably when running
+            disk_free = 'N/A'
+            disk_free_pct = 'N/A'
+            
+            if ct['status'] == 'running':
+                disk_used = stat.get('disk', 0)
+                disk_max = stat.get('maxdisk', 0)
+                if disk_max > 0:
+                    free_bytes = disk_max - disk_used
+                    disk_free = fmt(free_bytes)
+                    disk_free_pct = (free_bytes / disk_max * 100)
             
             items.append({
                 'id': ct['vmid'], 'name': ct['name'], 'type': 'CT',
                 'status': ct['status'], 'node': n,
                 'cores': cfg.get('cores', 'N/A'),
                 'mem': f"{fmt(memory)} - {fmt(swap)}",
-                'disk': fmt(disk_max),
-                'free': disk_free_pct if ct['status'] == 'running' else 'N/A'
+                'total_disk': fmt(total_disk) if total_disk > 0 else 'N/A',
+                'free_disk': disk_free,
+                'free': disk_free_pct
             })
     
     items.sort(key=lambda x: x['id'])
     
-    print("\n" + "="*110)
-    print(f"{'ID':<6} {'Type':<4} {'Status':<10} {'Name':<20} {'Node':<12} {'Cores':<6} {'Memory':<20} {'Disk':<10} {'Free%':<6}")
-    print("-"*110)
+    print("\n" + "="*130)
+    print(f"{'ID':<6} {'Type':<4} {'Status':<10} {'Name':<20} {'Node':<12} {'Cores':<6} {'Memory':<20} {'Total Disk':<12} {'Free Disk':<12} {'Free%':<8}")
+    print("-"*130)
     for i in items:
         free_display = f"{i['free']:.1f}%" if isinstance(i['free'], (int, float)) else i['free']
-        print(f"{i['id']:<6} {i['type']:<4} {i['status']:<10} {i['name']:<20} {i['node']:<12} {i['cores']:<6} {i['mem']:<20} {i['disk']:<10} {free_display:<6}")
-    print("="*110)
+        print(f"{i['id']:<6} {i['type']:<4} {i['status']:<10} {i['name']:<20} {i['node']:<12} {i['cores']:<6} {i['mem']:<20} {i['total_disk']:<12} {i['free_disk']:<12} {free_display:<8}")
+    print("="*130)
     return items
 
 def menu(px, items):
