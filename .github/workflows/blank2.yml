@@ -68,6 +68,7 @@ def show(px):
             # Disk usage - VMs need agent for accurate disk usage
             disk_free = 'N/A'
             disk_free_pct = 'N/A'
+            total_filesystem = 'N/A'
             
             if vm['status'] == 'running':
                 # Try to get filesystem info from agent
@@ -97,6 +98,7 @@ def show(px):
                                     avail_fs += (total - used)
                         
                         if total_fs > 0 and avail_fs > 0:
+                            total_filesystem = fmt(total_fs)
                             disk_free = fmt(avail_fs)
                             disk_free_pct = (avail_fs / total_fs * 100)
                 except:
@@ -108,6 +110,7 @@ def show(px):
                 'cores': cfg.get('cores', 'N/A'),
                 'mem': f"{fmt(balloon)} - {fmt(maxmem)}",
                 'total_disk': fmt(total_disk) if total_disk > 0 else 'N/A',
+                'total_filesystem': total_filesystem,
                 'free_disk': disk_free,
                 'free': disk_free_pct
             })
