@@ -2,7 +2,7 @@
 use strict;
 use warnings;
 use LWP::UserAgent;
-use JSON qw(decode_json);
+use JSON;
 use HTTP::Request;
 
 # Configuration
@@ -34,7 +34,8 @@ package Proxmox {
         });
         die "Auth failed: " . $response->status_line unless $response->is_success;
         
-        my $data = decode_json($response->content)->{data};
+        my $json = JSON->new;
+        my $data = $json->decode($response->content)->{data};
         $self->{cookies} = { PVEAuthCookie => $data->{ticket} };
         $self->{headers} = { CSRFPreventionToken => $data->{CSRFPreventionToken} };
     }
@@ -46,7 +47,8 @@ package Proxmox {
         $req->header('Cookie' => "PVEAuthCookie=$self->{cookies}{PVEAuthCookie}");
         my $response = $self->{ua}->request($req);
         die "GET failed: " . $response->status_line unless $response->is_success;
-        return decode_json($response->content)->{data};
+        my $json = JSON->new;
+        return $json->decode($response->content)->{data};
     }
     
     sub post {
@@ -60,6 +62,8 @@ package Proxmox {
         return $response;
     }
 }
+
+package main;
 
 # Format bytes to human readable
 sub fmt {
