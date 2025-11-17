@@ -51,9 +51,9 @@ class Proxmox:
 def fmt(b):
     if not b or b == 'N/A': return 'N/A'
     b = float(b)
-    for u in ['B','KB','MB','GB','TB']:
-        if b < 1000: return f"{b:.1f}{u}"
-        b /= 1000
+    for u in ['B','KiB','MiB','GiB','TiB']:
+        if b < 1024: return f"{b:.1f}{u}"
+        b /= 1024
 
 def show(px):
     items = []
