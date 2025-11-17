@@ -98,9 +98,9 @@ sub fmt {
     my ($b) = @_;
     return 'N/A' unless defined $b && $b ne 'N/A';
     $b = 0 + $b;  # Convert to number
-    for my $u ('B', 'KB', 'MB', 'GB', 'TB') {
-        return sprintf("%.1f%s", $b, $u) if $b < 1000;
-        $b /= 1000;
+    for my $u ('B', 'KiB', 'MiB', 'GiB', 'TiB') {
+        return sprintf("%.1f%s", $b, $u) if $b < 1024;
+        $b /= 1024;
     }
     return sprintf("%.1fPB", $b);
 }
