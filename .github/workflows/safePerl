@@ -102,7 +102,7 @@ sub fmt {
         return sprintf("%.1f%s", $b, $u) if $b < 1024;
         $b /= 1024;
     }
-    return sprintf("%.1fPB", $b);
+    return sprintf("%.1fPiB", $b);
 }
 
 # Show dashboard
