@@ -200,13 +200,13 @@ def show(px):
     
     items.sort(key=lambda x: x['id'])
     
-    print("\n" + "="*170)
+    print("\n" + "="*158)
     print(f"{'ID':<6} {'Type':<4} {'Status':<10} {'Name':<20} {'Node':<12} {'Cores':<6} {'Sockets':<8} {'CPU Type':<15} {'Memory':<20} {'Total Disk':<12} {'Total FS':<12} {'Free Disk':<12} {'Free%':<8}")
-    print("-"*170)
+    print("-"*158)
     for i in items:
         free_display = f"{i['free']:.1f}%" if isinstance(i['free'], (int, float)) else i['free']
         print(f"{i['id']:<6} {i['type']:<4} {i['status']:<10} {i['name']:<20} {i['node']:<12} {i['cores']:<6} {i['sockets']:<8} {i['cpu_type']:<15} {i['mem']:<20} {i['total_disk']:<12} {i['total_filesystem']:<12} {i['free_disk']:<12} {free_display:<8}")
-    print("="*170)
+    print("="*158)
     return items
 
 def menu(px, items):
