@@ -268,10 +268,10 @@ sub show {
     
     @items = sort { $a->{id} <=> $b->{id} } @items;
     
-    print "\n" . "=" x 170 . "\n";
+    print "\n" . "=" x 158 . "\n";
     printf "%-6s %-4s %-10s %-20s %-12s %-6s %-8s %-15s %-20s %-12s %-12s %-12s %-8s\n",
         'ID', 'Type', 'Status', 'Name', 'Node', 'Cores', 'Sockets', 'CPU Type', 'Memory', 'Total Disk', 'Total FS', 'Free Disk', 'Free%';
-    print "-" x 170 . "\n";
+    print "-" x 158 . "\n";
     
     for my $i (@items) {
         my $free_display = (ref $i->{free} || $i->{free} =~ /^\d/) ? sprintf("%.1f%%", $i->{free}) : $i->{free};
@@ -281,7 +281,7 @@ sub show {
             $i->{free_disk}, $free_display;
     }
     
-    print "=" x 170 . "\n";
+    print "=" x 158 . "\n";
     return \@items;
 }
 
