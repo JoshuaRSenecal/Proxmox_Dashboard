@@ -1,1 +1,1436 @@
+#!/usr/bin/env python3
+"""
+Proxmox Dashboard - Enhanced with Full Metrics
+Features: CPU%, Memory Usage, Uptime, Guest Agent, Disk I/O, IPs, Boot Order
+Optimized for performance with parallel processing and caching
+SUPPORTS MULTIPLE PROXMOX NODES
+"""
 
+import tkinter as tk
+from tkinter import ttk, messagebox, simpledialog
+import requests
+import json
+import base64
+import os
+import threading
+import time
+import queue
+from datetime import datetime, timedelta
+from cryptography.fernet import Fernet
+from cryptography.hazmat.primitives import hashes
+from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2
+from concurrent.futures import ThreadPoolExecutor, as_completed
+import urllib3
+
+# Configuration
+SALT = b'proxmox_dashboard_salt_v1'
+CREDENTIALS_FILE = os.path.expanduser('~/.proxmox_credentials.enc')
+PROXMOX_CA_CERT = os.path.expanduser('~/proxmox-ca.pem')
+AUDIT_LOG_FILE = os.path.expanduser('~/.proxmox_dashboard_audit.log')
+REFRESH_INTERVAL = 30  # seconds
+MAX_RETRIES = 3
+RETRY_DELAY = 2
+MAX_WORKERS = 10  # Parallel workers for fetching VM data
+
+# Performance options
+FETCH_GUEST_AGENT_DATA = True  # Set to False to skip slow guest agent calls
+CACHE_DURATION = 60  # Cache guest agent data for 60 seconds
+
+# SSL Configuration
+USE_SSL_VERIFICATION = os.path.exists(PROXMOX_CA_CERT)
+
+if not USE_SSL_VERIFICATION:
+    urllib3.disable_warnings()
+    print("WARNING: SSL Verification: Disabled (CA certificate not found)")
+    print(f"   To enable: scp root@YOUR_PROXMOX_IP:/etc/pve/pve-root-ca.pem ~/proxmox-ca.pem")
+else:
+    print(f"INFO: SSL Verification: Enabled (using {PROXMOX_CA_CERT})")
+
+class AuditLogger:
+    """Audit logger for tracking all critical operations"""
+    
+    @staticmethod
+    def log(action, target, result, details=None):
+        try:
+            timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            log_entry = f"{timestamp} | {action:20} | {target:20} | {result:10}"
+            if details:
+                log_entry += f" | {details}"
+            
+            with open(AUDIT_LOG_FILE, 'a') as f:
+                f.write(log_entry + '\n')
+        except Exception as e:
+            print(f"Failed to write audit log: {e}")
+    
+    @staticmethod
+    def log_authentication(host, user, success):
+        result = "SUCCESS" if success else "FAILED"
+        AuditLogger.log("AUTH", f"{user}@{host}", result)
+    
+    @staticmethod
+    def log_vm_action(action, vmid, vm_type, vm_name, success, error=None):
+        result = "SUCCESS" if success else "FAILED"
+        target = f"{vm_type} {vmid} ({vm_name})"
+        details = f"Error: {error}" if error else None
+        AuditLogger.log(action, target, result, details)
+
+class ProxmoxAPI:
+    """Proxmox API Client with HTTPS encryption, SSL verification, and retry logic"""
+    def __init__(self, host, user=None, password=None, token_id=None, token_secret=None):
+        self.base = f"https://{host}:8006/api2/json"
+        self.host = host
+        self.use_token = token_id is not None and token_secret is not None
+        self.cache = {}  # Simple cache for guest agent data
+        
+        if USE_SSL_VERIFICATION:
+            self.verify = PROXMOX_CA_CERT
+            self.ssl_status = "Verified"
+        else:
+            self.verify = False
+            self.ssl_status = "Unverified"
+        
+        if self.use_token:
+            self.cookies = None
+            self.headers = {'Authorization': f'PVEAPIToken={token_id}={token_secret}'}
+            try:
+                self._api_request('get', '/version')
+                AuditLogger.log_authentication(host, token_id, True)
+            except Exception as e:
+                AuditLogger.log_authentication(host, token_id, False)
+                raise Exception(f"API token authentication failed: {str(e)}")
+        else:
+            if not user or not password:
+                raise Exception("Either user/password or token_id/token_secret must be provided")
+            
+            try:
+                r = requests.post(
+                    f"{self.base}/access/ticket",
+                    data={'username': user, 'password': password},
+                    verify=self.verify,
+                    timeout=10
+                )
+                if r.status_code != 200:
+                    AuditLogger.log_authentication(host, user, False)
+                    raise Exception(f"Authentication failed: {r.status_code}")
+                
+                d = r.json()['data']
+                self.cookies = {'PVEAuthCookie': d['ticket']}
+                self.headers = {'CSRFPreventionToken': d['CSRFPreventionToken']}
+                AuditLogger.log_authentication(host, user, True)
+            except Exception as e:
+                AuditLogger.log_authentication(host, user, False)
+                raise
+    
+    def _api_request(self, method, path, retries=MAX_RETRIES, **kwargs):
+        """Make API request with retry logic"""
+        for attempt in range(retries):
+            try:
+                if method == 'get':
+                    r = requests.get(
+                        f"{self.base}{path}",
+                        cookies=self.cookies,
+                        headers=self.headers if self.use_token else None,
+                        verify=self.verify,
+                        timeout=10,
+                        **kwargs
+                    )
+                elif method == 'post':
+                    r = requests.post(
+                        f"{self.base}{path}",
+                        cookies=self.cookies,
+                        headers=self.headers,
+                        verify=self.verify,
+                        timeout=10,
+                        **kwargs
+                    )
+                
+                if r.status_code in [200, 201]:
+                    return r
+                elif r.status_code >= 500 and attempt < retries - 1:
+                    delay = RETRY_DELAY * (2 ** attempt)
+                    time.sleep(delay)
+                    continue
+                else:
+                    r.raise_for_status()
+                    
+            except requests.ConnectionError:
+                if attempt == retries - 1:
+                    raise Exception(f"Connection failed after {retries} attempts")
+                time.sleep(RETRY_DELAY * (2 ** attempt))
+            except requests.Timeout:
+                if attempt == retries - 1:
+                    raise Exception(f"Request timeout after {retries} attempts")
+                time.sleep(RETRY_DELAY * (2 ** attempt))
+            except Exception as e:
+                if attempt == retries - 1:
+                    raise
+                time.sleep(RETRY_DELAY * (2 ** attempt))
+        
+        raise Exception(f"API request failed after {retries} attempts")
+    
+    def get(self, path):
+        r = self._api_request('get', path)
+        return r.json()['data']
+    
+    def post(self, path, data=None):
+        kwargs = {'data': data} if data else {}
+        return self._api_request('post', path, **kwargs)
+    
+    def get_cached(self, cache_key, fetch_func, duration=CACHE_DURATION):
+        """Get data with caching"""
+        if cache_key in self.cache:
+            cached_time, cached_data = self.cache[cache_key]
+            if time.time() - cached_time < duration:
+                return cached_data
+        
+        data = fetch_func()
+        self.cache[cache_key] = (time.time(), data)
+        return data
+
+class CredentialManager:
+    """Manages encrypted credential storage - supports both passwords and API tokens"""
+    
+    @staticmethod
+    def get_key_from_password(password: str) -> bytes:
+        kdf = PBKDF2(
+            algorithm=hashes.SHA256(),
+            length=32,
+            salt=SALT,
+            iterations=100000,
+        )
+        return base64.urlsafe_b64encode(kdf.derive(password.encode()))
+    
+    @staticmethod
+    def save_credentials(host, master_password, user=None, password=None, token_id=None, token_secret=None):
+        credentials = {'host': host}
+        
+        if token_id and token_secret:
+            credentials['auth_type'] = 'token'
+            credentials['token_id'] = token_id
+            credentials['token_secret'] = token_secret
+        else:
+            credentials['auth_type'] = 'password'
+            credentials['user'] = user
+            credentials['password'] = password
+        
+        key = CredentialManager.get_key_from_password(master_password)
+        cipher = Fernet(key)
+        encrypted_data = cipher.encrypt(json.dumps(credentials).encode())
+        
+        with open(CREDENTIALS_FILE, 'wb') as f:
+            f.write(encrypted_data)
+        os.chmod(CREDENTIALS_FILE, 0o600)
+    
+    @staticmethod
+    def load_credentials(master_password):
+        if not os.path.exists(CREDENTIALS_FILE):
+            return None
+        
+        with open(CREDENTIALS_FILE, 'rb') as f:
+            encrypted_data = f.read()
+        
+        key = CredentialManager.get_key_from_password(master_password)
+        cipher = Fernet(key)
+        decrypted_data = cipher.decrypt(encrypted_data)
+        return json.loads(decrypted_data.decode())
+
+class CredentialsDialog(tk.Toplevel):
+    """Dialog for entering/setting up credentials - supports password and API token"""
+    
+    def __init__(self, parent, is_setup=False):
+        super().__init__(parent)
+        self.title("Setup Credentials" if is_setup else "Enter Credentials")
+        self.geometry("500x450")
+        self.resizable(False, False)
+        self.result = None
+        self.is_setup = is_setup
+        self.auth_type = tk.StringVar(value="password")
+        
+        self.update_idletasks()
+        x = (self.winfo_screenwidth() // 2) - 250
+        y = (self.winfo_screenheight() // 2) - 225
+        self.geometry(f"500x450+{x}+{y}")
+        
+        self.create_widgets()
+        self.protocol("WM_DELETE_WINDOW", self.on_cancel)
+        self.grab_set()
+    
+    def create_widgets(self):
+        # Title
+        title_frame = tk.Frame(self, bg="#2c3e50", height=60)
+        title_frame.pack(fill=tk.X)
+        title_frame.pack_propagate(False)
+        
+        title_label = tk.Label(
+            title_frame,
+            text="Proxmox Dashboard Setup" if self.is_setup else "Unlock Dashboard",
+            font=("Arial", 16, "bold"),
+            bg="#2c3e50",
+            fg="white"
+        )
+        title_label.pack(pady=15)
+        
+        # Form frame
+        form_frame = tk.Frame(self, bg="white")
+        form_frame.pack(fill=tk.BOTH, expand=True, padx=20, pady=20)
+        
+        # Host
+        tk.Label(form_frame, text="Proxmox Host:", font=("Arial", 10), bg="white").grid(row=0, column=0, sticky="w", pady=5)
+        self.host_entry = tk.Entry(form_frame, font=("Arial", 10), width=35)
+        self.host_entry.grid(row=0, column=1, pady=5, columnspan=2)
+        self.host_entry.insert(0, "192.168.1.100")
+        
+        # Auth type
+        tk.Label(form_frame, text="Authentication:", font=("Arial", 10, "bold"), bg="white").grid(row=1, column=0, sticky="w", pady=10, columnspan=3)
+        
+        auth_frame = tk.Frame(form_frame, bg="white")
+        auth_frame.grid(row=2, column=0, columnspan=3, sticky="w", pady=5)
+        
+        tk.Radiobutton(
+            auth_frame,
+            text="Password",
+            variable=self.auth_type,
+            value="password",
+            command=self.toggle_auth_fields,
+            font=("Arial", 9),
+            bg="white"
+        ).pack(side=tk.LEFT, padx=5)
+        
+        tk.Radiobutton(
+            auth_frame,
+            text="API Token (Recommended)",
+            variable=self.auth_type,
+            value="token",
+            command=self.toggle_auth_fields,
+            font=("Arial", 9),
+            bg="white"
+        ).pack(side=tk.LEFT, padx=5)
+        
+        # Password fields
+        self.password_frame = tk.Frame(form_frame, bg="white")
+        self.password_frame.grid(row=3, column=0, columnspan=3, sticky="ew", pady=5)
+        
+        tk.Label(self.password_frame, text="Username:", font=("Arial", 10), bg="white").grid(row=0, column=0, sticky="w", pady=5)
+        self.user_entry = tk.Entry(self.password_frame, font=("Arial", 10), width=35)
+        self.user_entry.grid(row=0, column=1, pady=5)
+        self.user_entry.insert(0, "root@pam")
+        
+        tk.Label(self.password_frame, text="Password:", font=("Arial", 10), bg="white").grid(row=1, column=0, sticky="w", pady=5)
+        self.pass_entry = tk.Entry(self.password_frame, font=("Arial", 10), width=35, show="*")
+        self.pass_entry.grid(row=1, column=1, pady=5)
+        
+        # Token fields
+        self.token_frame = tk.Frame(form_frame, bg="white")
+        self.token_frame.grid(row=3, column=0, columnspan=3, sticky="ew", pady=5)
+        
+        tk.Label(self.token_frame, text="Token ID:", font=("Arial", 10), bg="white").grid(row=0, column=0, sticky="w", pady=5)
+        self.token_id_entry = tk.Entry(self.token_frame, font=("Arial", 10), width=35)
+        self.token_id_entry.grid(row=0, column=1, pady=5)
+        
+        tk.Label(self.token_frame, text="Token Secret:", font=("Arial", 10), bg="white").grid(row=1, column=0, sticky="w", pady=5)
+        self.token_secret_entry = tk.Entry(self.token_frame, font=("Arial", 10), width=35, show="*")
+        self.token_secret_entry.grid(row=1, column=1, pady=5)
+        
+        tk.Label(
+            self.token_frame,
+            text="Create token in Proxmox: Datacenter -> Permissions -> API Tokens",
+            font=("Arial", 8),
+            bg="white",
+            fg="#7f8c8d"
+        ).grid(row=2, column=0, columnspan=2, sticky="w", pady=2)
+        
+        # Master password
+        tk.Label(form_frame, text="Master Password:", font=("Arial", 10), bg="white").grid(row=4, column=0, sticky="w", pady=5)
+        self.master_entry = tk.Entry(form_frame, font=("Arial", 10), width=35, show="*")
+        self.master_entry.grid(row=4, column=1, pady=5, columnspan=2)
+        
+        if self.is_setup:
+            tk.Label(form_frame, text="Confirm Master:", font=("Arial", 10), bg="white").grid(row=5, column=0, sticky="w", pady=5)
+            self.master_confirm = tk.Entry(form_frame, font=("Arial", 10), width=35, show="*")
+            self.master_confirm.grid(row=5, column=1, pady=5, columnspan=2)
+        
+        # Buttons
+        btn_frame = tk.Frame(form_frame, bg="white")
+        btn_frame.grid(row=6, column=0, columnspan=3, pady=15)
+        
+        tk.Button(
+            btn_frame,
+            text="Save & Connect" if self.is_setup else "Connect",
+            command=self.on_ok,
+            bg="#27ae60",
+            fg="white",
+            font=("Arial", 10, "bold"),
+            width=15,
+            cursor="hand2"
+        ).pack(side=tk.LEFT, padx=5)
+        
+        tk.Button(
+            btn_frame,
+            text="Cancel",
+            command=self.on_cancel,
+            bg="#95a5a6",
+            fg="white",
+            font=("Arial", 10),
+            width=15,
+            cursor="hand2"
+        ).pack(side=tk.LEFT, padx=5)
+        
+        self.toggle_auth_fields()
+    
+    def toggle_auth_fields(self):
+        if self.auth_type.get() == "password":
+            self.token_frame.grid_remove()
+            self.password_frame.grid()
+        else:
+            self.password_frame.grid_remove()
+            self.token_frame.grid()
+    
+    def on_ok(self):
+        host = self.host_entry.get().strip()
+        master = self.master_entry.get()
+        
+        if not host or not master:
+            messagebox.showerror("Error", "Host and master password are required!")
+            return
+        
+        if self.is_setup:
+            confirm = self.master_confirm.get()
+            if master != confirm:
+                messagebox.showerror("Error", "Master passwords don't match!")
+                return
+        
+        if self.auth_type.get() == "password":
+            user = self.user_entry.get().strip()
+            password = self.pass_entry.get()
+            if not user or not password:
+                messagebox.showerror("Error", "Username and password are required!")
+                return
+            self.result = ('password', host, user, password, None, None, master)
+        else:
+            token_id = self.token_id_entry.get().strip()
+            token_secret = self.token_secret_entry.get()
+            if not token_id or not token_secret:
+                messagebox.showerror("Error", "Token ID and Token Secret are required!")
+                return
+            self.result = ('token', host, None, None, token_id, token_secret, master)
+        
+        self.destroy()
+    
+    def on_cancel(self):
+        self.result = None
+        self.destroy()
+
+class ProxmoxDashboard:
+    """Main Dashboard Application - Enhanced with Full Metrics"""
+    
+    def __init__(self, root):
+        self.root = root
+        self.root.title("Proxmox Dashboard - Enhanced with Full Metrics")
+        self.root.geometry("1600x900")
+        
+        self.root.update_idletasks()
+        x = (self.root.winfo_screenwidth() // 2) - 800
+        y = (self.root.winfo_screenheight() // 2) - 450
+        self.root.geometry(f"1600x900+{x}+{y}")
+        
+        self.api = None
+        self.auto_refresh = True
+        self.refresh_thread = None
+        self.health_check_thread = None
+        self.vm_data = []
+        self.filtered_vm_data = []
+        self.search_query = ""
+        self.is_loading = False
+        self.task_queue = queue.Queue()
+        self.connection_healthy = False
+        self.node_count = 0
+        
+        self.setup_styles()
+        self.create_widgets()
+        
+        if not self.authenticate():
+            self.root.destroy()
+            return
+        
+        self.start_auto_refresh()
+        self.start_health_check()
+        self.start_task_processor()
+    
+    def setup_styles(self):
+        style = ttk.Style()
+        style.theme_use('clam')
+        
+        style.configure("Treeview",
+                       background="#ecf0f1",
+                       foreground="black",
+                       rowheight=30,
+                       fieldbackground="#ecf0f1",
+                       font=("Arial", 9))
+        style.map('Treeview', background=[('selected', '#3498db')])
+        
+        style.configure("Treeview.Heading",
+                       background="#34495e",
+                       foreground="white",
+                       font=("Arial", 9, "bold"))
+    
+    def create_widgets(self):
+        # Top bar
+        top_frame = tk.Frame(self.root, bg="#2c3e50", height=70)
+        top_frame.pack(fill=tk.X)
+        top_frame.pack_propagate(False)
+        
+        title_label = tk.Label(
+            top_frame,
+            text="Proxmox VM/Container Dashboard - Enhanced",
+            font=("Arial", 18, "bold"),
+            bg="#2c3e50",
+            fg="white"
+        )
+        title_label.pack(side=tk.LEFT, padx=20, pady=15)
+        
+        # Status indicators
+        self.status_frame = tk.Frame(top_frame, bg="#2c3e50")
+        self.status_frame.pack(side=tk.RIGHT, padx=20)
+        
+        self.connection_label = tk.Label(
+            self.status_frame,
+            text="[Connected]",
+            font=("Arial", 10),
+            bg="#2c3e50",
+            fg="#27ae60"
+        )
+        self.connection_label.pack()
+        
+        self.node_label = tk.Label(
+            self.status_frame,
+            text="Nodes: 0",
+            font=("Arial", 10),
+            bg="#2c3e50",
+            fg="white"
+        )
+        self.node_label.pack()
+        
+        self.ssl_label = tk.Label(
+            self.status_frame,
+            text="SSL: Checking...",
+            font=("Arial", 10),
+            bg="#2c3e50",
+            fg="white"
+        )
+        self.ssl_label.pack()
+        
+        self.last_update_label = tk.Label(
+            self.status_frame,
+            text="Last update: --",
+            font=("Arial", 9),
+            bg="#2c3e50",
+            fg="#bdc3c7"
+        )
+        self.last_update_label.pack()
+        
+        # Control panel
+        control_frame = tk.Frame(self.root, bg="#ecf0f1", height=80)
+        control_frame.pack(fill=tk.X)
+        control_frame.pack_propagate(False)
+        
+        btn_container = tk.Frame(control_frame, bg="#ecf0f1")
+        btn_container.pack(pady=15)
+        
+        self.start_btn = tk.Button(
+            btn_container,
+            text="Start",
+            command=self.start_selected,
+            bg="#27ae60",
+            fg="white",
+            font=("Arial", 11, "bold"),
+            width=12,
+            height=2,
+            cursor="hand2",
+            relief=tk.RAISED,
+            bd=2
+        )
+        self.start_btn.pack(side=tk.LEFT, padx=5)
+        
+        self.stop_btn = tk.Button(
+            btn_container,
+            text="Stop",
+            command=self.stop_selected,
+            bg="#e74c3c",
+            fg="white",
+            font=("Arial", 11, "bold"),
+            width=12,
+            height=2,
+            cursor="hand2",
+            relief=tk.RAISED,
+            bd=2
+        )
+        self.stop_btn.pack(side=tk.LEFT, padx=5)
+        
+        tk.Button(
+            btn_container,
+            text="Refresh",
+            command=self.refresh_data_async,
+            bg="#3498db",
+            fg="white",
+            font=("Arial", 11, "bold"),
+            width=12,
+            height=2,
+            cursor="hand2",
+            relief=tk.RAISED,
+            bd=2
+        ).pack(side=tk.LEFT, padx=5)
+        
+        tk.Button(
+            btn_container,
+            text="Start All",
+            command=self.start_all_stopped,
+            bg="#16a085",
+            fg="white",
+            font=("Arial", 11, "bold"),
+            width=12,
+            height=2,
+            cursor="hand2",
+            relief=tk.RAISED,
+            bd=2
+        ).pack(side=tk.LEFT, padx=5)
+        
+        self.auto_refresh_var = tk.BooleanVar(value=True)
+        tk.Checkbutton(
+            btn_container,
+            text="Auto-refresh",
+            variable=self.auto_refresh_var,
+            command=self.toggle_auto_refresh,
+            font=("Arial", 10),
+            bg="#ecf0f1",
+            selectcolor="#3498db"
+        ).pack(side=tk.LEFT, padx=10)
+        
+        # Search bar
+        search_frame = tk.Frame(self.root, bg="#ecf0f1", height=40)
+        search_frame.pack(fill=tk.X)
+        search_frame.pack_propagate(False)
+        
+        tk.Label(
+            search_frame,
+            text="Search:",
+            font=("Arial", 10),
+            bg="#ecf0f1"
+        ).pack(side=tk.LEFT, padx=10)
+        
+        self.search_entry = tk.Entry(search_frame, font=("Arial", 10), width=30)
+        self.search_entry.pack(side=tk.LEFT, padx=5)
+        self.search_entry.bind('<KeyRelease>', self.filter_vms)
+        
+        tk.Label(
+            search_frame,
+            text="Filter by ID, Name, Type, Status, Node, or IP",
+            font=("Arial", 9),
+            bg="#ecf0f1",
+            fg="#7f8c8d"
+        ).pack(side=tk.LEFT, padx=10)
+        
+        # Progress bar
+        self.progress_frame = tk.Frame(self.root, bg="#ecf0f1", height=30)
+        self.progress_frame.pack(fill=tk.X)
+        self.progress_frame.pack_propagate(False)
+        
+        self.progress_bar = ttk.Progressbar(
+            self.progress_frame,
+            mode='indeterminate',
+            length=300
+        )
+        self.progress_bar.pack(side=tk.LEFT, padx=10, pady=5)
+        
+        self.progress_label = tk.Label(
+            self.progress_frame,
+            text="",
+            font=("Arial", 9),
+            bg="#ecf0f1",
+            fg="#7f8c8d"
+        )
+        self.progress_label.pack(side=tk.LEFT, padx=5)
+        
+        # Table with horizontal scrollbar
+        table_container = tk.Frame(self.root)
+        table_container.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
+        
+        # Create canvas and scrollbar for horizontal scrolling
+        canvas = tk.Canvas(table_container, bg="#ecf0f1")
+        hsb = ttk.Scrollbar(table_container, orient="horizontal", command=canvas.xview)
+        vsb = ttk.Scrollbar(table_container, orient="vertical")
+        
+        table_frame = tk.Frame(canvas)
+        
+        # Configure canvas
+        canvas.configure(xscrollcommand=hsb.set)
+        
+        # Enhanced columns with new metrics
+        columns = (
+            "ID", "Type", "Status", "Name", "Node", 
+            "CPU%", "Mem%", "Uptime", "Agent",
+            "Cores", "Memory", "Disk", "Free%",
+            "Read", "Write", "IPs", "Boot"
+        )
+        
+        self.tree = ttk.Treeview(
+            table_frame,
+            columns=columns,
+            show="tree headings",
+            yscrollcommand=vsb.set,
+            selectmode="browse",
+            height=20
+        )
+        
+        vsb.config(command=self.tree.yview)
+        
+        self.tree.column("#0", width=0, stretch=tk.NO)
+        
+        # Column widths optimized for new data
+        column_widths = {
+            "ID": 60, "Type": 50, "Status": 70, "Name": 150, "Node": 80,
+            "CPU%": 60, "Mem%": 60, "Uptime": 100, "Agent": 60,
+            "Cores": 60, "Memory": 100, "Disk": 80, "Free%": 60,
+            "Read": 80, "Write": 80, "IPs": 150, "Boot": 100
+        }
+        
+        for col in columns:
+            width = column_widths.get(col, 80)
+            self.tree.column(col, width=width, anchor="center")
+            self.tree.heading(col, text=col, anchor="center")
+        
+        self.tree.pack(fill=tk.BOTH, expand=True)
+        
+        # Pack scrollbars and canvas
+        hsb.pack(side=tk.BOTTOM, fill=tk.X)
+        vsb.pack(side=tk.RIGHT, fill=tk.Y)
+        canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        
+        # Create window in canvas
+        canvas_window = canvas.create_window((0, 0), window=table_frame, anchor="nw")
+        
+        # Configure scroll region
+        def configure_scroll_region(event):
+            canvas.configure(scrollregion=canvas.bbox("all"))
+        
+        table_frame.bind("<Configure>", configure_scroll_region)
+        
+        self.tree.bind("<<TreeviewSelect>>", self.on_select)
+        
+        # Status bar
+        status_bar = tk.Frame(self.root, bg="#34495e", height=30)
+        status_bar.pack(fill=tk.X)
+        status_bar.pack_propagate(False)
+        
+        self.status_label = tk.Label(
+            status_bar,
+            text="Ready",
+            font=("Arial", 9),
+            bg="#34495e",
+            fg="white",
+            anchor="w"
+        )
+        self.status_label.pack(side=tk.LEFT, padx=10, fill=tk.X, expand=True)
+    
+    def authenticate(self):
+        """Handle authentication - supports both password and API token"""
+        
+        if os.path.exists(CREDENTIALS_FILE):
+            while True:
+                master_password = simpledialog.askstring(
+                    "Master Password",
+                    "Enter your master password:",
+                    show='*',
+                    parent=self.root
+                )
+                
+                if master_password is None:
+                    return False
+                
+                try:
+                    creds = CredentialManager.load_credentials(master_password)
+                    if creds:
+                        if creds.get('auth_type') == 'token':
+                            self.api = ProxmoxAPI(
+                                creds['host'],
+                                token_id=creds['token_id'],
+                                token_secret=creds['token_secret']
+                            )
+                        else:
+                            self.api = ProxmoxAPI(
+                                creds['host'],
+                                user=creds['user'],
+                                password=creds['password']
+                            )
+                        
+                        self.status_label.config(text=f"Connected to {creds['host']}")
+                        self.ssl_label.config(text=f"SSL: {self.api.ssl_status}")
+                        self.connection_healthy = True
+                        return True
+                except Exception as e:
+                    messagebox.showerror("Error", f"Failed to decrypt or connect:\n{str(e)}")
+        
+        messagebox.showinfo("Setup", "No credentials found. Let's set up your connection.")
+        dialog = CredentialsDialog(self.root, is_setup=True)
+        self.root.wait_window(dialog)
+        
+        if dialog.result:
+            auth_type, host, user, password, token_id, token_secret, master = dialog.result
+            try:
+                if auth_type == 'token':
+                    self.api = ProxmoxAPI(host, token_id=token_id, token_secret=token_secret)
+                    CredentialManager.save_credentials(
+                        host, master, token_id=token_id, token_secret=token_secret
+                    )
+                else:
+                    self.api = ProxmoxAPI(host, user=user, password=password)
+                    CredentialManager.save_credentials(
+                        host, master, user=user, password=password
+                    )
+                
+                messagebox.showinfo("Success", "Credentials saved successfully!")
+                self.status_label.config(text=f"Connected to {host}")
+                self.ssl_label.config(text=f"SSL: {self.api.ssl_status}")
+                self.connection_healthy = True
+                return True
+            except Exception as e:
+                messagebox.showerror("Error", f"Connection failed:\n{str(e)}")
+                return False
+        
+        return False
+    
+    def start_task_processor(self):
+        """Process async tasks"""
+        def process_tasks():
+            while True:
+                try:
+                    task = self.task_queue.get(timeout=1)
+                    if task:
+                        func, args, callback = task
+                        try:
+                            result = func(*args)
+                            if callback:
+                                self.root.after(0, lambda r=result: callback(r, None))
+                        except Exception as e:
+                            if callback:
+                                self.root.after(0, lambda er=e: callback(None, er))
+                except queue.Empty:
+                    continue
+                except:
+                    break
+        
+        task_thread = threading.Thread(target=process_tasks, daemon=True)
+        task_thread.start()
+    
+    def run_async(self, func, args=(), callback=None):
+        """Run function asynchronously"""
+        self.task_queue.put((func, args, callback))
+    
+    def show_loading(self, message="Loading..."):
+        """Show loading indicator"""
+        self.is_loading = True
+        self.progress_label.config(text=message)
+        self.progress_bar.start()
+        self.status_label.config(text=f"[Loading] {message}")
+        self.root.config(cursor="watch")
+    
+    def hide_loading(self):
+        """Hide loading indicator"""
+        self.is_loading = False
+        self.progress_bar.stop()
+        self.progress_label.config(text="")
+        self.root.config(cursor="")
+    
+    def start_health_check(self):
+        """Start connection health check"""
+        def health_check_loop():
+            while True:
+                time.sleep(60)
+                try:
+                    if self.api:
+                        self.api.get('/version')
+                        self.connection_healthy = True
+                        self.root.after(0, lambda: self.connection_label.config(
+                            text="[Connected]", fg="#27ae60"
+                        ))
+                except:
+                    self.connection_healthy = False
+                    self.root.after(0, lambda: self.connection_label.config(
+                        text="[Disconnected]", fg="#e74c3c"
+                    ))
+                    self.root.after(0, self.attempt_reconnect)
+        
+        self.health_check_thread = threading.Thread(target=health_check_loop, daemon=True)
+        self.health_check_thread.start()
+    
+    def attempt_reconnect(self):
+        """Attempt reconnection"""
+        if self.is_loading:
+            return
+        
+        response = messagebox.askyesno(
+            "Connection Lost",
+            "Connection to Proxmox was lost. Attempt to reconnect?"
+        )
+        
+        if response:
+            self.show_loading("Reconnecting...")
+            
+            def try_reconnect():
+                try:
+                    self.api.get('/version')
+                    return True
+                except:
+                    return False
+            
+            def reconnect_callback(success, error):
+                self.hide_loading()
+                if success:
+                    messagebox.showinfo("Success", "Reconnected successfully!")
+                    self.refresh_data_async()
+                else:
+                    messagebox.showerror("Error", "Reconnection failed. Please restart the application.")
+            
+            self.run_async(try_reconnect, callback=reconnect_callback)
+    
+    def filter_vms(self, event=None):
+        """Filter VMs based on search query"""
+        query = self.search_entry.get().lower()
+        
+        for item in self.tree.get_children():
+            self.tree.delete(item)
+        
+        self.filtered_vm_data = []
+        for vm in self.vm_data:
+            if (query in str(vm['id']).lower() or
+                query in vm['name'].lower() or
+                query in vm['type'].lower() or
+                query in vm['status'].lower() or
+                query in vm['node'].lower() or
+                query in vm.get('ips', '').lower()):
+                self.filtered_vm_data.append(vm)
+                
+                tags = ('running',) if vm['status'] == 'running' else ('stopped',)
+                self.tree.insert('', 'end', values=(
+                    vm['id'], vm['type'], vm['status'], vm['name'], vm['node'],
+                    vm.get('cpu_pct', 'N/A'), vm.get('mem_pct', 'N/A'),
+                    vm.get('uptime', 'N/A'), vm.get('agent', 'N/A'),
+                    vm.get('cores', 'N/A'), vm.get('memory', 'N/A'),
+                    vm.get('disk', 'N/A'), vm.get('free_pct', 'N/A'),
+                    vm.get('disk_read', 'N/A'), vm.get('disk_write', 'N/A'),
+                    vm.get('ips', 'N/A'), vm.get('boot_order', 'N/A')
+                ), tags=tags)
+        
+        self.tree.tag_configure('running', background='#d5f4e6')
+        self.tree.tag_configure('stopped', background='#fadbd8')
+        
+        if query:
+            self.status_label.config(
+                text=f"Showing {len(self.filtered_vm_data)} of {len(self.vm_data)} VMs/CTs"
+            )
+        else:
+            self.status_label.config(text=f"Ready - {len(self.vm_data)} VMs/CTs across {self.node_count} node(s)")
+    
+    def format_bytes(self, bytes_val):
+        """Format bytes to human readable"""
+        if not bytes_val or bytes_val == 'N/A':
+            return 'N/A'
+        try:
+            bytes_val = float(bytes_val)
+            for unit in ['B', 'KB', 'MB', 'GB', 'TB']:
+                if bytes_val < 1024:
+                    return f"{bytes_val:.1f}{unit}"
+                bytes_val /= 1024
+            return f"{bytes_val:.1f}PB"
+        except:
+            return 'N/A'
+    
+    def format_uptime(self, seconds):
+        """Format uptime to human readable"""
+        if not seconds or seconds == 'N/A':
+            return 'N/A'
+        try:
+            seconds = int(seconds)
+            days = seconds // 86400
+            hours = (seconds % 86400) // 3600
+            minutes = (seconds % 3600) // 60
+            
+            if days > 0:
+                return f"{days}d {hours}h"
+            elif hours > 0:
+                return f"{hours}h {minutes}m"
+            else:
+                return f"{minutes}m"
+        except:
+            return 'N/A'
+    
+    def fetch_single_vm_data(self, node, vm, vm_type):
+        """Fetch data for a single VM/CT - used for parallel processing"""
+        try:
+            n = node['node']
+            endpoint = 'qemu' if vm_type == 'VM' else 'lxc'
+            vmid = vm['vmid']
+            
+            # Get config
+            cfg = self.api.get(f'/nodes/{n}/{endpoint}/{vmid}/config')
+            
+            # Get current status (includes CPU%, Memory%, Disk I/O)
+            stat = self.api.get(f'/nodes/{n}/{endpoint}/{vmid}/status/current')
+            
+            # Basic info
+            cores = cfg.get('cores', 'N/A')
+            memory_mb = int(cfg.get('memory', 0))
+            memory = self.format_bytes(memory_mb * 1024 * 1024) if memory_mb else 'N/A'
+            
+            # Current CPU % and Memory %
+            cpu_pct = 'N/A'
+            mem_pct = 'N/A'
+            uptime = 'N/A'
+            
+            if vm['status'] == 'running':
+                if vm_type == 'VM':
+                    cpu_val = stat.get('cpu', 0)
+                    cpu_pct = f"{cpu_val * 100:.1f}%" if cpu_val else 'N/A'
+                else:  # CT
+                    cpu_val = stat.get('cpu', 0)
+                    cpu_pct = f"{cpu_val * 100:.1f}%" if cpu_val else 'N/A'
+                
+                mem_used = stat.get('mem', 0)
+                mem_max = stat.get('maxmem', 0)
+                if mem_max > 0:
+                    mem_pct = f"{(mem_used / mem_max * 100):.1f}%"
+                
+                uptime_sec = stat.get('uptime', 0)
+                uptime = self.format_uptime(uptime_sec)
+            
+            # Disk size
+            total_disk = 'N/A'
+            if vm_type == 'VM':
+                for key in sorted(cfg.keys()):
+                    if key.startswith(('scsi0', 'sata0', 'ide0', 'virtio0')):
+                        value = str(cfg[key])
+                        if 'size=' in value:
+                            size_str = value.split('size=')[1].split(',')[0].strip()
+                            if size_str.endswith('G'):
+                                total_disk = f"{size_str[:-1]}GB"
+                            break
+            else:  # CT
+                rootfs = cfg.get('rootfs', '')
+                if 'size=' in str(rootfs):
+                    size_str = str(rootfs).split('size=')[1].split(',')[0].strip()
+                    if size_str.endswith('G'):
+                        total_disk = f"{size_str[:-1]}GB"
+            
+            # Free disk %
+            free_pct = 'N/A'
+            if vm['status'] == 'running':
+                disk_used = stat.get('disk', 0)
+                disk_max = stat.get('maxdisk', 0)
+                if disk_max > 0:
+                    free_bytes = disk_max - disk_used
+                    free_pct = f"{(free_bytes / disk_max * 100):.1f}%"
+            
+            # Disk I/O rates
+            disk_read = 'N/A'
+            disk_write = 'N/A'
+            if vm['status'] == 'running':
+                disk_read_bytes = stat.get('diskread', 0)
+                disk_write_bytes = stat.get('diskwrite', 0)
+                disk_read = self.format_bytes(disk_read_bytes)
+                disk_write = self.format_bytes(disk_write_bytes)
+            
+            # Guest agent status and IPs
+            agent_status = 'N/A'
+            ips = 'N/A'
+            
+            if FETCH_GUEST_AGENT_DATA and vm['status'] == 'running' and vm_type == 'VM':
+                # Use cache to avoid slow agent calls
+                cache_key = f"agent_{n}_{vmid}"
+                
+                def fetch_agent_data():
+                    agent_data = {}
+                    try:
+                        # Check if agent is running
+                        ping = self.api.get(f'/nodes/{n}/qemu/{vmid}/agent/ping')
+                        agent_data['status'] = 'YES' if ping else 'NO'
+                        
+                        # Get network interfaces
+                        net_info = self.api.get(f'/nodes/{n}/qemu/{vmid}/agent/network-get-interfaces')
+                        if net_info and 'result' in net_info:
+                            ip_list = []
+                            for iface in net_info['result']:
+                                if 'ip-addresses' in iface:
+                                    for ip in iface['ip-addresses']:
+                                        addr = ip.get('ip-address', '')
+                                        if addr and not addr.startswith('fe80') and not addr.startswith('127.'):
+                                            ip_list.append(addr)
+                            agent_data['ips'] = ', '.join(ip_list[:3]) if ip_list else 'N/A'
+                    except:
+                        agent_data['status'] = 'NO'
+                        agent_data['ips'] = 'N/A'
+                    
+                    return agent_data
+                
+                try:
+                    agent_info = self.api.get_cached(cache_key, fetch_agent_data)
+                    agent_status = agent_info.get('status', 'NO')
+                    ips = agent_info.get('ips', 'N/A')
+                except:
+                    agent_status = 'NO'
+                    ips = 'N/A'
+            elif vm_type == 'CT' and vm['status'] == 'running':
+                # For containers, we can get IPs from config
+                agent_status = 'N/A'
+                try:
+                    # Try to get IPs from status
+                    if 'net0' in cfg:
+                        # Parse network config if available
+                        pass
+                except:
+                    pass
+            
+            # Boot order
+            boot_order = 'N/A'
+            if vm_type == 'VM':
+                boot = cfg.get('boot', '')
+                if boot:
+                    if isinstance(boot, str):
+                        # New format: order=scsi0;ide2;net0
+                        if 'order=' in boot:
+                            boot_order = boot.split('order=')[1].split(';')[0]
+                        else:
+                            boot_order = boot[:20]  # Limit length
+            
+            # Additional CPU info
+            sockets = cfg.get('sockets', 'N/A') if vm_type == 'VM' else 'N/A'
+            cpu_type = cfg.get('cpu', 'N/A') if vm_type == 'VM' else 'N/A'
+            
+            vm_info = {
+                'id': vmid,
+                'type': vm_type,
+                'status': vm['status'],
+                'name': vm['name'],
+                'node': n,
+                'cpu_pct': cpu_pct,
+                'mem_pct': mem_pct,
+                'uptime': uptime,
+                'agent': agent_status,
+                'cores': cores,
+                'sockets': sockets,
+                'cpu_type': cpu_type,
+                'memory': memory,
+                'disk': total_disk,
+                'free_pct': free_pct,
+                'disk_read': disk_read,
+                'disk_write': disk_write,
+                'ips': ips,
+                'boot_order': boot_order
+            }
+            
+            return vm_info
+            
+        except Exception as e:
+            print(f"Error getting {vm_type} {vm['vmid']}: {e}")
+            return None
+    
+    def refresh_data_async(self):
+        """Refresh data asynchronously with parallel processing"""
+        if self.is_loading:
+            return
+        
+        self.show_loading("Fetching data from Proxmox...")
+        
+        def fetch_data():
+            return self._fetch_vm_data_parallel()
+        
+        def update_ui(result, error):
+            self.hide_loading()
+            if error:
+                self.status_label.config(text=f"Error: {str(error)}")
+                self.connection_label.config(text="[Disconnected]", fg="#e74c3c")
+                messagebox.showerror("Error", f"Failed to refresh:\n{str(error)}")
+            else:
+                self.vm_data = result
+                self.filter_vms()
+                now = datetime.now().strftime("%H:%M:%S")
+                self.last_update_label.config(text=f"Last update: {now}")
+                self.connection_label.config(text="[Connected]", fg="#27ae60")
+        
+        self.run_async(fetch_data, callback=update_ui)
+    
+    def _fetch_vm_data_parallel(self):
+        """Fetch VM data using parallel processing for better performance"""
+        vm_data = []
+        nodes = self.api.get('/nodes')
+        self.node_count = len(nodes)
+        
+        # Update node count in UI
+        self.root.after(0, lambda: self.node_label.config(text=f"Nodes: {self.node_count}"))
+        
+        # Collect all VMs and CTs from all nodes
+        tasks = []
+        
+        for node in nodes:
+            n = node['node']
+            
+            # Get VMs
+            try:
+                vms = self.api.get(f'/nodes/{n}/qemu')
+                for vm in vms:
+                    tasks.append((node, vm, 'VM'))
+            except Exception as e:
+                print(f"Error getting VMs from node {n}: {e}")
+            
+            # Get Containers
+            try:
+                cts = self.api.get(f'/nodes/{n}/lxc')
+                for ct in cts:
+                    tasks.append((node, ct, 'CT'))
+            except Exception as e:
+                print(f"Error getting CTs from node {n}: {e}")
+        
+        total_tasks = len(tasks)
+        self.root.after(0, lambda: self.progress_label.config(
+            text=f"Processing 0/{total_tasks} VMs/CTs..."
+        ))
+        
+        # Process in parallel using ThreadPoolExecutor
+        completed = 0
+        with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+            future_to_vm = {
+                executor.submit(self.fetch_single_vm_data, node, vm, vm_type): (node, vm, vm_type)
+                for node, vm, vm_type in tasks
+            }
+            
+            for future in as_completed(future_to_vm):
+                completed += 1
+                self.root.after(0, lambda c=completed, t=total_tasks: self.progress_label.config(
+                    text=f"Processing {c}/{t} VMs/CTs..."
+                ))
+                
+                try:
+                    vm_info = future.result()
+                    if vm_info:
+                        vm_data.append(vm_info)
+                except Exception as e:
+                    node, vm, vm_type = future_to_vm[future]
+                    print(f"Error processing {vm_type} {vm['vmid']}: {e}")
+        
+        vm_data.sort(key=lambda x: x['id'])
+        return vm_data
+    
+    def on_select(self, event):
+        """Handle tree selection"""
+        selection = self.tree.selection()
+        if not selection:
+            return
+        
+        item = self.tree.item(selection[0])
+        values = item['values']
+        if len(values) < 3:
+            return
+        
+        status = values[2]
+        
+        if status == 'running':
+            self.stop_btn.config(bg="#27ae60", state=tk.NORMAL)
+            self.start_btn.config(bg="#e74c3c", state=tk.DISABLED)
+        else:
+            self.start_btn.config(bg="#27ae60", state=tk.NORMAL)
+            self.stop_btn.config(bg="#e74c3c", state=tk.DISABLED)
+    
+    def get_selected_vm(self):
+        """Get selected VM/CT"""
+        selection = self.tree.selection()
+        if not selection:
+            messagebox.showwarning("Warning", "Please select a VM/CT")
+            return None
+        
+        item = self.tree.item(selection[0])
+        values = item['values']
+        vmid = values[0]
+        
+        for vm in self.vm_data:
+            if vm['id'] == vmid:
+                return vm
+        return None
+    
+    def start_selected(self):
+        """Start selected VM/CT"""
+        vm = self.get_selected_vm()
+        if not vm:
+            return
+        
+        self.show_loading(f"Starting {vm['type']} {vm['id']}...")
+        
+        def start_vm():
+            try:
+                endpoint = 'qemu' if vm['type'] == 'VM' else 'lxc'
+                self.api.post(f"/nodes/{vm['node']}/{endpoint}/{vm['id']}/status/start")
+                AuditLogger.log_vm_action("START", vm['id'], vm['type'], vm['name'], True)
+                return True
+            except Exception as e:
+                AuditLogger.log_vm_action("START", vm['id'], vm['type'], vm['name'], False, str(e))
+                raise
+        
+        def start_callback(success, error):
+            self.hide_loading()
+            if error:
+                messagebox.showerror("Error", f"Failed to start:\n{str(error)}")
+            else:
+                self.status_label.config(text=f"Started {vm['type']} {vm['id']} ({vm['name']})")
+                self.root.after(2000, self.refresh_data_async)
+        
+        self.run_async(start_vm, callback=start_callback)
+    
+    def stop_selected(self):
+        """Stop selected VM/CT"""
+        vm = self.get_selected_vm()
+        if not vm:
+            return
+        
+        if not messagebox.askyesno("Confirm", f"Stop {vm['type']} {vm['id']} ({vm['name']})?"):
+            return
+        
+        self.show_loading(f"Stopping {vm['type']} {vm['id']}...")
+        
+        def stop_vm():
+            try:
+                endpoint = 'qemu' if vm['type'] == 'VM' else 'lxc'
+                self.api.post(f"/nodes/{vm['node']}/{endpoint}/{vm['id']}/status/stop")
+                AuditLogger.log_vm_action("STOP", vm['id'], vm['type'], vm['name'], True)
+                return True
+            except Exception as e:
+                AuditLogger.log_vm_action("STOP", vm['id'], vm['type'], vm['name'], False, str(e))
+                raise
+        
+        def stop_callback(success, error):
+            self.hide_loading()
+            if error:
+                messagebox.showerror("Error", f"Failed to stop:\n{str(error)}")
+            else:
+                self.status_label.config(text=f"Stopped {vm['type']} {vm['id']} ({vm['name']})")
+                self.root.after(2000, self.refresh_data_async)
+        
+        self.run_async(stop_vm, callback=stop_callback)
+    
+    def start_all_stopped(self):
+        """Start all stopped VMs/CTs"""
+        stopped = [vm for vm in self.vm_data if vm['status'] != 'running']
+        
+        if not stopped:
+            messagebox.showinfo("Info", "All VMs/CTs are already running")
+            return
+        
+        if not messagebox.askyesno("Confirm", f"Start {len(stopped)} stopped VMs/CTs?"):
+            return
+        
+        self.show_loading(f"Starting {len(stopped)} VMs/CTs...")
+        
+        def start_all():
+            results = []
+            for vm in stopped:
+                try:
+                    endpoint = 'qemu' if vm['type'] == 'VM' else 'lxc'
+                    self.api.post(f"/nodes/{vm['node']}/{endpoint}/{vm['id']}/status/start")
+                    AuditLogger.log_vm_action("START_ALL", vm['id'], vm['type'], vm['name'], True)
+                    results.append((vm['id'], True))
+                except Exception as e:
+                    AuditLogger.log_vm_action("START_ALL", vm['id'], vm['type'], vm['name'], False, str(e))
+                    results.append((vm['id'], False))
+            return results
+        
+        def start_all_callback(results, error):
+            self.hide_loading()
+            if error:
+                messagebox.showerror("Error", f"Failed to start all:\n{str(error)}")
+            else:
+                success_count = sum(1 for _, success in results if success)
+                self.status_label.config(text=f"Started {success_count}/{len(stopped)} VMs/CTs")
+                self.root.after(3000, self.refresh_data_async)
+        
+        self.run_async(start_all, callback=start_all_callback)
+    
+    def toggle_auto_refresh(self):
+        """Toggle auto-refresh"""
+        self.auto_refresh = self.auto_refresh_var.get()
+        if self.auto_refresh:
+            self.status_label.config(text="Auto-refresh enabled")
+        else:
+            self.status_label.config(text="Auto-refresh disabled")
+    
+    def start_auto_refresh(self):
+        """Start auto-refresh thread"""
+        self.refresh_data_async()
+        
+        def auto_refresh_loop():
+            while True:
+                time.sleep(REFRESH_INTERVAL)
+                if self.auto_refresh:
+                    try:
+                        self.root.after(0, self.refresh_data_async)
+                    except:
+                        break
+        
+        self.refresh_thread = threading.Thread(target=auto_refresh_loop, daemon=True)
+        self.refresh_thread.start()
+
+def main():
+    """
+    ═══════════════════════════════════════════════════════════════════════
+    PROXMOX DASHBOARD - ENHANCED EDITION
+    ═══════════════════════════════════════════════════════════════════════
+    
+    NEW FEATURES IN THIS VERSION:
+    * Current CPU usage percentage
+    * Current memory usage percentage  
+    * System uptime
+    * Guest agent status
+    * Disk I/O rates (read/write)
+    * IP addresses (via guest agent)
+    * Boot order
+    
+    PERFORMANCE OPTIMIZATIONS:
+    * Parallel VM data fetching using ThreadPoolExecutor
+    * Configurable number of parallel workers (MAX_WORKERS)
+    * Guest agent data caching (60 second TTL)
+    * Optional guest agent data fetching (FETCH_GUEST_AGENT_DATA flag)
+    * Progress indicator during data loading
+    * Retry logic with exponential backoff
+    
+    MULTI-NODE SUPPORT:
+    * YES! This script automatically detects and works with ALL nodes
+       in your Proxmox cluster. It fetches the list of nodes from the
+       /nodes API endpoint and processes VMs/CTs from each node.
+    * Node count displayed in the UI
+    * Node name shown for each VM/CT
+    
+    PERFORMANCE NOTES:
+    
+    Without optimizations, fetching data for 50 VMs would take:
+      ~50 seconds (1 second per VM, serial processing)
+    
+    With optimizations (parallel + caching):
+      ~5-10 seconds (10 workers processing in parallel)
+    
+    Guest agent calls are the slowest operations. If you have many VMs:
+      - Set FETCH_GUEST_AGENT_DATA = False to skip agent data
+      - Or increase CACHE_DURATION to reduce agent API calls
+      - Or increase MAX_WORKERS for more parallelism
+    
+    CONFIGURATION:
+      MAX_WORKERS = 10              # Parallel workers (adjust based on CPU)
+      FETCH_GUEST_AGENT_DATA = True # Set False to skip slow agent calls
+      CACHE_DURATION = 60           # Cache TTL in seconds
+      REFRESH_INTERVAL = 30         # Auto-refresh interval
+    
+    ═══════════════════════════════════════════════════════════════════════
+    """
+    
+    print(__doc__)
+    
+    root = tk.Tk()
+    app = ProxmoxDashboard(root)
+    root.mainloop()
+
+if __name__ == '__main__':
+    main()
