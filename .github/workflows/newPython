@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """
-Proxmox Dashboard - Enhanced with Full Metrics
+Proxmox Dashboard - Enhanced with Full Metrics (Simplified)
 Features: CPU%, Memory Usage, Uptime, Guest Agent, Disk I/O, IPs, Boot Order
-Optimized for performance with parallel processing and caching
+Simple serial processing for clarity and reliability
 SUPPORTS MULTIPLE PROXMOX NODES
 """
 
@@ -19,7 +19,6 @@ from datetime import datetime, timedelta
 from cryptography.fernet import Fernet
 from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2
-from concurrent.futures import ThreadPoolExecutor, as_completed
 import urllib3
 
 # Configuration
@@ -30,7 +29,6 @@ AUDIT_LOG_FILE = os.path.expanduser('~/.proxmox_dashboard_audit.log')
 REFRESH_INTERVAL = 30  # seconds
 MAX_RETRIES = 3
 RETRY_DELAY = 2
-MAX_WORKERS = 10  # Parallel workers for fetching VM data
 
 # Performance options
 FETCH_GUEST_AGENT_DATA = True  # Set to False to skip slow guest agent calls
@@ -456,7 +454,7 @@ class ProxmoxDashboard:
     
     def __init__(self, root):
         self.root = root
-        self.root.title("Proxmox Dashboard - Enhanced with Full Metrics")
+        self.root.title("Proxmox Dashboard - Simplified Edition")
         self.root.geometry("1600x900")
         
         self.root.update_idletasks()
@@ -515,7 +513,7 @@ class ProxmoxDashboard:
         
         title_label = tk.Label(
             top_frame,
-            text="Proxmox VM/Container Dashboard - Enhanced",
+            text="Proxmox VM/Container Dashboard - Simplified",
             font=("Arial", 18, "bold"),
             bg="#2c3e50",
             fg="white"
@@ -1193,7 +1191,7 @@ class ProxmoxDashboard:
         self.run_async(fetch_data, callback=update_ui)
     
     def _fetch_vm_data_parallel(self):
-        """Fetch VM data using parallel processing for better performance"""
+        """Fetch VM data using simple serial processing"""
         vm_data = []
         nodes = self.api.get('/nodes')
         self.node_count = len(nodes)
@@ -1201,60 +1199,62 @@ class ProxmoxDashboard:
         # Update node count in UI
         self.root.after(0, lambda: self.node_label.config(text=f"Nodes: {self.node_count}"))
         
-        # Collect all VMs and CTs from all nodes
-        tasks = []
+        # Count total VMs/CTs first for progress
+        total_count = 0
+        for node in nodes:
+            n = node['node']
+            try:
+                vms = self.api.get(f'/nodes/{n}/qemu')
+                total_count += len(vms)
+            except Exception as e:
+                print(f"Error counting VMs from node {n}: {e}")
+            
+            try:
+                cts = self.api.get(f'/nodes/{n}/lxc')
+                total_count += len(cts)
+            except Exception as e:
+                print(f"Error counting CTs from node {n}: {e}")
         
+        # Process each VM/CT sequentially
+        current = 0
         for node in nodes:
             n = node['node']
             
-            # Get VMs
+            # Get and process VMs
             try:
                 vms = self.api.get(f'/nodes/{n}/qemu')
                 for vm in vms:
-                    tasks.append((node, vm, 'VM'))
-            except Exception as e:
-                print(f"Error getting VMs from node {n}: {e}")
-            
-            # Get Containers
-            try:
-                cts = self.api.get(f'/nodes/{n}/lxc')
-                for ct in cts:
-                    tasks.append((node, ct, 'CT'))
-            except Exception as e:
-                print(f"Error getting CTs from node {n}: {e}")
-        
-        total_tasks = len(tasks)
-        self.root.after(0, lambda: self.progress_label.config(
-            text=f"Processing 0/{total_tasks} VMs/CTs..."
-        ))
-        
-        # Process in parallel using ThreadPoolExecutor
-        completed = 0
-        with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
-            future_to_vm = {
-                executor.submit(self.fetch_single_vm_data, node, vm, vm_type): (node, vm, vm_type)
-                for node, vm, vm_type in tasks
-            }
-            
-            try:
-                for future in as_completed(future_to_vm, timeout=120):  # 2 minute timeout
-                    completed += 1
-                    self.root.after(0, lambda c=completed, t=total_tasks: self.progress_label.config(
+                    current += 1
+                    self.root.after(0, lambda c=current, t=total_count: self.progress_label.config(
                         text=f"Processing {c}/{t} VMs/CTs..."
                     ))
                     
                     try:
-                        vm_info = future.result()
+                        vm_info = self.fetch_single_vm_data(node, vm, 'VM')
                         if vm_info:
                             vm_data.append(vm_info)
                     except Exception as e:
-                        node, vm, vm_type = future_to_vm[future]
-                        print(f"Error processing {vm_type} {vm['vmid']}: {e}")
-            except TimeoutError:
-                print("WARNING: VM data fetch timed out after 120 seconds")
-                # Cancel remaining futures
-                for future in future_to_vm:
-                    future.cancel()
+                        print(f"Error getting VM {vm['vmid']}: {e}")
+            except Exception as e:
+                print(f"Error getting VMs from node {n}: {e}")
+            
+            # Get and process Containers
+            try:
+                cts = self.api.get(f'/nodes/{n}/lxc')
+                for ct in cts:
+                    current += 1
+                    self.root.after(0, lambda c=current, t=total_count: self.progress_label.config(
+                        text=f"Processing {c}/{t} VMs/CTs..."
+                    ))
+                    
+                    try:
+                        ct_info = self.fetch_single_vm_data(node, ct, 'CT')
+                        if ct_info:
+                            vm_data.append(ct_info)
+                    except Exception as e:
+                        print(f"Error getting CT {ct['vmid']}: {e}")
+            except Exception as e:
+                print(f"Error getting CTs from node {n}: {e}")
         
         vm_data.sort(key=lambda x: x['id'])
         return vm_data
@@ -1445,7 +1445,7 @@ class ProxmoxDashboard:
 def main():
     """
     ═══════════════════════════════════════════════════════════════════════
-    PROXMOX DASHBOARD - ENHANCED EDITION
+    PROXMOX DASHBOARD - SIMPLIFIED EDITION
     ═══════════════════════════════════════════════════════════════════════
     
     NEW FEATURES IN THIS VERSION:
@@ -1457,13 +1457,19 @@ def main():
     * IP addresses (via guest agent)
     * Boot order
     
-    PERFORMANCE OPTIMIZATIONS:
-    * Parallel VM data fetching using ThreadPoolExecutor
-    * Configurable number of parallel workers (MAX_WORKERS)
+    DESIGN PHILOSOPHY:
+    * Simple, straightforward serial processing
+    * Easy to understand and debug
+    * Reliable and predictable
+    * No complex threading or parallel processing
+    * Perfect for home labs and small/medium deployments
+    
+    FEATURES:
     * Guest agent data caching (60 second TTL)
     * Optional guest agent data fetching (FETCH_GUEST_AGENT_DATA flag)
     * Progress indicator during data loading
     * Retry logic with exponential backoff
+    * Clean shutdown handling
     
     MULTI-NODE SUPPORT:
     * YES! This script automatically detects and works with ALL nodes
@@ -1474,19 +1480,18 @@ def main():
     
     PERFORMANCE NOTES:
     
-    Without optimizations, fetching data for 50 VMs would take:
-      ~50 seconds (1 second per VM, serial processing)
+    Serial processing performance:
+      10 VMs:  ~10-15 seconds
+      20 VMs:  ~20-30 seconds
+      50 VMs:  ~50-70 seconds
+      100 VMs: ~100-140 seconds
     
-    With optimizations (parallel + caching):
-      ~5-10 seconds (10 workers processing in parallel)
-    
-    Guest agent calls are the slowest operations. If you have many VMs:
+    This is perfect for most use cases! If refresh times are too long:
       - Set FETCH_GUEST_AGENT_DATA = False to skip agent data
-      - Or increase CACHE_DURATION to reduce agent API calls
-      - Or increase MAX_WORKERS for more parallelism
+      - Increase CACHE_DURATION to reduce API calls
+      - Increase REFRESH_INTERVAL for less frequent updates
     
     CONFIGURATION:
-      MAX_WORKERS = 10              # Parallel workers (adjust based on CPU)
       FETCH_GUEST_AGENT_DATA = True # Set False to skip slow agent calls
       CACHE_DURATION = 60           # Cache TTL in seconds
       REFRESH_INTERVAL = 30         # Auto-refresh interval
