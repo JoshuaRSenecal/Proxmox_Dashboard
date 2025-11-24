@@ -7,10 +7,12 @@ SUPPORTS MULTIPLE PROXMOX NODES
 FEATURES:
 - Live data feed with 3-second default refresh (configurable 2s-30s)
 - Pause/Resume live feed
+- Host laptop/PC temperature monitoring
 - API Token authentication only (more secure than passwords)
 - Master password protects locally stored credentials
 - All passwords obscured during entry (anti-shoulder surfing)
 - Mandatory SSL/TLS certificate verification for secure connections
+- Graphical status indicators (LED indicators and colored rows)
 """
 
 import tkinter as tk
@@ -28,6 +30,7 @@ from cryptography.fernet import Fernet
 from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2
 import urllib3
+import psutil
 
 # Configure logging
 logging.basicConfig(
@@ -491,6 +494,77 @@ class ProxmoxDashboard:
         )
         return label
     
+    def get_host_temperature(self):
+        """Get host laptop/PC temperature"""
+        try:
+            # Try to get temperature sensors
+            temps = psutil.sensors_temperatures()
+            
+            if not temps:
+                return None, "No sensors"
+            
+            # Priority order for temperature zones
+            priority_zones = [
+                'coretemp',      # Intel CPU
+                'k10temp',       # AMD CPU
+                'cpu_thermal',   # ARM/Raspberry Pi
+                'acpitz',        # ACPI thermal zone
+            ]
+            
+            # Try priority zones first
+            for zone in priority_zones:
+                if zone in temps and temps[zone]:
+                    # Get average of all sensors in this zone
+                    readings = [s.current for s in temps[zone] if s.current]
+                    if readings:
+                        avg_temp = sum(readings) / len(readings)
+                        return round(avg_temp, 1), zone
+            
+            # Fallback: use first available zone
+            for zone_name, sensors in temps.items():
+                if sensors:
+                    readings = [s.current for s in sensors if s.current]
+                    if readings:
+                        avg_temp = sum(readings) / len(readings)
+                        return round(avg_temp, 1), zone_name
+            
+            return None, "No readings"
+            
+        except AttributeError:
+            # sensors_temperatures not available on this platform
+            return None, "Not supported"
+        except Exception as e:
+            logger.debug(f"Temperature read error: {e}")
+            return None, "Error"
+    
+    def format_temperature(self, temp, zone):
+        """Format temperature for display"""
+        if temp is None:
+            return "N/A"
+        
+        # Color based on temperature
+        if temp < 50:
+            return f"{temp}°C"
+        elif temp < 70:
+            return f"{temp}°C"
+        elif temp < 85:
+            return f"{temp}°C"
+        else:
+            return f"{temp}°C"
+    
+    def get_temp_color(self, temp):
+        """Get color for temperature"""
+        if temp is None:
+            return "#95a5a6"  # Gray for N/A
+        elif temp < 50:
+            return "#27ae60"  # Green - Cool
+        elif temp < 70:
+            return "#3498db"  # Blue - Normal
+        elif temp < 85:
+            return "#f39c12"  # Orange - Warm
+        else:
+            return "#e74c3c"  # Red - Hot
+    
     def create_widgets(self):
         # Top bar
         top_frame = tk.Frame(self.root, bg="#2c3e50", height=70)
@@ -543,6 +617,27 @@ class ProxmoxDashboard:
             fg="white"
         )
         self.ssl_label.pack()
+        
+        # Host temperature indicator
+        temp_frame = tk.Frame(self.status_frame, bg="#2c3e50")
+        temp_frame.pack(pady=2)
+        
+        tk.Label(
+            temp_frame,
+            text="Host Temp:",
+            font=("Arial", 9),
+            bg="#2c3e50",
+            fg="#bdc3c7"
+        ).pack(side=tk.LEFT, padx=(0, 5))
+        
+        self.temp_label = tk.Label(
+            temp_frame,
+            text="--",
+            font=("Arial", 9, "bold"),
+            bg="#2c3e50",
+            fg="#95a5a6"
+        )
+        self.temp_label.pack(side=tk.LEFT)
         
         # Live feed indicator with LED
         live_frame = tk.Frame(self.status_frame, bg="#2c3e50")
@@ -1180,6 +1275,12 @@ class ProxmoxDashboard:
                 self.connection_label.config(text="Connected", fg="#27ae60")
                 # Update LED to green
                 self.update_led_color(self.connection_led, "#27ae60")
+                
+                # Update host temperature
+                temp, zone = self.get_host_temperature()
+                temp_text = self.format_temperature(temp, zone)
+                temp_color = self.get_temp_color(temp)
+                self.temp_label.config(text=temp_text, fg=temp_color)
         
         self.run_async(fetch_data, callback=update_ui)
     
