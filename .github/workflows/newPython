@@ -258,15 +258,15 @@ class CredentialsDialog(tk.Toplevel):
     def __init__(self, parent, is_setup=False):
         super().__init__(parent)
         self.title("Setup Credentials" if is_setup else "Enter Credentials")
-        self.geometry("500x380")
+        self.geometry("500x500")
         self.resizable(False, False)
         self.result = None
         self.is_setup = is_setup
         
         self.update_idletasks()
         x = (self.winfo_screenwidth() // 2) - 250
-        y = (self.winfo_screenheight() // 2) - 190
-        self.geometry(f"500x380+{x}+{y}")
+        y = (self.winfo_screenheight() // 2) - 250
+        self.geometry(f"500x500+{x}+{y}")
         
         self.create_widgets()
         self.protocol("WM_DELETE_WINDOW", self.on_cancel)
@@ -566,7 +566,7 @@ class ProxmoxDashboard:
     
     def create_widgets(self):
         # Top bar
-        top_frame = tk.Frame(self.root, bg="#2c3e50", height=70)
+        top_frame = tk.Frame(self.root, bg="#2c3e50", height=140)
         top_frame.pack(fill=tk.X)
         top_frame.pack_propagate(False)
         
@@ -577,11 +577,11 @@ class ProxmoxDashboard:
             bg="#2c3e50",
             fg="white"
         )
-        title_label.pack(side=tk.LEFT, padx=20, pady=15)
+        title_label.pack(side=tk.LEFT, padx=20, pady=50)
         
         # Status indicators
         self.status_frame = tk.Frame(top_frame, bg="#2c3e50")
-        self.status_frame.pack(side=tk.RIGHT, padx=20)
+        self.status_frame.pack(side=tk.RIGHT, padx=20, pady=10)
         
         # Connection status with LED
         connection_frame = tk.Frame(self.status_frame, bg="#2c3e50")
