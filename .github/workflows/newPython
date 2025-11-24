@@ -258,15 +258,15 @@ class CredentialsDialog(tk.Toplevel):
     def __init__(self, parent, is_setup=False):
         super().__init__(parent)
         self.title("Setup Credentials" if is_setup else "Enter Credentials")
-        self.geometry("500x500")
-        self.resizable(False, False)
+        self.geometry("500x470")
+        self.resizable(True, True)
         self.result = None
         self.is_setup = is_setup
         
         self.update_idletasks()
         x = (self.winfo_screenwidth() // 2) - 250
-        y = (self.winfo_screenheight() // 2) - 250
-        self.geometry(f"500x500+{x}+{y}")
+        y = (self.winfo_screenheight() // 2) - 235
+        self.geometry(f"500x470+{x}+{y}")
         
         self.create_widgets()
         self.protocol("WM_DELETE_WINDOW", self.on_cancel)
@@ -399,6 +399,7 @@ class ProxmoxDashboard:
         self.root = root
         self.root.title("Proxmox Dashboard - Live Feed")
         self.root.geometry("1600x900")
+        self.root.resizable(True, True)
         
         self.root.update_idletasks()
         x = (self.root.winfo_screenwidth() // 2) - 800
@@ -579,13 +580,13 @@ class ProxmoxDashboard:
         )
         title_label.pack(side=tk.LEFT, padx=20, pady=50)
         
-        # Status indicators
+        # Status indicators - Better organized grid layout
         self.status_frame = tk.Frame(top_frame, bg="#2c3e50")
         self.status_frame.pack(side=tk.RIGHT, padx=20, pady=10)
         
-        # Connection status with LED
+        # Row 0: Connection and SSL status
         connection_frame = tk.Frame(self.status_frame, bg="#2c3e50")
-        connection_frame.pack(pady=2)
+        connection_frame.grid(row=0, column=0, sticky="w", padx=5, pady=3)
         
         self.connection_led = self.create_led_indicator(connection_frame, "#27ae60")
         self.connection_led.pack(side=tk.LEFT, padx=(0, 5))
@@ -593,23 +594,17 @@ class ProxmoxDashboard:
         self.connection_label = tk.Label(
             connection_frame,
             text="Connected",
-            font=("Arial", 10),
+            font=("Arial", 10, "bold"),
             bg="#2c3e50",
             fg="#27ae60"
         )
         self.connection_label.pack(side=tk.LEFT)
         
-        self.node_label = tk.Label(
-            self.status_frame,
-            text="Nodes: 0",
-            font=("Arial", 10),
-            bg="#2c3e50",
-            fg="white"
-        )
-        self.node_label.pack()
+        ssl_frame = tk.Frame(self.status_frame, bg="#2c3e50")
+        ssl_frame.grid(row=0, column=1, sticky="w", padx=15, pady=3)
         
         self.ssl_label = tk.Label(
-            self.status_frame,
+            ssl_frame,
             text="SSL: Checking...",
             font=("Arial", 10),
             bg="#2c3e50",
@@ -617,14 +612,27 @@ class ProxmoxDashboard:
         )
         self.ssl_label.pack()
         
+        # Row 1: Nodes and Temperature
+        nodes_frame = tk.Frame(self.status_frame, bg="#2c3e50")
+        nodes_frame.grid(row=1, column=0, sticky="w", padx=5, pady=3)
+        
+        self.node_label = tk.Label(
+            nodes_frame,
+            text="Nodes: 0",
+            font=("Arial", 10),
+            bg="#2c3e50",
+            fg="white"
+        )
+        self.node_label.pack()
+        
         # Host temperature indicator
         temp_frame = tk.Frame(self.status_frame, bg="#2c3e50")
-        temp_frame.pack(pady=2)
+        temp_frame.grid(row=1, column=1, sticky="w", padx=15, pady=3)
         
         tk.Label(
             temp_frame,
-            text="Host Temp:",
-            font=("Arial", 9),
+            text="Temp:",
+            font=("Arial", 10),
             bg="#2c3e50",
             fg="#bdc3c7"
         ).pack(side=tk.LEFT, padx=(0, 5))
@@ -632,15 +640,15 @@ class ProxmoxDashboard:
         self.temp_label = tk.Label(
             temp_frame,
             text="--",
-            font=("Arial", 9, "bold"),
+            font=("Arial", 10, "bold"),
             bg="#2c3e50",
             fg="#95a5a6"
         )
         self.temp_label.pack(side=tk.LEFT)
         
-        # Live feed indicator with LED
+        # Row 2: Live indicator and Last update
         live_frame = tk.Frame(self.status_frame, bg="#2c3e50")
-        live_frame.pack(pady=2)
+        live_frame.grid(row=2, column=0, sticky="w", padx=5, pady=3)
         
         self.live_led = self.create_led_indicator(live_frame, "#27ae60")
         self.live_led.pack(side=tk.LEFT, padx=(0, 5))
@@ -654,30 +662,35 @@ class ProxmoxDashboard:
         )
         self.live_indicator.pack(side=tk.LEFT)
         
+        update_frame = tk.Frame(self.status_frame, bg="#2c3e50")
+        update_frame.grid(row=2, column=1, sticky="w", padx=15, pady=3)
+        
         self.last_update_label = tk.Label(
-            self.status_frame,
-            text="Last update: --",
+            update_frame,
+            text="Updated: --",
             font=("Arial", 9),
             bg="#2c3e50",
             fg="#bdc3c7"
         )
         self.last_update_label.pack()
         
-        # VM Summary Panel with visual indicators
-        summary_frame = tk.Frame(self.status_frame, bg="#2c3e50")
-        summary_frame.pack(pady=(10, 0))
+        # Separator line
+        separator = tk.Frame(self.status_frame, bg="#7f8c8d", height=1)
+        separator.grid(row=3, column=0, columnspan=2, sticky="ew", pady=10, padx=5)
         
-        tk.Label(
-            summary_frame,
+        # Row 4-5: VM Summary Panel with visual indicators
+        summary_label = tk.Label(
+            self.status_frame,
             text="VMs/CTs:",
-            font=("Arial", 9, "bold"),
+            font=("Arial", 10, "bold"),
             bg="#2c3e50",
-            fg="#bdc3c7"
-        ).pack()
+            fg="#ecf0f1"
+        )
+        summary_label.grid(row=4, column=0, columnspan=2, sticky="w", padx=5, pady=(5, 3))
         
         # Running count with green indicator
-        running_frame = tk.Frame(summary_frame, bg="#2c3e50")
-        running_frame.pack(pady=2)
+        running_frame = tk.Frame(self.status_frame, bg="#2c3e50")
+        running_frame.grid(row=5, column=0, sticky="w", padx=5, pady=2)
         
         self.running_led = self.create_led_indicator(running_frame, "#27ae60", size=8)
         self.running_led.pack(side=tk.LEFT, padx=(0, 5))
@@ -685,15 +698,15 @@ class ProxmoxDashboard:
         self.running_count_label = tk.Label(
             running_frame,
             text="Running: 0",
-            font=("Arial", 9),
+            font=("Arial", 10),
             bg="#2c3e50",
             fg="#27ae60"
         )
         self.running_count_label.pack(side=tk.LEFT)
         
         # Stopped count with red indicator
-        stopped_frame = tk.Frame(summary_frame, bg="#2c3e50")
-        stopped_frame.pack(pady=2)
+        stopped_frame = tk.Frame(self.status_frame, bg="#2c3e50")
+        stopped_frame.grid(row=5, column=1, sticky="w", padx=15, pady=2)
         
         self.stopped_led = self.create_led_indicator(stopped_frame, "#e74c3c", size=8)
         self.stopped_led.pack(side=tk.LEFT, padx=(0, 5))
@@ -701,7 +714,7 @@ class ProxmoxDashboard:
         self.stopped_count_label = tk.Label(
             stopped_frame,
             text="Stopped: 0",
-            font=("Arial", 9),
+            font=("Arial", 10),
             bg="#2c3e50",
             fg="#e74c3c"
         )
