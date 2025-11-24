@@ -252,6 +252,147 @@ class CredentialManager:
             # Most likely wrong password or corrupted file
             raise Exception("Invalid master password or corrupted credentials file")
 
+class TokenCreationGuide(tk.Toplevel):
+    """Guide dialog for creating API tokens in Proxmox"""
+    
+    def __init__(self, parent):
+        super().__init__(parent)
+        self.title("Create Proxmox API Token")
+        self.geometry("700x650")
+        self.resizable(True, True)
+        
+        self.update_idletasks()
+        x = (self.winfo_screenwidth() // 2) - 350
+        y = (self.winfo_screenheight() // 2) - 325
+        self.geometry(f"700x650+{x}+{y}")
+        
+        self.create_widgets()
+        self.protocol("WM_DELETE_WINDOW", self.on_close)
+        self.grab_set()
+    
+    def create_widgets(self):
+        # Title
+        title_frame = tk.Frame(self, bg="#3498db", height=60)
+        title_frame.pack(fill=tk.X)
+        title_frame.pack_propagate(False)
+        
+        title_label = tk.Label(
+            title_frame,
+            text="Step 1: Create API Token in Proxmox",
+            font=("Arial", 16, "bold"),
+            bg="#3498db",
+            fg="white"
+        )
+        title_label.pack(pady=15)
+        
+        # Main content with scrollbar
+        main_frame = tk.Frame(self, bg="white")
+        main_frame.pack(fill=tk.BOTH, expand=True, padx=20, pady=20)
+        
+        # Create canvas and scrollbar
+        canvas = tk.Canvas(main_frame, bg="white", highlightthickness=0)
+        scrollbar = tk.Scrollbar(main_frame, orient="vertical", command=canvas.yview)
+        scrollable_frame = tk.Frame(canvas, bg="white")
+        
+        scrollable_frame.bind(
+            "<Configure>",
+            lambda e: canvas.configure(scrollregion=canvas.bbox("all"))
+        )
+        
+        canvas.create_window((0, 0), window=scrollable_frame, anchor="nw")
+        canvas.configure(yscrollcommand=scrollbar.set)
+        
+        # Instructions content
+        instructions = [
+            ("What is an API Token?", "bold", "#2c3e50"),
+            ("An API token is a secure way to connect to Proxmox without using your password.\n", "normal", "#34495e"),
+            
+            ("How to Create Token:", "bold", "#2c3e50"),
+            ("1. Open Proxmox web interface", "bold", "#27ae60"),
+            ("   Go to: https://YOUR_PROXMOX_IP:8006\n", "normal", "#7f8c8d"),
+            
+            ("2. Navigate to API Tokens", "bold", "#27ae60"),
+            ("   Click: Datacenter → Permissions → API Tokens\n", "normal", "#7f8c8d"),
+            
+            ("3. Click 'Add' button", "bold", "#27ae60"),
+            ("   (Top of the API Tokens page)\n", "normal", "#7f8c8d"),
+            
+            ("4. Fill in the form:", "bold", "#27ae60"),
+            ("   • User: root@pam", "normal", "#7f8c8d"),
+            ("   • Token ID: dashboard (or any name you want)", "normal", "#7f8c8d"),
+            ("   • Privilege Separation: UNCHECK THIS BOX ☐", "normal", "#e74c3c"),
+            ("   • Expire: Never", "normal", "#7f8c8d"),
+            ("   • Comment: Dashboard access (optional)\n", "normal", "#7f8c8d"),
+            
+            ("5. Click 'Add' button", "bold", "#27ae60"),
+            ("   The token will be created.\n", "normal", "#7f8c8d"),
+            
+            ("6. COPY THE SECRET!", "bold", "#e74c3c"),
+            ("   A popup or message will show the token secret.", "normal", "#e74c3c"),
+            ("   COPY IT IMMEDIATELY - it's shown only once!\n", "normal", "#e74c3c"),
+            
+            ("Alternative: Command Line (Recommended)", "bold", "#2c3e50"),
+            ("If you have SSH access, this is more reliable:\n", "normal", "#34495e"),
+            
+            ("ssh root@YOUR_PROXMOX_IP", "normal", "#16a085"),
+            ("pveum user token add root@pam dashboard --privsep 0\n", "normal", "#16a085"),
+            
+            ("The secret will appear in the output immediately.\n", "normal", "#7f8c8d"),
+            
+            ("What You'll Need for Next Step:", "bold", "#2c3e50"),
+            ("• Token ID: root@pam!dashboard", "normal", "#34495e"),
+            ("• Token Secret: (the long string you copied)\n", "normal", "#34495e"),
+        ]
+        
+        for text, weight, color in instructions:
+            label = tk.Label(
+                scrollable_frame,
+                text=text,
+                font=("Arial", 10, weight),
+                bg="white",
+                fg=color,
+                justify=tk.LEFT,
+                wraplength=620,
+                anchor="w"
+            )
+            label.pack(anchor="w", pady=2)
+        
+        canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+        
+        # Button frame
+        btn_frame = tk.Frame(self, bg="white")
+        btn_frame.pack(fill=tk.X, padx=20, pady=20)
+        
+        tk.Button(
+            btn_frame,
+            text="I've Created the Token - Continue",
+            command=self.on_continue,
+            bg="#27ae60",
+            fg="white",
+            font=("Arial", 12, "bold"),
+            width=30,
+            height=2,
+            cursor="hand2"
+        ).pack(pady=5)
+        
+        tk.Button(
+            btn_frame,
+            text="Cancel",
+            command=self.on_close,
+            bg="#95a5a6",
+            fg="white",
+            font=("Arial", 10),
+            width=30,
+            cursor="hand2"
+        ).pack(pady=5)
+    
+    def on_continue(self):
+        self.destroy()
+    
+    def on_close(self):
+        self.destroy()
+
 class CredentialsDialog(tk.Toplevel):
     """Dialog for entering API token credentials - Token Authentication Only"""
     
@@ -995,7 +1136,12 @@ class ProxmoxDashboard:
                     logger.error(f"Authentication failed: {str(e)}")
                     messagebox.showerror("Error", f"Failed to decrypt or connect:\n{str(e)}")
         
-        messagebox.showinfo("Setup", "No credentials found. Let's set up your connection with an API token.")
+        # Show token creation guide first
+        messagebox.showinfo("Setup Required", "No credentials found.\n\nYou'll need to create an API token in Proxmox first.\n\nThe next screen will show you how.")
+        guide = TokenCreationGuide(self.root)
+        self.root.wait_window(guide)
+        
+        # Now show credentials entry
         dialog = CredentialsDialog(self.root, is_setup=True)
         self.root.wait_window(dialog)
         
