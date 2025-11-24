@@ -10,6 +10,7 @@ FEATURES:
 - API Token authentication only (more secure than passwords)
 - Master password protects locally stored credentials
 - All passwords obscured during entry (anti-shoulder surfing)
+- Mandatory SSL/TLS certificate verification for secure connections
 """
 
 import tkinter as tk
@@ -53,15 +54,30 @@ REFRESH_INTERVAL = 3  # seconds - Live data feed (near-constant updates)
 MAX_RETRIES = 3
 RETRY_DELAY = 2
 
-# SSL Configuration
-USE_SSL_VERIFICATION = os.path.exists(PROXMOX_CA_CERT)
+# SSL Configuration - MANDATORY
+if not os.path.exists(PROXMOX_CA_CERT):
+    error_msg = f"""
+SSL CERTIFICATE REQUIRED
 
-if not USE_SSL_VERIFICATION:
-    urllib3.disable_warnings()
-    logger.warning("SSL Verification: Disabled (CA certificate not found)")
-    logger.info(f"To enable SSL: scp root@YOUR_PROXMOX_IP:/etc/pve/pve-root-ca.pem {PROXMOX_CA_CERT}")
-else:
-    logger.info(f"SSL Verification: Enabled (using {PROXMOX_CA_CERT})")
+The Proxmox CA certificate is required for secure connections.
+
+Certificate not found at: {PROXMOX_CA_CERT}
+
+To obtain the certificate:
+  1. SSH into your Proxmox server
+  2. Run: scp root@YOUR_PROXMOX_IP:/etc/pve/pve-root-ca.pem {PROXMOX_CA_CERT}
+  
+Or manually copy /etc/pve/pve-root-ca.pem from Proxmox to {PROXMOX_CA_CERT}
+
+SSL verification is MANDATORY for security.
+Dashboard cannot start without the CA certificate.
+"""
+    print(error_msg)
+    logger.error("SSL Certificate not found - cannot start")
+    logger.error(f"Expected location: {PROXMOX_CA_CERT}")
+    exit(1)
+
+logger.info(f"SSL Verification: Enabled (using {PROXMOX_CA_CERT})")
 
 class AuditLogger:
     """Audit logger for tracking all critical operations"""
@@ -102,12 +118,9 @@ class ProxmoxAPI:
         self.base = f"https://{host}:8006/api2/json"
         self.host = host
         
-        if USE_SSL_VERIFICATION:
-            self.verify = PROXMOX_CA_CERT
-            self.ssl_status = "Verified"
-        else:
-            self.verify = False
-            self.ssl_status = "Unverified"
+        # SSL verification is MANDATORY
+        self.verify = PROXMOX_CA_CERT
+        self.ssl_status = "Verified"
         
         # API Token authentication
         self.headers = {'Authorization': f'PVEAPIToken={token_id}={token_secret}'}
