@@ -990,41 +990,44 @@ class ProxmoxDashboard:
         """Get host laptop/PC temperature with improved detection"""
         try:
             # Method 1: Try psutil sensors_temperatures
-            temps = psutil.sensors_temperatures()
-            
-            if temps:
-                # Priority order for temperature zones
-                priority_zones = [
-                    'coretemp',      # Intel CPU
-                    'k10temp',       # AMD CPU
-                    'zenpower',      # AMD Zen
-                    'cpu_thermal',   # ARM/Raspberry Pi
-                    'acpitz',        # ACPI thermal zone
-                ]
+            try:
+                temps = psutil.sensors_temperatures()
                 
-                # Try priority zones first
-                for zone in priority_zones:
-                    if zone in temps and temps[zone]:
-                        # Get average of all sensors in this zone
-                        readings = [s.current for s in temps[zone] if s.current]
-                        if readings:
-                            avg_temp = sum(readings) / len(readings)
-                            return round(avg_temp, 1), zone
-                
-                # Fallback: use first available zone
-                for zone_name, sensors in temps.items():
-                    if sensors:
-                        readings = [s.current for s in sensors if s.current]
-                        if readings:
-                            avg_temp = sum(readings) / len(readings)
-                            return round(avg_temp, 1), zone_name
+                if temps:
+                    # Priority order for temperature zones
+                    priority_zones = [
+                        'coretemp',      # Intel CPU
+                        'k10temp',       # AMD CPU
+                        'zenpower',      # AMD Zen
+                        'cpu_thermal',   # ARM/Raspberry Pi
+                        'acpitz',        # ACPI thermal zone
+                    ]
+                    
+                    # Try priority zones first
+                    for zone in priority_zones:
+                        if zone in temps and temps[zone]:
+                            # Get average of all sensors in this zone
+                            readings = [s.current for s in temps[zone] if s.current]
+                            if readings:
+                                avg_temp = sum(readings) / len(readings)
+                                return round(avg_temp, 1), zone
+                    
+                    # Fallback: use first available zone
+                    for zone_name, sensors in temps.items():
+                        if sensors:
+                            readings = [s.current for s in sensors if s.current]
+                            if readings:
+                                avg_temp = sum(readings) / len(readings)
+                                return round(avg_temp, 1), zone_name
+            except (AttributeError, Exception) as e:
+                logger.debug(f"psutil sensors not available: {e}")
             
             # Method 2: Try reading from /sys/class/thermal (Linux)
             thermal_zones = [
                 '/sys/class/thermal/thermal_zone0/temp',
                 '/sys/class/thermal/thermal_zone1/temp',
-                '/sys/class/hwmon/hwmon0/temp1_input',
-                '/sys/class/hwmon/hwmon1/temp1_input',
+                '/sys/class/thermal/thermal_zone2/temp',
+                '/sys/class/thermal/thermal_zone3/temp',
             ]
             
             for zone_path in thermal_zones:
@@ -1036,14 +1039,55 @@ class ProxmoxDashboard:
                             temp = temp_raw / 1000.0
                             if 0 < temp < 150:  # Sanity check
                                 return round(temp, 1), "thermal_zone"
-                except (ValueError, IOError):
+                except (ValueError, IOError, PermissionError):
                     continue
             
-            return None, "No sensors"
+            # Method 3: Try hwmon sensors
+            hwmon_paths = []
+            hwmon_base = '/sys/class/hwmon'
+            if os.path.exists(hwmon_base):
+                try:
+                    for hwmon_dir in os.listdir(hwmon_base):
+                        hwmon_path = os.path.join(hwmon_base, hwmon_dir)
+                        # Check for temp1_input, temp2_input, etc.
+                        for i in range(1, 10):
+                            temp_file = os.path.join(hwmon_path, f'temp{i}_input')
+                            if os.path.exists(temp_file):
+                                hwmon_paths.append(temp_file)
+                except (OSError, PermissionError):
+                    pass
             
-        except AttributeError:
-            # sensors_temperatures not available on this platform
-            return None, "Not supported"
+            for hwmon_path in hwmon_paths:
+                try:
+                    with open(hwmon_path, 'r') as f:
+                        temp_raw = int(f.read().strip())
+                        temp = temp_raw / 1000.0
+                        if 0 < temp < 150:  # Sanity check
+                            return round(temp, 1), "hwmon"
+                except (ValueError, IOError, PermissionError):
+                    continue
+            
+            # Method 4: Try sensors command (if installed)
+            try:
+                import subprocess
+                result = subprocess.run(['sensors', '-u'], capture_output=True, text=True, timeout=2)
+                if result.returncode == 0:
+                    lines = result.stdout.split('\n')
+                    for line in lines:
+                        if 'temp' in line.lower() and 'input' in line.lower():
+                            parts = line.split(':')
+                            if len(parts) == 2:
+                                try:
+                                    temp = float(parts[1].strip())
+                                    if 0 < temp < 150:
+                                        return round(temp, 1), "sensors"
+                                except ValueError:
+                                    continue
+            except (FileNotFoundError, subprocess.TimeoutExpired, Exception):
+                pass
+            
+            return None, "No sensors detected"
+            
         except Exception as e:
             logger.debug(f"Temperature read error: {e}")
             return None, "Error"
@@ -1082,6 +1126,7 @@ class ProxmoxDashboard:
         top_frame.pack(fill=tk.X)
         top_frame.pack_propagate(False)
         
+        # Left section: Title
         title_label = tk.Label(
             top_frame,
             text="Proxmox VM/Container Dashboard",
@@ -1091,9 +1136,17 @@ class ProxmoxDashboard:
         )
         title_label.pack(side=tk.LEFT, padx=20, pady=50)
         
-        # VM Summary section - CENTER LEFT of banner
-        vm_summary_frame = tk.Frame(top_frame, bg="#2c3e50")
-        vm_summary_frame.pack(side=tk.LEFT, padx=40, pady=20)
+        # Right section: Status indicators (pack first to anchor right side)
+        self.status_frame = tk.Frame(top_frame, bg="#2c3e50")
+        self.status_frame.pack(side=tk.RIGHT, padx=20, pady=10)
+        
+        # Center section: VM Summary (fills remaining space and centers content)
+        vm_summary_container = tk.Frame(top_frame, bg="#2c3e50")
+        vm_summary_container.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        
+        # Inner frame for VM summary (centered within container)
+        vm_summary_frame = tk.Frame(vm_summary_container, bg="#2c3e50")
+        vm_summary_frame.place(relx=0.5, rely=0.5, anchor="center")
         
         # VMs/CTs: label
         summary_title = tk.Label(
@@ -1136,10 +1189,6 @@ class ProxmoxDashboard:
             fg="#e74c3c"
         )
         self.stopped_count_label.pack(side=tk.LEFT)
-        
-        # Status indicators - RIGHT side of banner
-        self.status_frame = tk.Frame(top_frame, bg="#2c3e50")
-        self.status_frame.pack(side=tk.RIGHT, padx=20, pady=10)
         
         # Row 0: Connection and LIVE status
         connection_frame = tk.Frame(self.status_frame, bg="#2c3e50")
@@ -1415,10 +1464,14 @@ class ProxmoxDashboard:
         self.tree.tag_configure("paused", background="#fef5e7", foreground="#f39c12")
         self.tree.tag_configure("unknown", background="#ecf0f1", foreground="#95a5a6")
         
-        # Pack scrollbars and tree
-        vsb.pack(side=tk.RIGHT, fill=tk.Y)
-        hsb.pack(side=tk.BOTTOM, fill=tk.X)
-        self.tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        # Use grid layout for proper scrollbar positioning
+        self.tree.grid(row=0, column=0, sticky="nsew")
+        vsb.grid(row=0, column=1, sticky="ns")
+        hsb.grid(row=1, column=0, sticky="ew")
+        
+        # Configure grid weights so tree expands
+        table_container.grid_rowconfigure(0, weight=1)
+        table_container.grid_columnconfigure(0, weight=1)
         
         self.tree.bind("<<TreeviewSelect>>", self.on_select)
         
@@ -1757,22 +1810,71 @@ class ProxmoxDashboard:
             free_pct = 'N/A'
             if vm['status'] == 'running':
                 try:
-                    stat = self.api.get(f'/nodes/{n}/{endpoint}/{vmid}/status/current')
+                    if vm_type == 'VM':
+                        # For VMs: Try QEMU guest agent first for accurate filesystem data
+                        try:
+                            # Get filesystem info from QEMU guest agent
+                            fsinfo = self.api.get(f'/nodes/{n}/qemu/{vmid}/agent/get-fsinfo')
+                            
+                            # Guest agent returns filesystem information
+                            # We'll use the root filesystem or largest filesystem
+                            if 'result' in fsinfo and fsinfo['result']:
+                                filesystems = fsinfo['result']
+                                
+                                # Find root filesystem or largest one
+                                largest_fs = None
+                                root_fs = None
+                                
+                                for fs in filesystems:
+                                    # Check for root filesystem
+                                    if 'mountpoint' in fs and fs.get('mountpoint') in ['/', 'C:\\']:
+                                        root_fs = fs
+                                        break
+                                    # Track largest filesystem
+                                    if 'total-bytes' in fs and 'used-bytes' in fs:
+                                        if largest_fs is None or fs.get('total-bytes', 0) > largest_fs.get('total-bytes', 0):
+                                            largest_fs = fs
+                                
+                                # Use root filesystem if found, otherwise largest
+                                target_fs = root_fs if root_fs else largest_fs
+                                
+                                if target_fs and 'total-bytes' in target_fs and 'used-bytes' in target_fs:
+                                    total_bytes = target_fs['total-bytes']
+                                    used_bytes = target_fs['used-bytes']
+                                    
+                                    if total_bytes > 0:
+                                        free_bytes = total_bytes - used_bytes
+                                        if free_bytes >= 0:
+                                            free_disk = self.format_bytes(free_bytes)
+                                            free_pct = f"{(free_bytes / total_bytes * 100):.1f}%"
+                        
+                        except Exception as e:
+                            # Guest agent not available or error - fall back to status method
+                            logger.debug(f"Guest agent not available for VM {vmid}, using status method: {e}")
+                            stat = self.api.get(f'/nodes/{n}/qemu/{vmid}/status/current')
+                            disk_used = stat.get('disk', 0)
+                            disk_max = stat.get('maxdisk', 0)
+                            
+                            if disk_max > 0 and disk_used >= 0:
+                                free_bytes = disk_max - disk_used
+                                if free_bytes >= 0:
+                                    free_disk = self.format_bytes(free_bytes)
+                                    free_pct = f"{(free_bytes / disk_max * 100):.1f}%"
                     
-                    # Get DISK usage for Free% (NOT memory!)
-                    disk_used = stat.get('disk', 0)
-                    disk_max = stat.get('maxdisk', 0)
-                    
-                    if disk_max > 0 and disk_used >= 0:
-                        # Calculate free disk space
-                        free_bytes = disk_max - disk_used
-                        if free_bytes >= 0:
-                            free_disk = self.format_bytes(free_bytes)
-                            # Calculate FREE DISK percentage (not memory!)
-                            free_pct = f"{(free_bytes / disk_max * 100):.1f}%"
-                        else:
-                            free_pct = 'N/A'
-                except Exception:
+                    else:  # CT
+                        # For CTs: Use status/current (already works correctly)
+                        stat = self.api.get(f'/nodes/{n}/lxc/{vmid}/status/current')
+                        disk_used = stat.get('disk', 0)
+                        disk_max = stat.get('maxdisk', 0)
+                        
+                        if disk_max > 0 and disk_used >= 0:
+                            free_bytes = disk_max - disk_used
+                            if free_bytes >= 0:
+                                free_disk = self.format_bytes(free_bytes)
+                                free_pct = f"{(free_bytes / disk_max * 100):.1f}%"
+                
+                except Exception as e:
+                    logger.debug(f"Error getting disk data for {vm_type} {vmid}: {e}")
                     pass
             
             # Additional CPU info
@@ -1877,9 +1979,6 @@ class ProxmoxDashboard:
                 vms = self.api.get(f'/nodes/{n}/qemu')
                 for vm in vms:
                     current += 1
-                    self.root.after(0, lambda c=current, t=total_count: self.progress_label.config(
-                        text=f"Processing {c}/{t} VMs/CTs..."
-                    ))
                     
                     try:
                         vm_info = self.fetch_single_vm_data(node, vm, 'VM')
@@ -1895,9 +1994,6 @@ class ProxmoxDashboard:
                 cts = self.api.get(f'/nodes/{n}/lxc')
                 for ct in cts:
                     current += 1
-                    self.root.after(0, lambda c=current, t=total_count: self.progress_label.config(
-                        text=f"Processing {c}/{t} VMs/CTs..."
-                    ))
                     
                     try:
                         ct_info = self.fetch_single_vm_data(node, ct, 'CT')
