@@ -994,6 +994,7 @@ class ProxmoxDashboard:
                 temps = psutil.sensors_temperatures()
                 
                 if temps:
+                    logger.debug(f"Found temperature sensors: {list(temps.keys())}")
                     # Priority order for temperature zones
                     priority_zones = [
                         'coretemp',      # Intel CPU
@@ -1010,6 +1011,7 @@ class ProxmoxDashboard:
                             readings = [s.current for s in temps[zone] if s.current]
                             if readings:
                                 avg_temp = sum(readings) / len(readings)
+                                logger.info(f"Temperature detected via psutil ({zone}): {avg_temp:.1f}°C")
                                 return round(avg_temp, 1), zone
                     
                     # Fallback: use first available zone
@@ -1018,7 +1020,10 @@ class ProxmoxDashboard:
                             readings = [s.current for s in sensors if s.current]
                             if readings:
                                 avg_temp = sum(readings) / len(readings)
+                                logger.info(f"Temperature detected via psutil ({zone_name}): {avg_temp:.1f}°C")
                                 return round(avg_temp, 1), zone_name
+                else:
+                    logger.debug("psutil.sensors_temperatures() returned empty dict")
             except (AttributeError, Exception) as e:
                 logger.debug(f"psutil sensors not available: {e}")
             
@@ -1038,8 +1043,10 @@ class ProxmoxDashboard:
                             # Convert from millidegrees to degrees
                             temp = temp_raw / 1000.0
                             if 0 < temp < 150:  # Sanity check
+                                logger.info(f"Temperature detected via {zone_path}: {temp:.1f}°C")
                                 return round(temp, 1), "thermal_zone"
-                except (ValueError, IOError, PermissionError):
+                except (ValueError, IOError, PermissionError) as e:
+                    logger.debug(f"Could not read {zone_path}: {e}")
                     continue
             
             # Method 3: Try hwmon sensors
@@ -1054,8 +1061,8 @@ class ProxmoxDashboard:
                             temp_file = os.path.join(hwmon_path, f'temp{i}_input')
                             if os.path.exists(temp_file):
                                 hwmon_paths.append(temp_file)
-                except (OSError, PermissionError):
-                    pass
+                except (OSError, PermissionError) as e:
+                    logger.debug(f"Could not list hwmon: {e}")
             
             for hwmon_path in hwmon_paths:
                 try:
@@ -1063,8 +1070,10 @@ class ProxmoxDashboard:
                         temp_raw = int(f.read().strip())
                         temp = temp_raw / 1000.0
                         if 0 < temp < 150:  # Sanity check
+                            logger.info(f"Temperature detected via {hwmon_path}: {temp:.1f}°C")
                             return round(temp, 1), "hwmon"
-                except (ValueError, IOError, PermissionError):
+                except (ValueError, IOError, PermissionError) as e:
+                    logger.debug(f"Could not read {hwmon_path}: {e}")
                     continue
             
             # Method 4: Try sensors command (if installed)
@@ -1080,16 +1089,18 @@ class ProxmoxDashboard:
                                 try:
                                     temp = float(parts[1].strip())
                                     if 0 < temp < 150:
+                                        logger.info(f"Temperature detected via sensors command: {temp:.1f}°C")
                                         return round(temp, 1), "sensors"
                                 except ValueError:
                                     continue
-            except (FileNotFoundError, subprocess.TimeoutExpired, Exception):
-                pass
+            except (FileNotFoundError, subprocess.TimeoutExpired, Exception) as e:
+                logger.debug(f"sensors command not available: {e}")
             
+            logger.warning("No temperature sensors detected on this system")
             return None, "No sensors detected"
             
         except Exception as e:
-            logger.debug(f"Temperature read error: {e}")
+            logger.error(f"Temperature read error: {e}")
             return None, "Error"
     
     def format_temperature(self, temp, zone):
@@ -1437,7 +1448,7 @@ class ProxmoxDashboard:
             yscrollcommand=vsb.set,
             xscrollcommand=hsb.set,
             selectmode="browse",
-            height=20
+            height=12
         )
         
         # Connect scrollbars to tree
@@ -1446,11 +1457,11 @@ class ProxmoxDashboard:
         
         self.tree.column("#0", width=0, stretch=tk.NO)
         
-        # Column widths
+        # Column widths (increased for better visibility and earlier scrollbar activation)
         column_widths = {
-            "ID": 60, "Type": 60, "Status": 80, "Name": 180, "Node": 100,
-            "Cores": 70, "Sockets": 80, "CPU": 120, "Memory": 180,
-            "Disk": 100, "Free Disk": 100, "Free%": 80
+            "ID": 80, "Type": 80, "Status": 110, "Name": 300, "Node": 150,
+            "Cores": 100, "Sockets": 110, "CPU": 180, "Memory": 250,
+            "Disk": 150, "Free Disk": 150, "Free%": 110
         }
         
         for col in columns:
@@ -1680,6 +1691,17 @@ class ProxmoxDashboard:
         """Filter VMs based on search query"""
         query = self.search_entry.get().lower()
         
+        # Save current selection (VM ID) before clearing
+        selected_vm_id = None
+        selected_items = self.tree.selection()
+        if selected_items:
+            try:
+                selected_values = self.tree.item(selected_items[0])['values']
+                if selected_values:
+                    selected_vm_id = selected_values[0]  # VM ID is first column
+            except (IndexError, KeyError):
+                pass
+        
         # Faster bulk delete
         self.tree.delete(*self.tree.get_children())
         
@@ -1688,6 +1710,8 @@ class ProxmoxDashboard:
         stopped_count = 0
         
         self.filtered_vm_data = []
+        item_to_select = None
+        
         for vm in self.vm_data:
             if (query in str(vm.get('id', '')).lower() or
                 query in vm.get('name', '').lower() or
@@ -1709,12 +1733,21 @@ class ProxmoxDashboard:
                 else:
                     tags = ('unknown',)
                 
-                self.tree.insert('', 'end', values=(
+                item = self.tree.insert('', 'end', values=(
                     vm['id'], vm['type'], vm['status'], vm['name'], vm['node'],
                     vm.get('cores', 'N/A'), vm.get('sockets', 'N/A'), vm.get('cpu', 'N/A'),
                     vm.get('memory', 'N/A'), vm.get('disk', 'N/A'),
                     vm.get('free_disk', 'N/A'), vm.get('free_pct', 'N/A')
                 ), tags=tags)
+                
+                # Track the item to reselect
+                if selected_vm_id is not None and vm['id'] == selected_vm_id:
+                    item_to_select = item
+        
+        # Restore selection if found
+        if item_to_select:
+            self.tree.selection_set(item_to_select)
+            self.tree.see(item_to_select)  # Ensure visible
         
         # Update summary counts
         self.running_count_label.config(text=f"Running: {running_count}")
@@ -1817,36 +1850,50 @@ class ProxmoxDashboard:
                             fsinfo = self.api.get(f'/nodes/{n}/qemu/{vmid}/agent/get-fsinfo')
                             
                             # Guest agent returns filesystem information
-                            # We'll use the root filesystem or largest filesystem
+                            # Sum ONLY relevant filesystems (filter out ISO/tmpfs/etc)
                             if 'result' in fsinfo and fsinfo['result']:
                                 filesystems = fsinfo['result']
                                 
-                                # Find root filesystem or largest one
-                                largest_fs = None
-                                root_fs = None
+                                # Define filesystem filters
+                                excluded_types = ['iso9660', 'udf', 'tmpfs', 'devtmpfs']
+                                included_mountpoints = ['/', '/boot', '/home', '/var', '/tmp', '/usr']
+                                
+                                # Sum only relevant filesystems
+                                total_bytes_sum = 0
+                                used_bytes_sum = 0
                                 
                                 for fs in filesystems:
-                                    # Check for root filesystem
-                                    if 'mountpoint' in fs and fs.get('mountpoint') in ['/', 'C:\\']:
-                                        root_fs = fs
-                                        break
-                                    # Track largest filesystem
-                                    if 'total-bytes' in fs and 'used-bytes' in fs:
-                                        if largest_fs is None or fs.get('total-bytes', 0) > largest_fs.get('total-bytes', 0):
-                                            largest_fs = fs
-                                
-                                # Use root filesystem if found, otherwise largest
-                                target_fs = root_fs if root_fs else largest_fs
-                                
-                                if target_fs and 'total-bytes' in target_fs and 'used-bytes' in target_fs:
-                                    total_bytes = target_fs['total-bytes']
-                                    used_bytes = target_fs['used-bytes']
+                                    # Get filesystem type and mountpoint
+                                    fs_type = fs.get('type', '').lower()
+                                    mountpoint = fs.get('mountpoint', '')
                                     
-                                    if total_bytes > 0:
-                                        free_bytes = total_bytes - used_bytes
-                                        if free_bytes >= 0:
-                                            free_disk = self.format_bytes(free_bytes)
-                                            free_pct = f"{(free_bytes / total_bytes * 100):.1f}%"
+                                    # Skip excluded filesystem types
+                                    if fs_type in excluded_types:
+                                        logger.debug(f"Skipping filesystem type {fs_type} at {mountpoint}")
+                                        continue
+                                    
+                                    # Only include specific mountpoints
+                                    if mountpoint not in included_mountpoints:
+                                        logger.debug(f"Skipping mountpoint {mountpoint} (not in included list)")
+                                        continue
+                                    
+                                    # Include filesystem with valid data
+                                    if 'total-bytes' in fs and 'used-bytes' in fs:
+                                        fs_total = fs.get('total-bytes', 0)
+                                        fs_used = fs.get('used-bytes', 0)
+                                        
+                                        # Sanity check - valid filesystem
+                                        if fs_total > 0:
+                                            logger.debug(f"Including {mountpoint} ({fs_type}): {fs_total} bytes")
+                                            total_bytes_sum += fs_total
+                                            used_bytes_sum += fs_used
+                                
+                                # Calculate free space from summed values
+                                if total_bytes_sum > 0:
+                                    free_bytes = total_bytes_sum - used_bytes_sum
+                                    if free_bytes >= 0:
+                                        free_disk = self.format_bytes(free_bytes)
+                                        free_pct = f"{(free_bytes / total_bytes_sum * 100):.1f}%"
                         
                         except Exception as e:
                             # Guest agent not available or error - fall back to status method
