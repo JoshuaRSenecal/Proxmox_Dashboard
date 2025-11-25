@@ -18,6 +18,10 @@ FEATURES:
 import tkinter as tk
 from tkinter import ttk, messagebox, simpledialog
 import requests
+from requests.adapters import HTTPAdapter
+from urllib3.poolmanager import PoolManager
+import urllib3
+import ssl
 import json
 import base64
 import os
@@ -31,13 +35,15 @@ from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
 import psutil
 
+# Disable hostname verification warnings (we verify certificate but allow IP addresses)
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+
 # Configure logging
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
     handlers=[
-        logging.FileHandler(os.path.expanduser('~/.proxmox_dashboard.log')),
-        logging.StreamHandler()
+        logging.FileHandler(os.path.expanduser('~/.proxmox_dashboard.log'))
     ]
 )
 logger = logging.getLogger('ProxmoxDashboard')
@@ -113,6 +119,18 @@ class AuditLogger:
         details = f"Error: {error}" if error else None
         AuditLogger.log(action, target, result, details)
 
+class SSLAdapter(HTTPAdapter):
+    """Custom HTTPAdapter that verifies CA cert but allows any hostname (including IPs)"""
+    
+    def init_poolmanager(self, *args, **kwargs):
+        # Create SSL context that verifies certificate but not hostname
+        context = ssl.create_default_context(cafile=PROXMOX_CA_CERT)
+        context.check_hostname = False  # Allow IP addresses
+        context.verify_mode = ssl.CERT_REQUIRED  # Still verify certificate
+        
+        kwargs['ssl_context'] = context
+        return super().init_poolmanager(*args, **kwargs)
+
 class ProxmoxAPI:
     """Proxmox API Client - API Token Authentication Only"""
     
@@ -120,9 +138,13 @@ class ProxmoxAPI:
         self.base = f"https://{host}:8006/api2/json"
         self.host = host
         
-        # SSL verification is MANDATORY
+        # SSL verification with CA cert but hostname checking disabled (allows IP addresses)
         self.verify = PROXMOX_CA_CERT
         self.ssl_status = "Verified"
+        
+        # Create session with custom SSL adapter
+        self.session = requests.Session()
+        self.session.mount('https://', SSLAdapter())
         
         # API Token authentication
         self.headers = {'Authorization': f'PVEAPIToken={token_id}={token_secret}'}
@@ -142,7 +164,7 @@ class ProxmoxAPI:
         for attempt in range(retries):
             try:
                 if method == 'get':
-                    r = requests.get(
+                    r = self.session.get(
                         f"{self.base}{path}",
                         headers=self.headers,
                         verify=self.verify,
@@ -150,7 +172,7 @@ class ProxmoxAPI:
                         **kwargs
                     )
                 elif method == 'post':
-                    r = requests.post(
+                    r = self.session.post(
                         f"{self.base}{path}",
                         headers=self.headers,
                         verify=self.verify,
@@ -251,6 +273,335 @@ class CredentialManager:
         except Exception as e:
             # Most likely wrong password or corrupted file
             raise Exception("Invalid master password or corrupted credentials file")
+
+def extract_hostname_from_certificate(cert_path):
+    """Extract Common Name from SSL certificate"""
+    try:
+        import subprocess
+        result = subprocess.run(
+            ['openssl', 'x509', '-in', cert_path, '-noout', '-subject'],
+            capture_output=True,
+            text=True,
+            timeout=5
+        )
+        if result.returncode == 0:
+            # Parse subject line: "subject=CN = pve"
+            for part in result.stdout.split(','):
+                if 'CN' in part or 'CN=' in part:
+                    hostname = part.split('=')[-1].strip()
+                    return hostname
+    except Exception as e:
+        logger.error(f"Failed to extract hostname from certificate: {e}")
+    return None
+
+class HostnameMismatchDialog(tk.Toplevel):
+    """Dialog to help user fix certificate hostname mismatch"""
+    
+    def __init__(self, parent, ip_address, certificate_hostname):
+        super().__init__(parent)
+        self.title("Certificate Hostname Mismatch - Fix Required")
+        self.geometry("750x700")
+        self.resizable(True, True)
+        
+        self.ip_address = ip_address
+        self.cert_hostname = certificate_hostname
+        
+        self.update_idletasks()
+        x = (self.winfo_screenwidth() // 2) - 375
+        y = (self.winfo_screenheight() // 2) - 350
+        self.geometry(f"750x700+{x}+{y}")
+        
+        self.create_widgets()
+        self.protocol("WM_DELETE_WINDOW", self.on_close)
+        self.grab_set()
+    
+    def create_widgets(self):
+        # Title
+        title_frame = tk.Frame(self, bg="#e74c3c", height=70)
+        title_frame.pack(fill=tk.X)
+        title_frame.pack_propagate(False)
+        
+        title_label = tk.Label(
+            title_frame,
+            text="⚠ Certificate Hostname Mismatch",
+            font=("Arial", 16, "bold"),
+            bg="#e74c3c",
+            fg="white"
+        )
+        title_label.pack(pady=20)
+        
+        # Main content with scrollbar
+        main_frame = tk.Frame(self, bg="white")
+        main_frame.pack(fill=tk.BOTH, expand=True, padx=20, pady=20)
+        
+        # Create canvas and scrollbar
+        canvas = tk.Canvas(main_frame, bg="white", highlightthickness=0)
+        scrollbar = tk.Scrollbar(main_frame, orient="vertical", command=canvas.yview)
+        scrollable_frame = tk.Frame(canvas, bg="white")
+        
+        scrollable_frame.bind(
+            "<Configure>",
+            lambda e: canvas.configure(scrollregion=canvas.bbox("all"))
+        )
+        
+        canvas.create_window((0, 0), window=scrollable_frame, anchor="nw")
+        canvas.configure(yscrollcommand=scrollbar.set)
+        
+        # Problem explanation
+        tk.Label(
+            scrollable_frame,
+            text="The Problem:",
+            font=("Arial", 12, "bold"),
+            bg="white",
+            fg="#2c3e50",
+            anchor="w"
+        ).pack(anchor="w", pady=(0, 5))
+        
+        problem_text = f"""Your Proxmox SSL certificate is issued for the hostname '{self.cert_hostname}', but you're trying to connect using the IP address '{self.ip_address}'.
+
+SSL validation requires the connection address to match the certificate hostname."""
+        
+        tk.Label(
+            scrollable_frame,
+            text=problem_text,
+            font=("Arial", 10),
+            bg="white",
+            fg="#34495e",
+            justify=tk.LEFT,
+            wraplength=680,
+            anchor="w"
+        ).pack(anchor="w", pady=(0, 15))
+        
+        # Solution
+        tk.Label(
+            scrollable_frame,
+            text="The Solution:",
+            font=("Arial", 12, "bold"),
+            bg="white",
+            fg="#27ae60",
+            anchor="w"
+        ).pack(anchor="w", pady=(0, 5))
+        
+        solution_text = f"Use the hostname '{self.cert_hostname}' instead of the IP address '{self.ip_address}' when connecting."
+        
+        tk.Label(
+            scrollable_frame,
+            text=solution_text,
+            font=("Arial", 10),
+            bg="white",
+            fg="#34495e",
+            justify=tk.LEFT,
+            wraplength=680,
+            anchor="w"
+        ).pack(anchor="w", pady=(0, 15))
+        
+        # Step-by-step fix
+        tk.Label(
+            scrollable_frame,
+            text="How to Fix:",
+            font=("Arial", 12, "bold"),
+            bg="white",
+            fg="#2c3e50",
+            anchor="w"
+        ).pack(anchor="w", pady=(0, 10))
+        
+        # Step 1
+        step1_frame = tk.Frame(scrollable_frame, bg="#ecf0f1", relief=tk.SOLID, borderwidth=1)
+        step1_frame.pack(fill=tk.X, pady=5)
+        
+        tk.Label(
+            step1_frame,
+            text="Step 1: Add hostname to your hosts file",
+            font=("Arial", 10, "bold"),
+            bg="#ecf0f1",
+            fg="#2c3e50",
+            anchor="w"
+        ).pack(anchor="w", padx=10, pady=(10, 5))
+        
+        tk.Label(
+            step1_frame,
+            text="Open a terminal and run this command:",
+            font=("Arial", 9),
+            bg="#ecf0f1",
+            fg="#7f8c8d",
+            anchor="w"
+        ).pack(anchor="w", padx=10, pady=(0, 5))
+        
+        # Command box
+        cmd_frame = tk.Frame(step1_frame, bg="#2c3e50")
+        cmd_frame.pack(fill=tk.X, padx=10, pady=(0, 10))
+        
+        hosts_command = f"echo '{self.ip_address}    {self.cert_hostname}' | sudo tee -a /etc/hosts"
+        
+        cmd_text = tk.Text(
+            cmd_frame,
+            height=2,
+            font=("Courier", 9),
+            bg="#2c3e50",
+            fg="#2ecc71",
+            wrap=tk.WORD,
+            relief=tk.FLAT
+        )
+        cmd_text.pack(fill=tk.X, padx=5, pady=5)
+        cmd_text.insert("1.0", hosts_command)
+        cmd_text.config(state=tk.DISABLED)
+        
+        # Copy button
+        copy_btn = tk.Button(
+            step1_frame,
+            text="Copy Command to Clipboard",
+            command=lambda: self.copy_to_clipboard(hosts_command),
+            bg="#3498db",
+            fg="white",
+            font=("Arial", 9, "bold"),
+            cursor="hand2"
+        )
+        copy_btn.pack(pady=(0, 10))
+        
+        # Step 2
+        step2_frame = tk.Frame(scrollable_frame, bg="#ecf0f1", relief=tk.SOLID, borderwidth=1)
+        step2_frame.pack(fill=tk.X, pady=5)
+        
+        tk.Label(
+            step2_frame,
+            text="Step 2: Test the hostname works",
+            font=("Arial", 10, "bold"),
+            bg="#ecf0f1",
+            fg="#2c3e50",
+            anchor="w"
+        ).pack(anchor="w", padx=10, pady=(10, 5))
+        
+        tk.Label(
+            step2_frame,
+            text="Run this command to verify:",
+            font=("Arial", 9),
+            bg="#ecf0f1",
+            fg="#7f8c8d",
+            anchor="w"
+        ).pack(anchor="w", padx=10, pady=(0, 5))
+        
+        test_cmd_frame = tk.Frame(step2_frame, bg="#2c3e50")
+        test_cmd_frame.pack(fill=tk.X, padx=10, pady=(0, 10))
+        
+        test_command = f"ping -c 3 {self.cert_hostname}"
+        
+        test_cmd_text = tk.Text(
+            test_cmd_frame,
+            height=1,
+            font=("Courier", 9),
+            bg="#2c3e50",
+            fg="#2ecc71",
+            wrap=tk.NONE,
+            relief=tk.FLAT
+        )
+        test_cmd_text.pack(fill=tk.X, padx=5, pady=5)
+        test_cmd_text.insert("1.0", test_command)
+        test_cmd_text.config(state=tk.DISABLED)
+        
+        # Step 3
+        step3_frame = tk.Frame(scrollable_frame, bg="#ecf0f1", relief=tk.SOLID, borderwidth=1)
+        step3_frame.pack(fill=tk.X, pady=5)
+        
+        tk.Label(
+            step3_frame,
+            text="Step 3: Reconnect using hostname",
+            font=("Arial", 10, "bold"),
+            bg="#ecf0f1",
+            fg="#2c3e50",
+            anchor="w"
+        ).pack(anchor="w", padx=10, pady=(10, 5))
+        
+        reconnect_text = f"""After adding the hostname to /etc/hosts:
+
+1. Click 'Close' below to return to the dashboard
+2. Delete your saved credentials (if any)
+3. Click 'Change Credentials' in the dashboard
+4. Enter hostname: {self.cert_hostname}
+5. Re-enter your token credentials
+
+The connection should now work!"""
+        
+        tk.Label(
+            step3_frame,
+            text=reconnect_text,
+            font=("Arial", 9),
+            bg="#ecf0f1",
+            fg="#34495e",
+            justify=tk.LEFT,
+            anchor="w"
+        ).pack(anchor="w", padx=10, pady=(0, 10))
+        
+        # Alternative solution
+        tk.Label(
+            scrollable_frame,
+            text="\nAlternative: If you can't modify /etc/hosts",
+            font=("Arial", 10, "bold"),
+            bg="white",
+            fg="#e67e22",
+            anchor="w"
+        ).pack(anchor="w", pady=(10, 5))
+        
+        alt_text = """You can regenerate the Proxmox certificate to include your IP address, but this is more complex. Using the hostname (above solution) is easier and recommended."""
+        
+        tk.Label(
+            scrollable_frame,
+            text=alt_text,
+            font=("Arial", 9),
+            bg="white",
+            fg="#7f8c8d",
+            justify=tk.LEFT,
+            wraplength=680,
+            anchor="w"
+        ).pack(anchor="w", pady=(0, 10))
+        
+        canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+        
+        # Button frame
+        btn_frame = tk.Frame(self, bg="white")
+        btn_frame.pack(fill=tk.X, padx=20, pady=20)
+        
+        tk.Button(
+            btn_frame,
+            text="I've Fixed It - Close",
+            command=self.on_close,
+            bg="#27ae60",
+            fg="white",
+            font=("Arial", 12, "bold"),
+            width=30,
+            height=2,
+            cursor="hand2"
+        ).pack(pady=5)
+        
+        tk.Button(
+            btn_frame,
+            text="Delete Credentials & Exit",
+            command=self.delete_and_exit,
+            bg="#95a5a6",
+            fg="white",
+            font=("Arial", 10),
+            width=30,
+            cursor="hand2"
+        ).pack(pady=5)
+    
+    def copy_to_clipboard(self, text):
+        """Copy text to clipboard"""
+        self.clipboard_clear()
+        self.clipboard_append(text)
+        messagebox.showinfo("Copied", "Command copied to clipboard!\n\nPaste it in your terminal and press Enter.")
+    
+    def delete_and_exit(self):
+        """Delete credentials file and exit"""
+        cred_file = os.path.expanduser("~/.proxmox_credentials.enc")
+        if os.path.exists(cred_file):
+            os.remove(cred_file)
+            messagebox.showinfo("Deleted", "Credentials deleted.\n\nRestart the dashboard after fixing the hostname issue.")
+        self.destroy()
+        import sys
+        sys.exit(0)
+    
+    def on_close(self):
+        self.destroy()
 
 class TokenCreationGuide(tk.Toplevel):
     """Guide dialog for creating API tokens in Proxmox"""
@@ -636,40 +987,59 @@ class ProxmoxDashboard:
         return label
     
     def get_host_temperature(self):
-        """Get host laptop/PC temperature"""
+        """Get host laptop/PC temperature with improved detection"""
         try:
-            # Try to get temperature sensors
+            # Method 1: Try psutil sensors_temperatures
             temps = psutil.sensors_temperatures()
             
-            if not temps:
-                return None, "No sensors"
+            if temps:
+                # Priority order for temperature zones
+                priority_zones = [
+                    'coretemp',      # Intel CPU
+                    'k10temp',       # AMD CPU
+                    'zenpower',      # AMD Zen
+                    'cpu_thermal',   # ARM/Raspberry Pi
+                    'acpitz',        # ACPI thermal zone
+                ]
+                
+                # Try priority zones first
+                for zone in priority_zones:
+                    if zone in temps and temps[zone]:
+                        # Get average of all sensors in this zone
+                        readings = [s.current for s in temps[zone] if s.current]
+                        if readings:
+                            avg_temp = sum(readings) / len(readings)
+                            return round(avg_temp, 1), zone
+                
+                # Fallback: use first available zone
+                for zone_name, sensors in temps.items():
+                    if sensors:
+                        readings = [s.current for s in sensors if s.current]
+                        if readings:
+                            avg_temp = sum(readings) / len(readings)
+                            return round(avg_temp, 1), zone_name
             
-            # Priority order for temperature zones
-            priority_zones = [
-                'coretemp',      # Intel CPU
-                'k10temp',       # AMD CPU
-                'cpu_thermal',   # ARM/Raspberry Pi
-                'acpitz',        # ACPI thermal zone
+            # Method 2: Try reading from /sys/class/thermal (Linux)
+            thermal_zones = [
+                '/sys/class/thermal/thermal_zone0/temp',
+                '/sys/class/thermal/thermal_zone1/temp',
+                '/sys/class/hwmon/hwmon0/temp1_input',
+                '/sys/class/hwmon/hwmon1/temp1_input',
             ]
             
-            # Try priority zones first
-            for zone in priority_zones:
-                if zone in temps and temps[zone]:
-                    # Get average of all sensors in this zone
-                    readings = [s.current for s in temps[zone] if s.current]
-                    if readings:
-                        avg_temp = sum(readings) / len(readings)
-                        return round(avg_temp, 1), zone
+            for zone_path in thermal_zones:
+                try:
+                    if os.path.exists(zone_path):
+                        with open(zone_path, 'r') as f:
+                            temp_raw = int(f.read().strip())
+                            # Convert from millidegrees to degrees
+                            temp = temp_raw / 1000.0
+                            if 0 < temp < 150:  # Sanity check
+                                return round(temp, 1), "thermal_zone"
+                except (ValueError, IOError):
+                    continue
             
-            # Fallback: use first available zone
-            for zone_name, sensors in temps.items():
-                if sensors:
-                    readings = [s.current for s in sensors if s.current]
-                    if readings:
-                        avg_temp = sum(readings) / len(readings)
-                        return round(avg_temp, 1), zone_name
-            
-            return None, "No readings"
+            return None, "No sensors"
             
         except AttributeError:
             # sensors_temperatures not available on this platform
@@ -721,11 +1091,57 @@ class ProxmoxDashboard:
         )
         title_label.pack(side=tk.LEFT, padx=20, pady=50)
         
-        # Status indicators - Better organized grid layout
+        # VM Summary section - CENTER LEFT of banner
+        vm_summary_frame = tk.Frame(top_frame, bg="#2c3e50")
+        vm_summary_frame.pack(side=tk.LEFT, padx=40, pady=20)
+        
+        # VMs/CTs: label
+        summary_title = tk.Label(
+            vm_summary_frame,
+            text="VMs/CTs:",
+            font=("Arial", 12, "bold"),
+            bg="#2c3e50",
+            fg="#ecf0f1"
+        )
+        summary_title.pack(pady=(0, 5))
+        
+        # Running count with green indicator
+        running_summary_frame = tk.Frame(vm_summary_frame, bg="#2c3e50")
+        running_summary_frame.pack(pady=2)
+        
+        self.running_led = self.create_led_indicator(running_summary_frame, "#27ae60", size=8)
+        self.running_led.pack(side=tk.LEFT, padx=(0, 5))
+        
+        self.running_count_label = tk.Label(
+            running_summary_frame,
+            text="Running: 0",
+            font=("Arial", 10),
+            bg="#2c3e50",
+            fg="#27ae60"
+        )
+        self.running_count_label.pack(side=tk.LEFT)
+        
+        # Stopped count with red indicator
+        stopped_summary_frame = tk.Frame(vm_summary_frame, bg="#2c3e50")
+        stopped_summary_frame.pack(pady=2)
+        
+        self.stopped_led = self.create_led_indicator(stopped_summary_frame, "#e74c3c", size=8)
+        self.stopped_led.pack(side=tk.LEFT, padx=(0, 5))
+        
+        self.stopped_count_label = tk.Label(
+            stopped_summary_frame,
+            text="Stopped: 0",
+            font=("Arial", 10),
+            bg="#2c3e50",
+            fg="#e74c3c"
+        )
+        self.stopped_count_label.pack(side=tk.LEFT)
+        
+        # Status indicators - RIGHT side of banner
         self.status_frame = tk.Frame(top_frame, bg="#2c3e50")
         self.status_frame.pack(side=tk.RIGHT, padx=20, pady=10)
         
-        # Row 0: Connection and SSL status
+        # Row 0: Connection and LIVE status
         connection_frame = tk.Frame(self.status_frame, bg="#2c3e50")
         connection_frame.grid(row=0, column=0, sticky="w", padx=5, pady=3)
         
@@ -741,8 +1157,24 @@ class ProxmoxDashboard:
         )
         self.connection_label.pack(side=tk.LEFT)
         
+        live_frame = tk.Frame(self.status_frame, bg="#2c3e50")
+        live_frame.grid(row=0, column=1, sticky="w", padx=15, pady=3)
+        
+        self.live_led = self.create_led_indicator(live_frame, "#27ae60")
+        self.live_led.pack(side=tk.LEFT, padx=(0, 5))
+        
+        self.live_indicator = tk.Label(
+            live_frame,
+            text="LIVE",
+            font=("Arial", 10, "bold"),
+            bg="#2c3e50",
+            fg="#27ae60"
+        )
+        self.live_indicator.pack(side=tk.LEFT)
+        
+        # Row 1: SSL and Nodes
         ssl_frame = tk.Frame(self.status_frame, bg="#2c3e50")
-        ssl_frame.grid(row=0, column=1, sticky="w", padx=15, pady=3)
+        ssl_frame.grid(row=1, column=0, sticky="w", padx=5, pady=3)
         
         self.ssl_label = tk.Label(
             ssl_frame,
@@ -753,9 +1185,8 @@ class ProxmoxDashboard:
         )
         self.ssl_label.pack()
         
-        # Row 1: Nodes and Temperature
         nodes_frame = tk.Frame(self.status_frame, bg="#2c3e50")
-        nodes_frame.grid(row=1, column=0, sticky="w", padx=5, pady=3)
+        nodes_frame.grid(row=1, column=1, sticky="w", padx=15, pady=3)
         
         self.node_label = tk.Label(
             nodes_frame,
@@ -766,9 +1197,10 @@ class ProxmoxDashboard:
         )
         self.node_label.pack()
         
+        # Row 2: Temperature and Last update
         # Host temperature indicator
         temp_frame = tk.Frame(self.status_frame, bg="#2c3e50")
-        temp_frame.grid(row=1, column=1, sticky="w", padx=15, pady=3)
+        temp_frame.grid(row=2, column=0, sticky="w", padx=5, pady=3)
         
         tk.Label(
             temp_frame,
@@ -787,22 +1219,6 @@ class ProxmoxDashboard:
         )
         self.temp_label.pack(side=tk.LEFT)
         
-        # Row 2: Live indicator and Last update
-        live_frame = tk.Frame(self.status_frame, bg="#2c3e50")
-        live_frame.grid(row=2, column=0, sticky="w", padx=5, pady=3)
-        
-        self.live_led = self.create_led_indicator(live_frame, "#27ae60")
-        self.live_led.pack(side=tk.LEFT, padx=(0, 5))
-        
-        self.live_indicator = tk.Label(
-            live_frame,
-            text="LIVE",
-            font=("Arial", 10, "bold"),
-            bg="#2c3e50",
-            fg="#27ae60"
-        )
-        self.live_indicator.pack(side=tk.LEFT)
-        
         update_frame = tk.Frame(self.status_frame, bg="#2c3e50")
         update_frame.grid(row=2, column=1, sticky="w", padx=15, pady=3)
         
@@ -814,52 +1230,6 @@ class ProxmoxDashboard:
             fg="#bdc3c7"
         )
         self.last_update_label.pack()
-        
-        # Separator line
-        separator = tk.Frame(self.status_frame, bg="#7f8c8d", height=1)
-        separator.grid(row=3, column=0, columnspan=2, sticky="ew", pady=10, padx=5)
-        
-        # Row 4-5: VM Summary Panel with visual indicators
-        summary_label = tk.Label(
-            self.status_frame,
-            text="VMs/CTs:",
-            font=("Arial", 10, "bold"),
-            bg="#2c3e50",
-            fg="#ecf0f1"
-        )
-        summary_label.grid(row=4, column=0, columnspan=2, sticky="w", padx=5, pady=(5, 3))
-        
-        # Running count with green indicator
-        running_frame = tk.Frame(self.status_frame, bg="#2c3e50")
-        running_frame.grid(row=5, column=0, sticky="w", padx=5, pady=2)
-        
-        self.running_led = self.create_led_indicator(running_frame, "#27ae60", size=8)
-        self.running_led.pack(side=tk.LEFT, padx=(0, 5))
-        
-        self.running_count_label = tk.Label(
-            running_frame,
-            text="Running: 0",
-            font=("Arial", 10),
-            bg="#2c3e50",
-            fg="#27ae60"
-        )
-        self.running_count_label.pack(side=tk.LEFT)
-        
-        # Stopped count with red indicator
-        stopped_frame = tk.Frame(self.status_frame, bg="#2c3e50")
-        stopped_frame.grid(row=5, column=1, sticky="w", padx=15, pady=2)
-        
-        self.stopped_led = self.create_led_indicator(stopped_frame, "#e74c3c", size=8)
-        self.stopped_led.pack(side=tk.LEFT, padx=(0, 5))
-        
-        self.stopped_count_label = tk.Label(
-            stopped_frame,
-            text="Stopped: 0",
-            font=("Arial", 10),
-            bg="#2c3e50",
-            fg="#e74c3c"
-        )
-        self.stopped_count_label.pack(side=tk.LEFT)
         
         # Control panel
         control_frame = tk.Frame(self.root, bg="#ecf0f1", height=80)
@@ -991,46 +1361,19 @@ class ProxmoxDashboard:
         
         tk.Label(
             search_frame,
-            text="Filter by ID, Name, Type, Status, Node, or IP",
+            text="Filter by ID, Name, Type, Status, Node",
             font=("Arial", 9),
             bg="#ecf0f1",
             fg="#7f8c8d"
         ).pack(side=tk.LEFT, padx=10)
         
-        # Progress bar
-        self.progress_frame = tk.Frame(self.root, bg="#ecf0f1", height=30)
-        self.progress_frame.pack(fill=tk.X)
-        self.progress_frame.pack_propagate(False)
-        
-        self.progress_bar = ttk.Progressbar(
-            self.progress_frame,
-            mode='indeterminate',
-            length=300
-        )
-        self.progress_bar.pack(side=tk.LEFT, padx=10, pady=5)
-        
-        self.progress_label = tk.Label(
-            self.progress_frame,
-            text="",
-            font=("Arial", 9),
-            bg="#ecf0f1",
-            fg="#7f8c8d"
-        )
-        self.progress_label.pack(side=tk.LEFT, padx=5)
-        
-        # Table with horizontal scrollbar
+        # Table with scrollbars
         table_container = tk.Frame(self.root)
         table_container.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
         
-        # Create canvas and scrollbar for horizontal scrolling
-        canvas = tk.Canvas(table_container, bg="#ecf0f1")
-        hsb = ttk.Scrollbar(table_container, orient="horizontal", command=canvas.xview)
+        # Create scrollbars
         vsb = ttk.Scrollbar(table_container, orient="vertical")
-        
-        table_frame = tk.Frame(canvas)
-        
-        # Configure canvas
-        canvas.configure(xscrollcommand=hsb.set)
+        hsb = ttk.Scrollbar(table_container, orient="horizontal")
         
         # Basic columns
         columns = (
@@ -1039,15 +1382,18 @@ class ProxmoxDashboard:
         )
         
         self.tree = ttk.Treeview(
-            table_frame,
+            table_container,
             columns=columns,
             show="tree headings",
             yscrollcommand=vsb.set,
+            xscrollcommand=hsb.set,
             selectmode="browse",
             height=20
         )
         
+        # Connect scrollbars to tree
         vsb.config(command=self.tree.yview)
+        hsb.config(command=self.tree.xview)
         
         self.tree.column("#0", width=0, stretch=tk.NO)
         
@@ -1063,27 +1409,16 @@ class ProxmoxDashboard:
             self.tree.column(col, width=width, anchor="center")
             self.tree.heading(col, text=col, anchor="center")
         
-        self.tree.pack(fill=tk.BOTH, expand=True)
-        
         # Configure colored tags for status highlighting
         self.tree.tag_configure("running", background="#d5f4e6", foreground="#27ae60")
         self.tree.tag_configure("stopped", background="#fadbd8", foreground="#e74c3c")
         self.tree.tag_configure("paused", background="#fef5e7", foreground="#f39c12")
         self.tree.tag_configure("unknown", background="#ecf0f1", foreground="#95a5a6")
         
-        # Pack scrollbars and canvas
-        hsb.pack(side=tk.BOTTOM, fill=tk.X)
+        # Pack scrollbars and tree
         vsb.pack(side=tk.RIGHT, fill=tk.Y)
-        canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
-        
-        # Create window in canvas
-        canvas_window = canvas.create_window((0, 0), window=table_frame, anchor="nw")
-        
-        # Configure scroll region
-        def configure_scroll_region(event):
-            canvas.configure(scrollregion=canvas.bbox("all"))
-        
-        table_frame.bind("<Configure>", configure_scroll_region)
+        hsb.pack(side=tk.BOTTOM, fill=tk.X)
+        self.tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
         
         self.tree.bind("<<TreeviewSelect>>", self.on_select)
         
@@ -1134,7 +1469,22 @@ class ProxmoxDashboard:
                         return True
                 except Exception as e:
                     logger.error(f"Authentication failed: {str(e)}")
-                    messagebox.showerror("Error", f"Failed to decrypt or connect:\n{str(e)}")
+                    error_msg = str(e).lower()
+                    
+                    # Check for certificate hostname mismatch
+                    if 'hostname' in error_msg and 'match' in error_msg:
+                        cert_hostname = extract_hostname_from_certificate(PROXMOX_CA_CERT)
+                        if cert_hostname:
+                            messagebox.showwarning(
+                                "Certificate Hostname Mismatch Detected",
+                                f"SSL certificate is for hostname '{cert_hostname}' but you're connecting to '{creds['host']}'.\n\nA fix guide will open next."
+                            )
+                            hostname_guide = HostnameMismatchDialog(self.root, creds['host'], cert_hostname)
+                            self.root.wait_window(hostname_guide)
+                        else:
+                            messagebox.showerror("Error", f"Failed to decrypt or connect:\n{str(e)}")
+                    else:
+                        messagebox.showerror("Error", f"Failed to decrypt or connect:\n{str(e)}")
         
         # Show token creation guide first
         messagebox.showinfo("Setup Required", "No credentials found.\n\nYou'll need to create an API token in Proxmox first.\n\nThe next screen will show you how.")
@@ -1160,7 +1510,22 @@ class ProxmoxDashboard:
                 return True
             except Exception as e:
                 logger.error(f"Connection setup failed: {str(e)}")
-                messagebox.showerror("Error", f"Connection failed:\n{str(e)}")
+                error_msg = str(e).lower()
+                
+                # Check for certificate hostname mismatch
+                if 'hostname' in error_msg and 'match' in error_msg:
+                    cert_hostname = extract_hostname_from_certificate(PROXMOX_CA_CERT)
+                    if cert_hostname:
+                        messagebox.showwarning(
+                            "Certificate Hostname Mismatch Detected",
+                            f"SSL certificate is for hostname '{cert_hostname}' but you're connecting to '{host}'.\n\nA fix guide will open next."
+                        )
+                        hostname_guide = HostnameMismatchDialog(self.root, host, cert_hostname)
+                        self.root.wait_window(hostname_guide)
+                    else:
+                        messagebox.showerror("Error", f"Connection failed:\n{str(e)}")
+                else:
+                    messagebox.showerror("Error", f"Connection failed:\n{str(e)}")
                 return False
         
         return False
@@ -1196,16 +1561,12 @@ class ProxmoxDashboard:
     def show_loading(self, message="Loading..."):
         """Show loading indicator"""
         self.is_loading = True
-        self.progress_label.config(text=message)
-        self.progress_bar.start()
         self.status_label.config(text=f"[Loading] {message}")
         self.root.config(cursor="watch")
     
     def hide_loading(self):
         """Hide loading indicator"""
         self.is_loading = False
-        self.progress_bar.stop()
-        self.progress_label.config(text="")
         self.root.config(cursor="")
     
     def start_health_check(self):
@@ -1314,16 +1675,16 @@ class ProxmoxDashboard:
             self.status_label.config(text=f"Ready - {len(self.vm_data)} VMs/CTs across {self.node_count} node(s)")
     
     def format_bytes(self, bytes_val):
-        """Format bytes to human readable"""
+        """Format bytes to human readable (binary units: GiB, MiB, etc)"""
         if not bytes_val or bytes_val == 'N/A':
             return 'N/A'
         try:
             bytes_val = float(bytes_val)
-            for unit in ['B', 'KB', 'MB', 'GB', 'TB']:
+            for unit in ['B', 'KiB', 'MiB', 'GiB', 'TiB']:
                 if bytes_val < 1024:
                     return f"{bytes_val:.1f}{unit}"
                 bytes_val /= 1024
-            return f"{bytes_val:.1f}PB"
+            return f"{bytes_val:.1f}PiB"
         except Exception:
             return 'N/A'
     
@@ -1339,8 +1700,39 @@ class ProxmoxDashboard:
             
             # Basic info
             cores = cfg.get('cores', 'N/A')
-            memory_mb = int(cfg.get('memory', 0))
-            memory = self.format_bytes(memory_mb * 1024 * 1024) if memory_mb else 'N/A'
+            
+            # Memory - STATIC CONFIG VALUES ONLY (not real-time)
+            if vm_type == 'VM':
+                # For VMs: Show minmem-maxmem (from balloon configuration)
+                # If balloon is configured, show minmem-maxmem
+                # Otherwise just show memory
+                memory_val = cfg.get('memory', 0)
+                if 'balloon' in cfg:
+                    # Balloon is configured - show range
+                    minmem = int(cfg.get('balloon', memory_val))
+                    maxmem = int(cfg.get('memory', memory_val))
+                    if minmem > 0 and maxmem > 0:
+                        minmem_str = self.format_bytes(minmem * 1024 * 1024)
+                        maxmem_str = self.format_bytes(maxmem * 1024 * 1024)
+                        memory = f"{minmem_str}-{maxmem_str}"
+                    else:
+                        memory = self.format_bytes(memory_val * 1024 * 1024) if memory_val else 'N/A'
+                else:
+                    # No balloon configured - just show memory
+                    memory = self.format_bytes(memory_val * 1024 * 1024) if memory_val else 'N/A'
+            else:  # CT
+                # For CTs: Show memory-swap
+                memory_mb = int(cfg.get('memory', 0))
+                swap_mb = int(cfg.get('swap', 0))
+                if memory_mb > 0:
+                    mem_str = self.format_bytes(memory_mb * 1024 * 1024)
+                    if swap_mb > 0:
+                        swap_str = self.format_bytes(swap_mb * 1024 * 1024)
+                        memory = f"{mem_str}-{swap_str}"
+                    else:
+                        memory = mem_str
+                else:
+                    memory = 'N/A'
             
             # Disk size
             total_disk = 'N/A'
@@ -1351,27 +1743,35 @@ class ProxmoxDashboard:
                         if 'size=' in value:
                             size_str = value.split('size=')[1].split(',')[0].strip()
                             if size_str.endswith('G'):
-                                total_disk = f"{size_str[:-1]}GB"
+                                total_disk = f"{size_str[:-1]}GiB"
                             break
             else:  # CT
                 rootfs = cfg.get('rootfs', '')
                 if 'size=' in str(rootfs):
                     size_str = str(rootfs).split('size=')[1].split(',')[0].strip()
                     if size_str.endswith('G'):
-                        total_disk = f"{size_str[:-1]}GB"
+                        total_disk = f"{size_str[:-1]}GiB"
             
-            # Free disk - only if running
+            # Free disk and Free% - REAL-TIME DISK VALUES (only if running)
             free_disk = 'N/A'
             free_pct = 'N/A'
             if vm['status'] == 'running':
                 try:
                     stat = self.api.get(f'/nodes/{n}/{endpoint}/{vmid}/status/current')
+                    
+                    # Get DISK usage for Free% (NOT memory!)
                     disk_used = stat.get('disk', 0)
                     disk_max = stat.get('maxdisk', 0)
-                    if disk_max > 0:
+                    
+                    if disk_max > 0 and disk_used >= 0:
+                        # Calculate free disk space
                         free_bytes = disk_max - disk_used
-                        free_disk = self.format_bytes(free_bytes)
-                        free_pct = f"{(free_bytes / disk_max * 100):.1f}%"
+                        if free_bytes >= 0:
+                            free_disk = self.format_bytes(free_bytes)
+                            # Calculate FREE DISK percentage (not memory!)
+                            free_pct = f"{(free_bytes / disk_max * 100):.1f}%"
+                        else:
+                            free_pct = 'N/A'
                 except Exception:
                     pass
             
