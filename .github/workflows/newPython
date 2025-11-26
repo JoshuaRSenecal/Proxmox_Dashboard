@@ -1,2001 +1,898 @@
 #!/usr/bin/env python3
 """
-Proxmox Dashboard - Live Data Feed Edition (API Token Authentication Only)
-Near-constant live updates for real-time VM/Container monitoring
-SUPPORTS MULTIPLE PROXMOX NODES
+Proxmox VM/Container Dashboard with API Temperature Monitoring
 
-FEATURES:
-- Live data feed with 3-second default refresh (configurable 2s-30s)
-- Pause/Resume live feed
-- Proxmox host temperature monitoring via VirtIO-FS ONLY
-  * Requires dashboard to run in Proxmox VM with VirtIO-FS configured
-  * <1ms latency direct access to host sensors
-  * Shows "N/A" if VirtIO-FS not configured
-- API Token authentication only (more secure than passwords)
-- Master password protects locally stored credentials
-- All passwords obscured during entry (anti-shoulder surfing)
-- Mandatory SSL/TLS certificate verification for secure connections
-- Graphical status indicators (LED indicators and colored rows)
-
-═══════════════════════════════════════════════════════════════════════
-VIRTIOFS SETUP (REQUIRED - For Proxmox host temperature monitoring)
-═══════════════════════════════════════════════════════════════════════
-
-This dashboard monitors Proxmox HOST temperature via VirtIO-FS.
-The dashboard must run INSIDE a Proxmox VM with VirtIO-FS configured.
-
-PROXMOX HOST SETUP:
--------------------
-1. Install virtiofsd:
-   apt install virtiofsd
-
-2. Edit VM configuration:
-   nano /etc/pve/qemu-server/<VMID>.conf
-   
-   Add this line (adjust memory size and VMID as needed):
-   args: -object memory-backend-memfd,id=mem,size=2G,share=on -numa node,memdev=mem -chardev socket,id=fs0,path=/tmp/vm-<VMID>-vhost-fs.sock -device vhost-user-fs-pci,queue-size=1024,chardev=fs0,tag=hostsensors
-
-3. Start virtiofsd daemon:
-   /usr/lib/qemu/virtiofsd \
-     --socket-path=/tmp/vm-<VMID>-vhost-fs.sock \
-     --shared-dir=/sys/class/hwmon \
-     --cache=none &
-   
-   (Add to systemd or /etc/rc.local for persistence)
-
-4. Restart VM:
-   qm stop <VMID>
-   qm start <VMID>
-
-INSIDE VM SETUP:
-----------------
-1. Create mount point:
-   mkdir -p /mnt/host-sensors
-
-2. Mount VirtIO-FS:
-   mount -t virtiofs hostsensors /mnt/host-sensors
-
-3. Make persistent (add to /etc/fstab):
-   echo "hostsensors /mnt/host-sensors virtiofs defaults 0 0" >> /etc/fstab
-
-4. Verify:
-   ls -la /mnt/host-sensors/
-   cat /mnt/host-sensors/hwmon0/name
-
-DASHBOARD BEHAVIOR:
--------------------
-- If VirtIO-FS mount exists → Show Proxmox host temperature
-- If VirtIO-FS NOT mounted → Show "N/A" (no temperature monitoring)
-- Status indicator shows: "VirtIO-coretemp" when working
-
-Performance: <1ms latency (instant access to host sensors)
-
-═══════════════════════════════════════════════════════════════════════
+Version: 2.2 - SSL Required
+Security: SSL certificate verification is MANDATORY
 """
 
 import tkinter as tk
 from tkinter import ttk, messagebox, simpledialog
 import requests
-from requests.adapters import HTTPAdapter
-from urllib3.poolmanager import PoolManager
 import urllib3
-import ssl
 import json
-import base64
-import os
-import threading
-import time
-import queue
 import logging
-from datetime import datetime, timedelta
+import os
+import sys
+import time
+from datetime import datetime
+from threading import Thread
 from cryptography.fernet import Fernet
-from cryptography.hazmat.primitives import hashes
-from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
-import psutil
 
-# Disable hostname verification warnings (we verify certificate but allow IP addresses)
-urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+# NO WARNING SUPPRESSION - SSL verification is mandatory!
 
 # Configure logging
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
     handlers=[
-        logging.FileHandler(os.path.expanduser('~/.proxmox_dashboard.log'))
+        logging.FileHandler('proxmox_dashboard.log'),
+        logging.StreamHandler()
     ]
 )
-logger = logging.getLogger('ProxmoxDashboard')
+logger = logging.getLogger(__name__)
 
-# Secure log file permissions (owner read/write only)
-LOG_FILE = os.path.expanduser('~/.proxmox_dashboard.log')
-if os.path.exists(LOG_FILE):
-    os.chmod(LOG_FILE, 0o600)
-
-# Configuration
-SALT = b'proxmox_dashboard_salt_v1'
-CREDENTIALS_FILE = os.path.expanduser('~/.proxmox_credentials.enc')
-PROXMOX_CA_CERT = os.path.expanduser('~/proxmox-ca.pem')
-AUDIT_LOG_FILE = os.path.expanduser('~/.proxmox_dashboard_audit.log')
-REFRESH_INTERVAL = 3  # seconds - Live data feed (near-constant updates)
-MAX_RETRIES = 3
-RETRY_DELAY = 2
-
-# SSL Configuration - MANDATORY
-if not os.path.exists(PROXMOX_CA_CERT):
-    error_msg = f"""
-SSL CERTIFICATE REQUIRED
-
-The Proxmox CA certificate is required for secure connections.
-
-Certificate not found at: {PROXMOX_CA_CERT}
-
-To obtain the certificate:
-  1. SSH into your Proxmox server
-  2. Run: scp root@YOUR_PROXMOX_IP:/etc/pve/pve-root-ca.pem {PROXMOX_CA_CERT}
-  
-Or manually copy /etc/pve/pve-root-ca.pem from Proxmox to {PROXMOX_CA_CERT}
-
-SSL verification is MANDATORY for security.
-Dashboard cannot start without the CA certificate.
-"""
-    print(error_msg)
-    logger.error("SSL Certificate not found - cannot start")
-    logger.error(f"Expected location: {PROXMOX_CA_CERT}")
-    exit(1)
-
-logger.info(f"SSL Verification: Enabled (using {PROXMOX_CA_CERT})")
-
-class AuditLogger:
-    """Audit logger for tracking all critical operations"""
-    
-    @staticmethod
-    def log(action, target, result, details=None):
-        try:
-            timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-            log_entry = f"{timestamp} | {action:20} | {target:20} | {result:10}"
-            if details:
-                log_entry += f" | {details}"
-            
-            with open(AUDIT_LOG_FILE, 'a') as f:
-                f.write(log_entry + '\n')
-            
-            # Secure audit log permissions (owner read/write only)
-            if os.path.exists(AUDIT_LOG_FILE):
-                os.chmod(AUDIT_LOG_FILE, 0o600)
-        except Exception as e:
-            logger.error(f"Failed to write audit log: {e}")
-    
-    @staticmethod
-    def log_authentication(host, user, success):
-        result = "SUCCESS" if success else "FAILED"
-        AuditLogger.log("AUTH", f"{user}@{host}", result)
-    
-    @staticmethod
-    def log_vm_action(action, vmid, vm_type, vm_name, success, error=None):
-        result = "SUCCESS" if success else "FAILED"
-        target = f"{vm_type} {vmid} ({vm_name})"
-        details = f"Error: {error}" if error else None
-        AuditLogger.log(action, target, result, details)
-
-class SSLAdapter(HTTPAdapter):
-    """Custom HTTPAdapter that verifies CA cert but allows any hostname (including IPs)"""
-    
-    def init_poolmanager(self, *args, **kwargs):
-        # Create SSL context that verifies certificate but not hostname
-        context = ssl.create_default_context(cafile=PROXMOX_CA_CERT)
-        context.check_hostname = False  # Allow IP addresses
-        context.verify_mode = ssl.CERT_REQUIRED  # Still verify certificate
-        
-        kwargs['ssl_context'] = context
-        return super().init_poolmanager(*args, **kwargs)
 
 class ProxmoxAPI:
-    """Proxmox API Client - API Token Authentication Only"""
+    """
+    Proxmox API client with mandatory SSL verification
+    
+    SSL certificate verification is ALWAYS enabled for security.
+    If you have a self-signed certificate, you must either:
+    1. Install a proper SSL certificate on Proxmox (recommended)
+    2. Add your self-signed certificate to your system's trusted store
+    """
     
     def __init__(self, host, token_id, token_secret):
-        self.base = f"https://{host}:8006/api2/json"
         self.host = host
+        self.base_url = f"https://{host}:8006/api2/json"
+        self.token_id = token_id
+        self.token_secret = token_secret
+        self.headers = {
+            "Authorization": f"PVEAPIToken={token_id}={token_secret}"
+        }
         
-        # SSL verification with CA cert but hostname checking disabled (allows IP addresses)
-        self.verify = PROXMOX_CA_CERT
-        self.ssl_status = "Verified"
-        
-        # Create session with custom SSL adapter
-        self.session = requests.Session()
-        self.session.mount('https://', SSLAdapter())
-        
-        # API Token authentication
-        self.headers = {'Authorization': f'PVEAPIToken={token_id}={token_secret}'}
-        
-        # Test authentication
+        logger.info("SSL certificate verification is ENABLED (mandatory)")
+    
+    def get(self, endpoint):
+        """GET request to Proxmox API with mandatory SSL verification"""
+        url = f"{self.base_url}{endpoint}"
         try:
-            self._api_request('get', '/version')
-            AuditLogger.log_authentication(host, token_id, True)
-            logger.info(f"Successfully authenticated with token: {token_id}")
-        except Exception as e:
-            AuditLogger.log_authentication(host, token_id, False)
-            logger.error(f"API token authentication failed: {str(e)}")
-            raise Exception(f"API token authentication failed: {str(e)}")
+            # verify=True is mandatory - no option to disable
+            response = requests.get(url, headers=self.headers, verify=True, timeout=10)
+            response.raise_for_status()
+            return response.json()['data']
+        except requests.exceptions.SSLError as e:
+            logger.error(f"SSL Certificate verification failed: {e}")
+            raise SSLCertificateError(
+                "SSL certificate verification failed.\n\n"
+                "This usually means your Proxmox server is using a self-signed certificate.\n\n"
+                "To fix this, you have two options:\n"
+                "1. Install a valid SSL certificate on your Proxmox server (recommended)\n"
+                "2. Add your Proxmox self-signed certificate to your system's trusted certificates\n\n"
+                "See the documentation for detailed instructions."
+            )
+        except requests.exceptions.RequestException as e:
+            logger.error(f"API request failed: {e}")
+            raise
     
-    def _api_request(self, method, path, retries=MAX_RETRIES, **kwargs):
-        """Make API request with retry logic - Token authentication only"""
-        for attempt in range(retries):
-            try:
-                if method == 'get':
-                    r = self.session.get(
-                        f"{self.base}{path}",
-                        headers=self.headers,
-                        verify=self.verify,
-                        timeout=10,
-                        **kwargs
-                    )
-                elif method == 'post':
-                    r = self.session.post(
-                        f"{self.base}{path}",
-                        headers=self.headers,
-                        verify=self.verify,
-                        timeout=10,
-                        **kwargs
-                    )
-                
-                if r.status_code in [200, 201]:
-                    return r
-                elif r.status_code >= 500 and attempt < retries - 1:
-                    delay = RETRY_DELAY * (2 ** attempt)
-                    time.sleep(delay)
-                    continue
-                else:
-                    r.raise_for_status()
-                    
-            except requests.ConnectionError:
-                if attempt == retries - 1:
-                    raise Exception(f"Connection failed after {retries} attempts")
-                time.sleep(RETRY_DELAY * (2 ** attempt))
-            except requests.Timeout:
-                if attempt == retries - 1:
-                    raise Exception(f"Request timeout after {retries} attempts")
-                time.sleep(RETRY_DELAY * (2 ** attempt))
-            except Exception as e:
-                if attempt == retries - 1:
-                    raise
-                time.sleep(RETRY_DELAY * (2 ** attempt))
-        
-        raise Exception(f"API request failed after {retries} attempts")
-    
-    def get(self, path):
-        r = self._api_request('get', path)
+    def post(self, endpoint, data=None):
+        """POST request to Proxmox API with mandatory SSL verification"""
+        url = f"{self.base_url}{endpoint}"
         try:
-            response_data = r.json()
-            if 'data' in response_data:
-                return response_data['data']
-            else:
-                return response_data
-        except (ValueError, KeyError, TypeError) as e:
-            raise Exception(f"Invalid API response from {path}: {str(e)}")
-    
-    def post(self, path, data=None):
-        kwargs = {'data': data} if data else {}
-        return self._api_request('post', path, **kwargs)
+            # verify=True is mandatory - no option to disable
+            response = requests.post(url, headers=self.headers, data=data, verify=True, timeout=10)
+            response.raise_for_status()
+            return response.json()['data']
+        except requests.exceptions.SSLError as e:
+            logger.error(f"SSL Certificate verification failed: {e}")
+            raise SSLCertificateError(
+                "SSL certificate verification failed.\n\n"
+                "This usually means your Proxmox server is using a self-signed certificate.\n\n"
+                "To fix this, you have two options:\n"
+                "1. Install a valid SSL certificate on your Proxmox server (recommended)\n"
+                "2. Add your Proxmox self-signed certificate to your system's trusted certificates\n\n"
+                "See the documentation for detailed instructions."
+            )
+        except requests.exceptions.RequestException as e:
+            logger.error(f"API request failed: {e}")
+            raise
+
+
+class SSLCertificateError(Exception):
+    """Custom exception for SSL certificate errors with helpful message"""
+    pass
+
 
 class CredentialManager:
-    """Manages encrypted credential storage - supports both passwords and API tokens"""
+    """Secure credential storage using encryption"""
     
-    @staticmethod
-    def get_key_from_password(password):
-        kdf = PBKDF2HMAC(
-            algorithm=hashes.SHA256(),
-            length=32,
-            salt=SALT,
-            iterations=100000,
-        )
-        return base64.urlsafe_b64encode(kdf.derive(password.encode()))
+    def __init__(self, cred_file='proxmox_creds.enc'):
+        self.cred_file = cred_file
+        self.key_file = '.proxmox_key'
+        self.key = self._load_or_create_key()
+        self.cipher = Fernet(self.key)
     
-    @staticmethod
-    def save_credentials(host, master_password, token_id, token_secret):
-        """Save API token credentials (token authentication only)"""
-        try:
-            credentials = {
-                'host': host,
-                'auth_type': 'token',
-                'token_id': token_id,
-                'token_secret': token_secret
-            }
-            
-            key = CredentialManager.get_key_from_password(master_password)
-            cipher = Fernet(key)
-            encrypted_data = cipher.encrypt(json.dumps(credentials).encode())
-            
-            with open(CREDENTIALS_FILE, 'wb') as f:
-                f.write(encrypted_data)
-            os.chmod(CREDENTIALS_FILE, 0o600)
-        except IOError as e:
-            raise Exception(f"Failed to save credentials file: {str(e)}")
-        except Exception as e:
-            raise Exception(f"Failed to encrypt credentials: {str(e)}")
+    def _load_or_create_key(self):
+        """Load existing key or create new one"""
+        if os.path.exists(self.key_file):
+            with open(self.key_file, 'rb') as f:
+                return f.read()
+        else:
+            key = Fernet.generate_key()
+            with open(self.key_file, 'wb') as f:
+                f.write(key)
+            os.chmod(self.key_file, 0o600)
+            return key
     
-    @staticmethod
-    def load_credentials(master_password):
-        if not os.path.exists(CREDENTIALS_FILE):
+    def save_credentials(self, host, token_id, token_secret):
+        """Save encrypted credentials (SSL always enabled)"""
+        creds = {
+            'host': host,
+            'token_id': token_id,
+            'token_secret': token_secret
+        }
+        encrypted = self.cipher.encrypt(json.dumps(creds).encode())
+        with open(self.cred_file, 'wb') as f:
+            f.write(encrypted)
+        os.chmod(self.cred_file, 0o600)
+    
+    def load_credentials(self):
+        """Load and decrypt credentials"""
+        if not os.path.exists(self.cred_file):
             return None
         
         try:
-            with open(CREDENTIALS_FILE, 'rb') as f:
-                encrypted_data = f.read()
-            
-            key = CredentialManager.get_key_from_password(master_password)
-            cipher = Fernet(key)
-            decrypted_data = cipher.decrypt(encrypted_data)
-            return json.loads(decrypted_data.decode())
-        except IOError as e:
-            raise Exception(f"Failed to read credentials file: {str(e)}")
+            with open(self.cred_file, 'rb') as f:
+                encrypted = f.read()
+            decrypted = self.cipher.decrypt(encrypted)
+            return json.loads(decrypted.decode())
         except Exception as e:
-            # Most likely wrong password or corrupted file
-            raise Exception("Invalid master password or corrupted credentials file")
+            logger.error(f"Failed to load credentials: {e}")
+            return None
+    
+    def credentials_exist(self):
+        """Check if credentials file exists"""
+        return os.path.exists(self.cred_file)
 
-def extract_hostname_from_certificate(cert_path):
-    """Extract Common Name from SSL certificate"""
-    try:
-        import subprocess
-        result = subprocess.run(
-            ['openssl', 'x509', '-in', cert_path, '-noout', '-subject'],
-            capture_output=True,
-            text=True,
-            timeout=5
-        )
-        if result.returncode == 0:
-            # Parse subject line: "subject=CN = pve"
-            for part in result.stdout.split(','):
-                if 'CN' in part or 'CN=' in part:
-                    hostname = part.split('=')[-1].strip()
-                    return hostname
-    except Exception as e:
-        logger.error(f"Failed to extract hostname from certificate: {e}")
-    return None
-
-class HostnameMismatchDialog(tk.Toplevel):
-    """Dialog to help user fix certificate hostname mismatch"""
-    
-    def __init__(self, parent, ip_address, certificate_hostname):
-        super().__init__(parent)
-        self.title("Certificate Hostname Mismatch - Fix Required")
-        self.geometry("750x700")
-        self.resizable(True, True)
-        
-        self.ip_address = ip_address
-        self.cert_hostname = certificate_hostname
-        
-        self.update_idletasks()
-        x = (self.winfo_screenwidth() // 2) - 375
-        y = (self.winfo_screenheight() // 2) - 350
-        self.geometry(f"750x700+{x}+{y}")
-        
-        self.create_widgets()
-        self.protocol("WM_DELETE_WINDOW", self.on_close)
-        self.grab_set()
-    
-    def create_widgets(self):
-        # Title
-        title_frame = tk.Frame(self, bg="#e74c3c", height=70)
-        title_frame.pack(fill=tk.X)
-        title_frame.pack_propagate(False)
-        
-        title_label = tk.Label(
-            title_frame,
-            text="⚠ Certificate Hostname Mismatch",
-            font=("Arial", 16, "bold"),
-            bg="#e74c3c",
-            fg="white"
-        )
-        title_label.pack(pady=20)
-        
-        # Main content with scrollbar
-        main_frame = tk.Frame(self, bg="white")
-        main_frame.pack(fill=tk.BOTH, expand=True, padx=20, pady=20)
-        
-        # Create canvas and scrollbar
-        canvas = tk.Canvas(main_frame, bg="white", highlightthickness=0)
-        scrollbar = tk.Scrollbar(main_frame, orient="vertical", command=canvas.yview)
-        scrollable_frame = tk.Frame(canvas, bg="white")
-        
-        scrollable_frame.bind(
-            "<Configure>",
-            lambda e: canvas.configure(scrollregion=canvas.bbox("all"))
-        )
-        
-        canvas.create_window((0, 0), window=scrollable_frame, anchor="nw")
-        canvas.configure(yscrollcommand=scrollbar.set)
-        
-        # Problem explanation
-        tk.Label(
-            scrollable_frame,
-            text="The Problem:",
-            font=("Arial", 12, "bold"),
-            bg="white",
-            fg="#2c3e50",
-            anchor="w"
-        ).pack(anchor="w", pady=(0, 5))
-        
-        problem_text = f"""Your Proxmox SSL certificate is issued for the hostname '{self.cert_hostname}', but you're trying to connect using the IP address '{self.ip_address}'.
-
-SSL validation requires the connection address to match the certificate hostname."""
-        
-        tk.Label(
-            scrollable_frame,
-            text=problem_text,
-            font=("Arial", 10),
-            bg="white",
-            fg="#34495e",
-            justify=tk.LEFT,
-            wraplength=680,
-            anchor="w"
-        ).pack(anchor="w", pady=(0, 15))
-        
-        # Solution
-        tk.Label(
-            scrollable_frame,
-            text="The Solution:",
-            font=("Arial", 12, "bold"),
-            bg="white",
-            fg="#27ae60",
-            anchor="w"
-        ).pack(anchor="w", pady=(0, 5))
-        
-        solution_text = f"Use the hostname '{self.cert_hostname}' instead of the IP address '{self.ip_address}' when connecting."
-        
-        tk.Label(
-            scrollable_frame,
-            text=solution_text,
-            font=("Arial", 10),
-            bg="white",
-            fg="#34495e",
-            justify=tk.LEFT,
-            wraplength=680,
-            anchor="w"
-        ).pack(anchor="w", pady=(0, 15))
-        
-        # Step-by-step fix
-        tk.Label(
-            scrollable_frame,
-            text="How to Fix:",
-            font=("Arial", 12, "bold"),
-            bg="white",
-            fg="#2c3e50",
-            anchor="w"
-        ).pack(anchor="w", pady=(0, 10))
-        
-        # Step 1
-        step1_frame = tk.Frame(scrollable_frame, bg="#ecf0f1", relief=tk.SOLID, borderwidth=1)
-        step1_frame.pack(fill=tk.X, pady=5)
-        
-        tk.Label(
-            step1_frame,
-            text="Step 1: Add hostname to your hosts file",
-            font=("Arial", 10, "bold"),
-            bg="#ecf0f1",
-            fg="#2c3e50",
-            anchor="w"
-        ).pack(anchor="w", padx=10, pady=(10, 5))
-        
-        tk.Label(
-            step1_frame,
-            text="Open a terminal and run this command:",
-            font=("Arial", 9),
-            bg="#ecf0f1",
-            fg="#7f8c8d",
-            anchor="w"
-        ).pack(anchor="w", padx=10, pady=(0, 5))
-        
-        # Command box
-        cmd_frame = tk.Frame(step1_frame, bg="#2c3e50")
-        cmd_frame.pack(fill=tk.X, padx=10, pady=(0, 10))
-        
-        hosts_command = f"echo '{self.ip_address}    {self.cert_hostname}' | sudo tee -a /etc/hosts"
-        
-        cmd_text = tk.Text(
-            cmd_frame,
-            height=2,
-            font=("Courier", 9),
-            bg="#2c3e50",
-            fg="#2ecc71",
-            wrap=tk.WORD,
-            relief=tk.FLAT
-        )
-        cmd_text.pack(fill=tk.X, padx=5, pady=5)
-        cmd_text.insert("1.0", hosts_command)
-        cmd_text.config(state=tk.DISABLED)
-        
-        # Copy button
-        copy_btn = tk.Button(
-            step1_frame,
-            text="Copy Command to Clipboard",
-            command=lambda: self.copy_to_clipboard(hosts_command),
-            bg="#3498db",
-            fg="white",
-            font=("Arial", 9, "bold"),
-            cursor="hand2"
-        )
-        copy_btn.pack(pady=(0, 10))
-        
-        # Step 2
-        step2_frame = tk.Frame(scrollable_frame, bg="#ecf0f1", relief=tk.SOLID, borderwidth=1)
-        step2_frame.pack(fill=tk.X, pady=5)
-        
-        tk.Label(
-            step2_frame,
-            text="Step 2: Test the hostname works",
-            font=("Arial", 10, "bold"),
-            bg="#ecf0f1",
-            fg="#2c3e50",
-            anchor="w"
-        ).pack(anchor="w", padx=10, pady=(10, 5))
-        
-        tk.Label(
-            step2_frame,
-            text="Run this command to verify:",
-            font=("Arial", 9),
-            bg="#ecf0f1",
-            fg="#7f8c8d",
-            anchor="w"
-        ).pack(anchor="w", padx=10, pady=(0, 5))
-        
-        test_cmd_frame = tk.Frame(step2_frame, bg="#2c3e50")
-        test_cmd_frame.pack(fill=tk.X, padx=10, pady=(0, 10))
-        
-        test_command = f"ping -c 3 {self.cert_hostname}"
-        
-        test_cmd_text = tk.Text(
-            test_cmd_frame,
-            height=1,
-            font=("Courier", 9),
-            bg="#2c3e50",
-            fg="#2ecc71",
-            wrap=tk.NONE,
-            relief=tk.FLAT
-        )
-        test_cmd_text.pack(fill=tk.X, padx=5, pady=5)
-        test_cmd_text.insert("1.0", test_command)
-        test_cmd_text.config(state=tk.DISABLED)
-        
-        # Step 3
-        step3_frame = tk.Frame(scrollable_frame, bg="#ecf0f1", relief=tk.SOLID, borderwidth=1)
-        step3_frame.pack(fill=tk.X, pady=5)
-        
-        tk.Label(
-            step3_frame,
-            text="Step 3: Reconnect using hostname",
-            font=("Arial", 10, "bold"),
-            bg="#ecf0f1",
-            fg="#2c3e50",
-            anchor="w"
-        ).pack(anchor="w", padx=10, pady=(10, 5))
-        
-        reconnect_text = f"""After adding the hostname to /etc/hosts:
-
-1. Click 'Close' below to return to the dashboard
-2. Delete your saved credentials (if any)
-3. Click 'Change Credentials' in the dashboard
-4. Enter hostname: {self.cert_hostname}
-5. Re-enter your token credentials
-
-The connection should now work!"""
-        
-        tk.Label(
-            step3_frame,
-            text=reconnect_text,
-            font=("Arial", 9),
-            bg="#ecf0f1",
-            fg="#34495e",
-            justify=tk.LEFT,
-            anchor="w"
-        ).pack(anchor="w", padx=10, pady=(0, 10))
-        
-        # Alternative solution
-        tk.Label(
-            scrollable_frame,
-            text="\nAlternative: If you can't modify /etc/hosts",
-            font=("Arial", 10, "bold"),
-            bg="white",
-            fg="#e67e22",
-            anchor="w"
-        ).pack(anchor="w", pady=(10, 5))
-        
-        alt_text = """You can regenerate the Proxmox certificate to include your IP address, but this is more complex. Using the hostname (above solution) is easier and recommended."""
-        
-        tk.Label(
-            scrollable_frame,
-            text=alt_text,
-            font=("Arial", 9),
-            bg="white",
-            fg="#7f8c8d",
-            justify=tk.LEFT,
-            wraplength=680,
-            anchor="w"
-        ).pack(anchor="w", pady=(0, 10))
-        
-        canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
-        scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
-        
-        # Button frame
-        btn_frame = tk.Frame(self, bg="white")
-        btn_frame.pack(fill=tk.X, padx=20, pady=20)
-        
-        tk.Button(
-            btn_frame,
-            text="I've Fixed It - Close",
-            command=self.on_close,
-            bg="#27ae60",
-            fg="white",
-            font=("Arial", 12, "bold"),
-            width=30,
-            height=2,
-            cursor="hand2"
-        ).pack(pady=5)
-        
-        tk.Button(
-            btn_frame,
-            text="Delete Credentials & Exit",
-            command=self.delete_and_exit,
-            bg="#95a5a6",
-            fg="white",
-            font=("Arial", 10),
-            width=30,
-            cursor="hand2"
-        ).pack(pady=5)
-    
-    def copy_to_clipboard(self, text):
-        """Copy text to clipboard"""
-        self.clipboard_clear()
-        self.clipboard_append(text)
-        messagebox.showinfo("Copied", "Command copied to clipboard!\n\nPaste it in your terminal and press Enter.")
-    
-    def delete_and_exit(self):
-        """Delete credentials file and exit"""
-        cred_file = os.path.expanduser("~/.proxmox_credentials.enc")
-        if os.path.exists(cred_file):
-            os.remove(cred_file)
-            messagebox.showinfo("Deleted", "Credentials deleted.\n\nRestart the dashboard after fixing the hostname issue.")
-        self.destroy()
-        import sys
-        sys.exit(0)
-    
-    def on_close(self):
-        self.destroy()
-
-class TokenCreationGuide(tk.Toplevel):
-    """Guide dialog for creating API tokens in Proxmox"""
-    
-    def __init__(self, parent):
-        super().__init__(parent)
-        self.title("Create Proxmox API Token")
-        self.geometry("700x650")
-        self.resizable(True, True)
-        
-        self.update_idletasks()
-        x = (self.winfo_screenwidth() // 2) - 350
-        y = (self.winfo_screenheight() // 2) - 325
-        self.geometry(f"700x650+{x}+{y}")
-        
-        self.create_widgets()
-        self.protocol("WM_DELETE_WINDOW", self.on_close)
-        self.grab_set()
-    
-    def create_widgets(self):
-        # Title
-        title_frame = tk.Frame(self, bg="#3498db", height=60)
-        title_frame.pack(fill=tk.X)
-        title_frame.pack_propagate(False)
-        
-        title_label = tk.Label(
-            title_frame,
-            text="Step 1: Create API Token in Proxmox",
-            font=("Arial", 16, "bold"),
-            bg="#3498db",
-            fg="white"
-        )
-        title_label.pack(pady=15)
-        
-        # Main content with scrollbar
-        main_frame = tk.Frame(self, bg="white")
-        main_frame.pack(fill=tk.BOTH, expand=True, padx=20, pady=20)
-        
-        # Create canvas and scrollbar
-        canvas = tk.Canvas(main_frame, bg="white", highlightthickness=0)
-        scrollbar = tk.Scrollbar(main_frame, orient="vertical", command=canvas.yview)
-        scrollable_frame = tk.Frame(canvas, bg="white")
-        
-        scrollable_frame.bind(
-            "<Configure>",
-            lambda e: canvas.configure(scrollregion=canvas.bbox("all"))
-        )
-        
-        canvas.create_window((0, 0), window=scrollable_frame, anchor="nw")
-        canvas.configure(yscrollcommand=scrollbar.set)
-        
-        # Instructions content
-        instructions = [
-            ("What is an API Token?", "bold", "#2c3e50"),
-            ("An API token is a secure way to connect to Proxmox without using your password.\n", "normal", "#34495e"),
-            
-            ("How to Create Token:", "bold", "#2c3e50"),
-            ("1. Open Proxmox web interface", "bold", "#27ae60"),
-            ("   Go to: https://YOUR_PROXMOX_IP:8006\n", "normal", "#7f8c8d"),
-            
-            ("2. Navigate to API Tokens", "bold", "#27ae60"),
-            ("   Click: Datacenter → Permissions → API Tokens\n", "normal", "#7f8c8d"),
-            
-            ("3. Click 'Add' button", "bold", "#27ae60"),
-            ("   (Top of the API Tokens page)\n", "normal", "#7f8c8d"),
-            
-            ("4. Fill in the form:", "bold", "#27ae60"),
-            ("   • User: root@pam", "normal", "#7f8c8d"),
-            ("   • Token ID: dashboard (or any name you want)", "normal", "#7f8c8d"),
-            ("   • Privilege Separation: UNCHECK THIS BOX ☐", "normal", "#e74c3c"),
-            ("   • Expire: Never", "normal", "#7f8c8d"),
-            ("   • Comment: Dashboard access (optional)\n", "normal", "#7f8c8d"),
-            
-            ("5. Click 'Add' button", "bold", "#27ae60"),
-            ("   The token will be created.\n", "normal", "#7f8c8d"),
-            
-            ("6. COPY THE SECRET!", "bold", "#e74c3c"),
-            ("   A popup or message will show the token secret.", "normal", "#e74c3c"),
-            ("   COPY IT IMMEDIATELY - it's shown only once!\n", "normal", "#e74c3c"),
-            
-            ("Alternative: Command Line (Recommended)", "bold", "#2c3e50"),
-            ("If you have SSH access, this is more reliable:\n", "normal", "#34495e"),
-            
-            ("ssh root@YOUR_PROXMOX_IP", "normal", "#16a085"),
-            ("pveum user token add root@pam dashboard --privsep 0\n", "normal", "#16a085"),
-            
-            ("The secret will appear in the output immediately.\n", "normal", "#7f8c8d"),
-            
-            ("What You'll Need for Next Step:", "bold", "#2c3e50"),
-            ("• Token ID: root@pam!dashboard", "normal", "#34495e"),
-            ("• Token Secret: (the long string you copied)\n", "normal", "#34495e"),
-        ]
-        
-        for text, weight, color in instructions:
-            label = tk.Label(
-                scrollable_frame,
-                text=text,
-                font=("Arial", 10, weight),
-                bg="white",
-                fg=color,
-                justify=tk.LEFT,
-                wraplength=620,
-                anchor="w"
-            )
-            label.pack(anchor="w", pady=2)
-        
-        canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
-        scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
-        
-        # Button frame
-        btn_frame = tk.Frame(self, bg="white")
-        btn_frame.pack(fill=tk.X, padx=20, pady=20)
-        
-        tk.Button(
-            btn_frame,
-            text="I've Created the Token - Continue",
-            command=self.on_continue,
-            bg="#27ae60",
-            fg="white",
-            font=("Arial", 12, "bold"),
-            width=30,
-            height=2,
-            cursor="hand2"
-        ).pack(pady=5)
-        
-        tk.Button(
-            btn_frame,
-            text="Cancel",
-            command=self.on_close,
-            bg="#95a5a6",
-            fg="white",
-            font=("Arial", 10),
-            width=30,
-            cursor="hand2"
-        ).pack(pady=5)
-    
-    def on_continue(self):
-        self.destroy()
-    
-    def on_close(self):
-        self.destroy()
-
-class CredentialsDialog(tk.Toplevel):
-    """Dialog for entering API token credentials - Token Authentication Only"""
-    
-    def __init__(self, parent, is_setup=False):
-        super().__init__(parent)
-        self.title("Setup Credentials" if is_setup else "Enter Credentials")
-        self.geometry("500x470")
-        self.resizable(True, True)
-        self.result = None
-        self.is_setup = is_setup
-        
-        self.update_idletasks()
-        x = (self.winfo_screenwidth() // 2) - 250
-        y = (self.winfo_screenheight() // 2) - 235
-        self.geometry(f"500x470+{x}+{y}")
-        
-        self.create_widgets()
-        self.protocol("WM_DELETE_WINDOW", self.on_cancel)
-        self.grab_set()
-    
-    def create_widgets(self):
-        # Title
-        title_frame = tk.Frame(self, bg="#2c3e50", height=60)
-        title_frame.pack(fill=tk.X)
-        title_frame.pack_propagate(False)
-        
-        title_label = tk.Label(
-            title_frame,
-            text="Proxmox Dashboard Setup" if self.is_setup else "Unlock Dashboard",
-            font=("Arial", 16, "bold"),
-            bg="#2c3e50",
-            fg="white"
-        )
-        title_label.pack(pady=15)
-        
-        # Form frame
-        form_frame = tk.Frame(self, bg="white")
-        form_frame.pack(fill=tk.BOTH, expand=True, padx=20, pady=20)
-        
-        # Host
-        tk.Label(form_frame, text="Proxmox Host:", font=("Arial", 10), bg="white").grid(row=0, column=0, sticky="w", pady=5)
-        self.host_entry = tk.Entry(form_frame, font=("Arial", 10), width=35)
-        self.host_entry.grid(row=0, column=1, pady=5, columnspan=2)
-        self.host_entry.insert(0, "192.168.1.100")
-        
-        # Auth type label
-        tk.Label(form_frame, text="Authentication: API Token", font=("Arial", 10, "bold"), bg="white", fg="#27ae60").grid(row=1, column=0, sticky="w", pady=10, columnspan=3)
-        
-        # Token fields
-        tk.Label(form_frame, text="Token ID:", font=("Arial", 10), bg="white").grid(row=2, column=0, sticky="w", pady=5)
-        self.token_id_entry = tk.Entry(form_frame, font=("Arial", 10), width=35)
-        self.token_id_entry.grid(row=2, column=1, pady=5, columnspan=2)
-        self.token_id_entry.insert(0, "root@pam!")
-        
-        tk.Label(form_frame, text="Token Secret:", font=("Arial", 10), bg="white").grid(row=3, column=0, sticky="w", pady=5)
-        self.token_secret_entry = tk.Entry(form_frame, font=("Arial", 10), width=35, show="*")
-        self.token_secret_entry.grid(row=3, column=1, pady=5, columnspan=2)
-        
-        tk.Label(
-            form_frame,
-            text="Create token: Datacenter → Permissions → API Tokens → Add",
-            font=("Arial", 8),
-            bg="white",
-            fg="#7f8c8d"
-        ).grid(row=4, column=0, columnspan=3, sticky="w", pady=2)
-        
-        # Master password
-        tk.Label(form_frame, text="Master Password:", font=("Arial", 10, "bold"), bg="white").grid(row=5, column=0, sticky="w", pady=(15, 5))
-        self.master_entry = tk.Entry(form_frame, font=("Arial", 10), width=35, show="*")
-        self.master_entry.grid(row=5, column=1, pady=(15, 5), columnspan=2)
-        
-        tk.Label(
-            form_frame,
-            text="(Used to encrypt credentials locally)",
-            font=("Arial", 8),
-            bg="white",
-            fg="#7f8c8d"
-        ).grid(row=6, column=1, sticky="w", columnspan=2)
-        
-        if self.is_setup:
-            tk.Label(form_frame, text="Confirm Master:", font=("Arial", 10), bg="white").grid(row=7, column=0, sticky="w", pady=5)
-            self.master_confirm = tk.Entry(form_frame, font=("Arial", 10), width=35, show="*")
-            self.master_confirm.grid(row=7, column=1, pady=5, columnspan=2)
-        
-        # Buttons
-        btn_frame = tk.Frame(form_frame, bg="white")
-        btn_frame.grid(row=8, column=0, columnspan=3, pady=15)
-        
-        tk.Button(
-            btn_frame,
-            text="Save & Connect" if self.is_setup else "Connect",
-            command=self.on_ok,
-            bg="#27ae60",
-            fg="white",
-            font=("Arial", 10, "bold"),
-            width=15,
-            cursor="hand2"
-        ).pack(side=tk.LEFT, padx=5)
-        
-        tk.Button(
-            btn_frame,
-            text="Cancel",
-            command=self.on_cancel,
-            bg="#95a5a6",
-            fg="white",
-            font=("Arial", 10),
-            width=15,
-            cursor="hand2"
-        ).pack(side=tk.LEFT, padx=5)
-    
-    def on_ok(self):
-        host = self.host_entry.get().strip()
-        master = self.master_entry.get()
-        
-        if not host or not master:
-            messagebox.showerror("Error", "Host and master password are required!")
-            return
-        
-        if self.is_setup:
-            confirm = self.master_confirm.get()
-            if master != confirm:
-                messagebox.showerror("Error", "Master passwords don't match!")
-                return
-        
-        token_id = self.token_id_entry.get().strip()
-        token_secret = self.token_secret_entry.get()
-        
-        if not token_id or not token_secret:
-            messagebox.showerror("Error", "Token ID and Token Secret are required!")
-            return
-        
-        # Always return token authentication
-        self.result = ('token', host, None, None, token_id, token_secret, master)
-        
-        self.destroy()
-    
-    def on_cancel(self):
-        self.result = None
-        self.destroy()
 
 class ProxmoxDashboard:
-    """Main Dashboard Application - Enhanced with Full Metrics"""
+    """Main dashboard application with mandatory SSL and API temperature monitoring"""
     
     def __init__(self, root):
         self.root = root
-        self.root.title("Proxmox Dashboard - Live Feed")
-        self.root.geometry("1600x900")
-        self.root.resizable(True, True)
-        
-        self.root.update_idletasks()
-        x = (self.root.winfo_screenwidth() // 2) - 800
-        y = (self.root.winfo_screenheight() // 2) - 450
-        self.root.geometry(f"1600x900+{x}+{y}")
+        self.root.title("Proxmox VM/Container Dashboard")
+        self.root.geometry("1400x800")
+        self.root.configure(bg="#2c3e50")
         
         self.api = None
-        self.auto_refresh = True
-        self.refresh_thread = None
-        self.health_check_thread = None
         self.vm_data = []
-        self.filtered_vm_data = []
-        self.search_query = ""
-        self.is_loading = False
-        self.task_queue = queue.Queue()
-        self.connection_healthy = False
+        self.filtered_data = []
+        self.refresh_job = None
+        self.is_refreshing = False
         self.node_count = 0
         
-        self.setup_styles()
-        self.create_widgets()
+        # Credential manager
+        self.cred_manager = CredentialManager()
         
-        # Add cleanup handler for window close
-        self.root.protocol("WM_DELETE_WINDOW", self.on_closing)
+        # Configuration
+        self.refresh_rate_var = tk.IntVar(value=3)
+        self.auto_refresh_var = tk.BooleanVar(value=True)
         
-        if not self.authenticate():
-            self.root.destroy()
-            return
+        # Node temperature storage
+        self.node_temp_labels = {}
         
-        self.start_auto_refresh()
-        self.start_health_check()
-        self.start_task_processor()
+        # Setup UI
+        self.setup_ui()
+        
+        # Try to load saved credentials
+        self.try_auto_login()
     
-    def setup_styles(self):
-        style = ttk.Style()
-        style.theme_use('clam')
+    def setup_ui(self):
+        """Create the user interface"""
+        # Top control panel
+        self.create_control_panel()
         
-        style.configure("Treeview",
-                       background="#ecf0f1",
-                       foreground="black",
-                       rowheight=30,
-                       fieldbackground="#ecf0f1",
-                       font=("Arial", 9))
-        style.map('Treeview', background=[('selected', '#3498db')])
+        # Status bar
+        self.create_status_bar()
         
-        style.configure("Treeview.Heading",
-                       background="#34495e",
-                       foreground="white",
-                       font=("Arial", 9, "bold"))
+        # Main content area
+        self.create_main_content()
+        
+        # Audit log
+        self.create_audit_log()
     
-    def create_led_indicator(self, parent, color="green", size=12):
-        """Create a simple LED indicator using Canvas"""
-        canvas = tk.Canvas(
-            parent,
-            width=size,
-            height=size,
-            bg="#2c3e50",
-            highlightthickness=0
-        )
-        padding = 2
-        canvas.led = canvas.create_oval(
-            padding, padding,
-            size - padding, size - padding,
-            fill=color,
-            outline=color
-        )
-        return canvas
-    
-    def update_led_color(self, canvas, color):
-        """Update LED indicator color"""
-        canvas.itemconfig(canvas.led, fill=color, outline=color)
-    
-    def create_status_badge(self, parent, text, status):
-        """Create a colored status badge"""
-        colors = {
-            "running": {"bg": "#27ae60", "fg": "white"},
-            "stopped": {"bg": "#e74c3c", "fg": "white"},
-            "paused": {"bg": "#f39c12", "fg": "white"},
-            "unknown": {"bg": "#95a5a6", "fg": "white"}
-        }
-        
-        style = colors.get(status.lower(), colors["unknown"])
-        
-        label = tk.Label(
-            parent,
-            text=text.upper(),
-            bg=style["bg"],
-            fg=style["fg"],
-            font=("Arial", 8, "bold"),
-            padx=8,
-            pady=3,
-            relief=tk.FLAT
-        )
-        return label
-    
-    def get_host_temperature(self):
-        """Get Proxmox host temperature via VirtIO-FS ONLY"""
-        try:
-            # VirtIO-FS - Direct access to Proxmox host sensors
-            # Dashboard must run in Proxmox VM with VirtIO-FS configured
-            
-            virtiofs_paths = [
-                '/mnt/host-sensors',      # Standard mount point
-                '/mnt/proxmox-sensors',   # Alternative mount point
-                '/host/sensors',          # Alternative mount point
-            ]
-            
-            for virtiofs_base in virtiofs_paths:
-                if os.path.exists(virtiofs_base):
-                    logger.debug(f"VirtIO-FS mount found at {virtiofs_base}")
-                    
-                    # Priority sensors to look for
-                    priority_sensors = ['coretemp', 'k10temp', 'zenpower', 'cpu_thermal']
-                    
-                    # Scan hwmon directories in VirtIO-FS mount
-                    for i in range(10):  # Check hwmon0 through hwmon9
-                        hwmon_dir = os.path.join(virtiofs_base, f'hwmon{i}')
-                        name_file = os.path.join(hwmon_dir, 'name')
-                        
-                        if os.path.exists(name_file):
-                            try:
-                                with open(name_file, 'r') as f:
-                                    sensor_name = f.read().strip()
-                                
-                                logger.debug(f"VirtIO-FS found sensor: {sensor_name}")
-                                
-                                # Check if this is a priority CPU sensor
-                                if sensor_name in priority_sensors:
-                                    # Try temp1_input, temp2_input, etc.
-                                    for temp_num in range(1, 10):
-                                        temp_file = os.path.join(hwmon_dir, f'temp{temp_num}_input')
-                                        if os.path.exists(temp_file):
-                                            try:
-                                                with open(temp_file, 'r') as f:
-                                                    temp_raw = int(f.read().strip())
-                                                    temp = temp_raw / 1000.0
-                                                    
-                                                    # Sanity check
-                                                    if 0 < temp < 150:
-                                                        logger.info(f"Temperature detected via VirtIO-FS ({sensor_name}): {temp:.1f}°C")
-                                                        return round(temp, 1), f"VirtIO-{sensor_name}"
-                                            except (ValueError, IOError, PermissionError) as e:
-                                                logger.debug(f"Could not read {temp_file}: {e}")
-                                                continue
-                            except (IOError, PermissionError) as e:
-                                logger.debug(f"Could not read {name_file}: {e}")
-                                continue
-                    
-                    # VirtIO-FS mount exists but no valid sensors found
-                    logger.debug(f"VirtIO-FS mount at {virtiofs_base} exists but no CPU sensors found")
-            
-            # VirtIO-FS not available
-            logger.info("VirtIO-FS not configured - temperature monitoring unavailable")
-            logger.info("To enable: Dashboard must run in Proxmox VM with VirtIO-FS mount configured")
-            return None, "VirtIO-FS not configured"
-            
-        except Exception as e:
-            logger.error(f"Temperature read error: {e}")
-            return None, "Error"
-    
-    def format_temperature(self, temp, zone):
-        """Format temperature for display"""
-        if temp is None:
-            return "N/A"
-        
-        # Color based on temperature
-        if temp < 50:
-            return f"{temp}°C"
-        elif temp < 70:
-            return f"{temp}°C"
-        elif temp < 85:
-            return f"{temp}°C"
-        else:
-            return f"{temp}°C"
-    
-    def get_temp_color(self, temp):
-        """Get color for temperature"""
-        if temp is None:
-            return "#95a5a6"  # Gray for N/A
-        elif temp < 50:
-            return "#27ae60"  # Green - Cool
-        elif temp < 70:
-            return "#3498db"  # Blue - Normal
-        elif temp < 85:
-            return "#f39c12"  # Orange - Warm
-        else:
-            return "#e74c3c"  # Red - Hot
-    
-    def create_widgets(self):
-        # Top bar
-        top_frame = tk.Frame(self.root, bg="#2c3e50", height=140)
-        top_frame.pack(fill=tk.X)
-        top_frame.pack_propagate(False)
-        
-        # Left section: Title
-        title_label = tk.Label(
-            top_frame,
-            text="Proxmox VM/Container Dashboard",
-            font=("Arial", 18, "bold"),
-            bg="#2c3e50",
-            fg="white"
-        )
-        title_label.pack(side=tk.LEFT, padx=20, pady=50)
-        
-        # Right section: Status indicators (pack first to anchor right side)
-        self.status_frame = tk.Frame(top_frame, bg="#2c3e50")
-        self.status_frame.pack(side=tk.RIGHT, padx=20, pady=10)
-        
-        # Center section: VM Summary (fills remaining space and centers content)
-        vm_summary_container = tk.Frame(top_frame, bg="#2c3e50")
-        vm_summary_container.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
-        
-        # Inner frame for VM summary (centered within container)
-        vm_summary_frame = tk.Frame(vm_summary_container, bg="#2c3e50")
-        vm_summary_frame.place(relx=0.5, rely=0.5, anchor="center")
-        
-        # VMs/CTs: label
-        summary_title = tk.Label(
-            vm_summary_frame,
-            text="VMs/CTs:",
-            font=("Arial", 12, "bold"),
-            bg="#2c3e50",
-            fg="#ecf0f1"
-        )
-        summary_title.pack(pady=(0, 5))
-        
-        # Running count with green indicator
-        running_summary_frame = tk.Frame(vm_summary_frame, bg="#2c3e50")
-        running_summary_frame.pack(pady=2)
-        
-        self.running_led = self.create_led_indicator(running_summary_frame, "#27ae60", size=8)
-        self.running_led.pack(side=tk.LEFT, padx=(0, 5))
-        
-        self.running_count_label = tk.Label(
-            running_summary_frame,
-            text="Running: 0",
-            font=("Arial", 10),
-            bg="#2c3e50",
-            fg="#27ae60"
-        )
-        self.running_count_label.pack(side=tk.LEFT)
-        
-        # Stopped count with red indicator
-        stopped_summary_frame = tk.Frame(vm_summary_frame, bg="#2c3e50")
-        stopped_summary_frame.pack(pady=2)
-        
-        self.stopped_led = self.create_led_indicator(stopped_summary_frame, "#e74c3c", size=8)
-        self.stopped_led.pack(side=tk.LEFT, padx=(0, 5))
-        
-        self.stopped_count_label = tk.Label(
-            stopped_summary_frame,
-            text="Stopped: 0",
-            font=("Arial", 10),
-            bg="#2c3e50",
-            fg="#e74c3c"
-        )
-        self.stopped_count_label.pack(side=tk.LEFT)
-        
-        # Row 0: Connection and LIVE status
-        connection_frame = tk.Frame(self.status_frame, bg="#2c3e50")
-        connection_frame.grid(row=0, column=0, sticky="w", padx=5, pady=3)
-        
-        self.connection_led = self.create_led_indicator(connection_frame, "#27ae60")
-        self.connection_led.pack(side=tk.LEFT, padx=(0, 5))
-        
-        self.connection_label = tk.Label(
-            connection_frame,
-            text="Connected",
-            font=("Arial", 10, "bold"),
-            bg="#2c3e50",
-            fg="#27ae60"
-        )
-        self.connection_label.pack(side=tk.LEFT)
-        
-        live_frame = tk.Frame(self.status_frame, bg="#2c3e50")
-        live_frame.grid(row=0, column=1, sticky="w", padx=15, pady=3)
-        
-        self.live_led = self.create_led_indicator(live_frame, "#27ae60")
-        self.live_led.pack(side=tk.LEFT, padx=(0, 5))
-        
-        self.live_indicator = tk.Label(
-            live_frame,
-            text="LIVE",
-            font=("Arial", 10, "bold"),
-            bg="#2c3e50",
-            fg="#27ae60"
-        )
-        self.live_indicator.pack(side=tk.LEFT)
-        
-        # Row 1: SSL and Nodes
-        ssl_frame = tk.Frame(self.status_frame, bg="#2c3e50")
-        ssl_frame.grid(row=1, column=0, sticky="w", padx=5, pady=3)
-        
-        self.ssl_label = tk.Label(
-            ssl_frame,
-            text="SSL: Checking...",
-            font=("Arial", 10),
-            bg="#2c3e50",
-            fg="white"
-        )
-        self.ssl_label.pack()
-        
-        nodes_frame = tk.Frame(self.status_frame, bg="#2c3e50")
-        nodes_frame.grid(row=1, column=1, sticky="w", padx=15, pady=3)
-        
-        self.node_label = tk.Label(
-            nodes_frame,
-            text="Nodes: 0",
-            font=("Arial", 10),
-            bg="#2c3e50",
-            fg="white"
-        )
-        self.node_label.pack()
-        
-        # Row 2: Temperature and Last update
-        # Proxmox host temperature indicator (VirtIO-FS only)
-        temp_frame = tk.Frame(self.status_frame, bg="#2c3e50")
-        temp_frame.grid(row=2, column=0, sticky="w", padx=5, pady=3)
-        
-        tk.Label(
-            temp_frame,
-            text="Host Temp:",
-            font=("Arial", 10),
-            bg="#2c3e50",
-            fg="#bdc3c7"
-        ).pack(side=tk.LEFT, padx=(0, 5))
-        
-        self.temp_label = tk.Label(
-            temp_frame,
-            text="--",
-            font=("Arial", 10, "bold"),
-            bg="#2c3e50",
-            fg="#95a5a6"
-        )
-        self.temp_label.pack(side=tk.LEFT)
-        
-        update_frame = tk.Frame(self.status_frame, bg="#2c3e50")
-        update_frame.grid(row=2, column=1, sticky="w", padx=15, pady=3)
-        
-        self.last_update_label = tk.Label(
-            update_frame,
-            text="Updated: --",
-            font=("Arial", 9),
-            bg="#2c3e50",
-            fg="#bdc3c7"
-        )
-        self.last_update_label.pack()
-        
-        # Control panel
-        control_frame = tk.Frame(self.root, bg="#ecf0f1", height=80)
-        control_frame.pack(fill=tk.X)
+    def create_control_panel(self):
+        """Create top control panel"""
+        control_frame = tk.Frame(self.root, bg="#34495e", height=60)
+        control_frame.pack(fill=tk.X, padx=10, pady=5)
         control_frame.pack_propagate(False)
         
-        btn_container = tk.Frame(control_frame, bg="#ecf0f1")
-        btn_container.pack(pady=15)
+        # Left side - Connection
+        left_frame = tk.Frame(control_frame, bg="#34495e")
+        left_frame.pack(side=tk.LEFT, padx=5)
         
-        self.start_btn = tk.Button(
-            btn_container,
+        tk.Button(
+            left_frame,
+            text="Connect",
+            command=self.show_connection_dialog,
+            bg="#3498db",
+            fg="white",
+            font=("Arial", 10, "bold"),
+            padx=15,
+            pady=5
+        ).pack(side=tk.LEFT, padx=2)
+        
+        tk.Button(
+            left_frame,
+            text="Disconnect",
+            command=self.disconnect,
+            bg="#e74c3c",
+            fg="white",
+            font=("Arial", 10, "bold"),
+            padx=15,
+            pady=5
+        ).pack(side=tk.LEFT, padx=2)
+        
+        # Middle - VM Controls
+        middle_frame = tk.Frame(control_frame, bg="#34495e")
+        middle_frame.pack(side=tk.LEFT, padx=20)
+        
+        tk.Button(
+            middle_frame,
             text="Start",
             command=self.start_selected,
             bg="#27ae60",
             fg="white",
-            font=("Arial", 11, "bold"),
-            width=12,
-            height=2,
-            cursor="hand2",
-            relief=tk.RAISED,
-            bd=2
-        )
-        self.start_btn.pack(side=tk.LEFT, padx=5)
+            font=("Arial", 10, "bold"),
+            padx=15,
+            pady=5
+        ).pack(side=tk.LEFT, padx=2)
         
-        self.stop_btn = tk.Button(
-            btn_container,
+        tk.Button(
+            middle_frame,
             text="Stop",
             command=self.stop_selected,
-            bg="#e74c3c",
-            fg="white",
-            font=("Arial", 11, "bold"),
-            width=12,
-            height=2,
-            cursor="hand2",
-            relief=tk.RAISED,
-            bd=2
-        )
-        self.stop_btn.pack(side=tk.LEFT, padx=5)
-        
-        tk.Button(
-            btn_container,
-            text="Refresh",
-            command=self.refresh_data_async,
-            bg="#3498db",
-            fg="white",
-            font=("Arial", 11, "bold"),
-            width=12,
-            height=2,
-            cursor="hand2",
-            relief=tk.RAISED,
-            bd=2
-        ).pack(side=tk.LEFT, padx=5)
-        
-        tk.Button(
-            btn_container,
-            text="Start All",
-            command=self.start_all_stopped,
-            bg="#16a085",
-            fg="white",
-            font=("Arial", 11, "bold"),
-            width=12,
-            height=2,
-            cursor="hand2",
-            relief=tk.RAISED,
-            bd=2
-        ).pack(side=tk.LEFT, padx=5)
-        
-        # Live feed controls
-        live_controls = tk.Frame(btn_container, bg="#ecf0f1")
-        live_controls.pack(side=tk.LEFT, padx=15)
-        
-        self.auto_refresh_var = tk.BooleanVar(value=True)
-        self.pause_resume_btn = tk.Button(
-            live_controls,
-            text="Pause Live",
-            command=self.toggle_auto_refresh,
             bg="#e67e22",
             fg="white",
             font=("Arial", 10, "bold"),
-            width=12,
-            cursor="hand2",
-            relief=tk.RAISED,
-            bd=2
-        )
-        self.pause_resume_btn.pack(side=tk.LEFT, padx=5)
+            padx=15,
+            pady=5
+        ).pack(side=tk.LEFT, padx=2)
         
-        # Refresh rate selector
-        rate_frame = tk.Frame(live_controls, bg="#ecf0f1")
-        rate_frame.pack(side=tk.LEFT, padx=10)
+        tk.Button(
+            middle_frame,
+            text="Start All Stopped",
+            command=self.start_all_stopped,
+            bg="#16a085",
+            fg="white",
+            font=("Arial", 10, "bold"),
+            padx=15,
+            pady=5
+        ).pack(side=tk.LEFT, padx=2)
+        
+        # Right side - Refresh controls
+        right_frame = tk.Frame(control_frame, bg="#34495e")
+        right_frame.pack(side=tk.RIGHT, padx=5)
+        
+        tk.Checkbutton(
+            right_frame,
+            text="Auto-refresh",
+            variable=self.auto_refresh_var,
+            command=self.toggle_auto_refresh,
+            bg="#34495e",
+            fg="white",
+            selectcolor="#2c3e50",
+            font=("Arial", 9)
+        ).pack(side=tk.LEFT, padx=5)
         
         tk.Label(
-            rate_frame,
-            text="Update every:",
-            font=("Arial", 9),
-            bg="#ecf0f1"
+            right_frame,
+            text="Interval:",
+            bg="#34495e",
+            fg="white",
+            font=("Arial", 9)
         ).pack(side=tk.LEFT)
         
-        self.refresh_rate_var = tk.IntVar(value=REFRESH_INTERVAL)
-        rate_options = [("2s", 2), ("3s", 3), ("5s", 5), ("10s", 10), ("30s", 30)]
+        refresh_options = [2, 3, 5, 10, 30]
+        refresh_menu = tk.OptionMenu(
+            right_frame,
+            self.refresh_rate_var,
+            *refresh_options,
+            command=self.update_refresh_rate
+        )
+        refresh_menu.config(bg="#3498db", fg="white", font=("Arial", 9))
+        refresh_menu.pack(side=tk.LEFT, padx=2)
         
-        for text, value in rate_options:
-            rb = tk.Radiobutton(
-                rate_frame,
-                text=text,
-                variable=self.refresh_rate_var,
-                value=value,
-                command=self.update_refresh_rate,
-                font=("Arial", 9),
-                bg="#ecf0f1",
-                selectcolor="#3498db"
-            )
-            rb.pack(side=tk.LEFT, padx=2)
+        tk.Label(
+            right_frame,
+            text="sec",
+            bg="#34495e",
+            fg="white",
+            font=("Arial", 9)
+        ).pack(side=tk.LEFT)
+        
+        tk.Button(
+            right_frame,
+            text="Refresh Now",
+            command=self.manual_refresh,
+            bg="#9b59b6",
+            fg="white",
+            font=("Arial", 9, "bold"),
+            padx=10,
+            pady=5
+        ).pack(side=tk.LEFT, padx=5)
+    
+    def create_status_bar(self):
+        """Create status bar with connection info and temperature"""
+        self.status_frame = tk.Frame(self.root, bg="#2c3e50", height=80)
+        self.status_frame.pack(fill=tk.X, padx=10, pady=2)
+        self.status_frame.pack_propagate(False)
+        
+        # Top row - Connection and stats
+        top_row = tk.Frame(self.status_frame, bg="#2c3e50")
+        top_row.pack(fill=tk.X, pady=2)
+        
+        # Left side - VM stats
+        left_status = tk.Frame(top_row, bg="#2c3e50")
+        left_status.pack(side=tk.LEFT, padx=5)
+        
+        self.stats_label = tk.Label(
+            left_status,
+            text="VMs/CTs: 0 | Running: 0 | Stopped: 0",
+            font=("Arial", 10, "bold"),
+            bg="#2c3e50",
+            fg="#ecf0f1"
+        )
+        self.stats_label.pack(anchor='w')
+        
+        # Right side - Connection status
+        right_status = tk.Frame(top_row, bg="#2c3e50")
+        right_status.pack(side=tk.RIGHT, padx=5)
+        
+        conn_frame = tk.Frame(right_status, bg="#2c3e50")
+        conn_frame.pack(anchor='e')
+        
+        tk.Label(
+            conn_frame,
+            text="Connection:",
+            font=("Arial", 9),
+            bg="#2c3e50",
+            fg="#bdc3c7"
+        ).pack(side=tk.LEFT, padx=2)
+        
+        self.conn_status_canvas = tk.Canvas(
+            conn_frame,
+            width=12,
+            height=12,
+            bg="#2c3e50",
+            highlightthickness=0
+        )
+        self.conn_status_canvas.pack(side=tk.LEFT, padx=2)
+        self.conn_indicator = self.conn_status_canvas.create_oval(
+            2, 2, 10, 10,
+            fill="#95a5a6",
+            outline=""
+        )
+        
+        self.conn_label = tk.Label(
+            conn_frame,
+            text="Disconnected",
+            font=("Arial", 9, "bold"),
+            bg="#2c3e50",
+            fg="#95a5a6"
+        )
+        self.conn_label.pack(side=tk.LEFT)
+        
+        # SSL status (always secure when connected)
+        ssl_frame = tk.Frame(right_status, bg="#2c3e50")
+        ssl_frame.pack(anchor='e', pady=1)
+        
+        tk.Label(
+            ssl_frame,
+            text="Security:",
+            font=("Arial", 9),
+            bg="#2c3e50",
+            fg="#bdc3c7"
+        ).pack(side=tk.LEFT, padx=2)
+        
+        # Security indicator (lock icon simulation)
+        self.security_canvas = tk.Canvas(
+            ssl_frame,
+            width=12,
+            height=12,
+            bg="#2c3e50",
+            highlightthickness=0
+        )
+        self.security_canvas.pack(side=tk.LEFT, padx=2)
+        
+        # Draw lock icon
+        self.security_lock = self.security_canvas.create_rectangle(
+            4, 6, 8, 10,
+            fill="#95a5a6",
+            outline=""
+        )
+        self.security_shackle = self.security_canvas.create_arc(
+            3, 3, 9, 9,
+            start=0,
+            extent=180,
+            style=tk.ARC,
+            outline="#95a5a6",
+            width=2
+        )
+        
+        self.ssl_label = tk.Label(
+            ssl_frame,
+            text="N/A",
+            font=("Arial", 9),
+            bg="#2c3e50",
+            fg="#95a5a6"
+        )
+        self.ssl_label.pack(side=tk.LEFT)
+        
+        # Bottom row - Node temperatures
+        self.node_temp_frame = tk.Frame(self.status_frame, bg="#2c3e50")
+        self.node_temp_frame.pack(fill=tk.X, pady=5)
+        
+        tk.Label(
+            self.node_temp_frame,
+            text="Node Temps:",
+            font=("Arial", 9, "bold"),
+            bg="#2c3e50",
+            fg="#bdc3c7"
+        ).pack(side=tk.LEFT, padx=5)
+        
+        # Temperature labels will be created dynamically
+    
+    def create_main_content(self):
+        """Create main content area with VM list and search"""
+        content_frame = tk.Frame(self.root, bg="#2c3e50")
+        content_frame.pack(fill=tk.BOTH, expand=True, padx=10, pady=5)
         
         # Search bar
-        search_frame = tk.Frame(self.root, bg="#ecf0f1", height=40)
-        search_frame.pack(fill=tk.X)
+        search_frame = tk.Frame(content_frame, bg="#34495e", height=40)
+        search_frame.pack(fill=tk.X, pady=(0, 5))
         search_frame.pack_propagate(False)
         
         tk.Label(
             search_frame,
             text="Search:",
-            font=("Arial", 10),
-            bg="#ecf0f1"
-        ).pack(side=tk.LEFT, padx=10)
+            bg="#34495e",
+            fg="white",
+            font=("Arial", 10)
+        ).pack(side=tk.LEFT, padx=5)
         
-        self.search_entry = tk.Entry(search_frame, font=("Arial", 10), width=30)
-        self.search_entry.pack(side=tk.LEFT, padx=5)
-        self.search_entry.bind('<KeyRelease>', self.filter_vms)
+        self.search_var = tk.StringVar()
+        self.search_var.trace('w', lambda *args: self.filter_vms())
         
-        tk.Label(
+        search_entry = tk.Entry(
             search_frame,
-            text="Filter by ID, Name, Type, Status, Node",
-            font=("Arial", 9),
+            textvariable=self.search_var,
+            font=("Arial", 10),
             bg="#ecf0f1",
-            fg="#7f8c8d"
-        ).pack(side=tk.LEFT, padx=10)
-        
-        # Table with scrollbars
-        table_container = tk.Frame(self.root)
-        table_container.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
-        
-        # Create scrollbars
-        vsb = ttk.Scrollbar(table_container, orient="vertical")
-        hsb = ttk.Scrollbar(table_container, orient="horizontal")
-        
-        # Basic columns
-        columns = (
-            "ID", "Type", "Status", "Name", "Node", 
-            "Cores", "Sockets", "CPU", "Memory", "Disk", "Free Disk", "Free%"
+            width=30
         )
+        search_entry.pack(side=tk.LEFT, padx=5, fill=tk.X, expand=True)
         
+        tk.Button(
+            search_frame,
+            text="Clear",
+            command=lambda: self.search_var.set(""),
+            bg="#7f8c8d",
+            fg="white",
+            font=("Arial", 9)
+        ).pack(side=tk.LEFT, padx=5)
+        
+        # VM list
+        list_frame = tk.Frame(content_frame, bg="#2c3e50")
+        list_frame.pack(fill=tk.BOTH, expand=True)
+        
+        # Treeview with scrollbars
+        tree_scroll_y = tk.Scrollbar(list_frame)
+        tree_scroll_y.pack(side=tk.RIGHT, fill=tk.Y)
+        
+        tree_scroll_x = tk.Scrollbar(list_frame, orient=tk.HORIZONTAL)
+        tree_scroll_x.pack(side=tk.BOTTOM, fill=tk.X)
+        
+        columns = ('ID', 'Type', 'Status', 'Name', 'Node', 'Cores', 'Memory', 'Disk', 'Uptime')
         self.tree = ttk.Treeview(
-            table_container,
+            list_frame,
             columns=columns,
-            show="tree headings",
-            yscrollcommand=vsb.set,
-            xscrollcommand=hsb.set,
-            selectmode="browse",
-            height=12
+            show='headings',
+            yscrollcommand=tree_scroll_y.set,
+            xscrollcommand=tree_scroll_x.set,
+            selectmode='browse'
         )
         
-        # Connect scrollbars to tree
-        vsb.config(command=self.tree.yview)
-        hsb.config(command=self.tree.xview)
+        tree_scroll_y.config(command=self.tree.yview)
+        tree_scroll_x.config(command=self.tree.xview)
         
-        self.tree.column("#0", width=0, stretch=tk.NO)
-        
-        # Column widths (increased for better visibility and earlier scrollbar activation)
+        # Configure columns
         column_widths = {
-            "ID": 80, "Type": 80, "Status": 110, "Name": 300, "Node": 150,
-            "Cores": 100, "Sockets": 110, "CPU": 180, "Memory": 250,
-            "Disk": 150, "Free Disk": 150, "Free%": 110
+            'ID': 80,
+            'Type': 60,
+            'Status': 80,
+            'Name': 200,
+            'Node': 100,
+            'Cores': 80,
+            'Memory': 100,
+            'Disk': 100,
+            'Uptime': 150
         }
         
         for col in columns:
-            width = column_widths.get(col, 80)
-            self.tree.column(col, width=width, anchor="center")
-            self.tree.heading(col, text=col, anchor="center")
+            self.tree.heading(col, text=col, command=lambda c=col: self.sort_by_column(c))
+            self.tree.column(col, width=column_widths.get(col, 100))
         
-        # Configure colored tags for status highlighting
-        self.tree.tag_configure("running", background="#d5f4e6", foreground="#27ae60")
-        self.tree.tag_configure("stopped", background="#fadbd8", foreground="#e74c3c")
-        self.tree.tag_configure("paused", background="#fef5e7", foreground="#f39c12")
-        self.tree.tag_configure("unknown", background="#ecf0f1", foreground="#95a5a6")
+        self.tree.pack(fill=tk.BOTH, expand=True)
         
-        # Use grid layout for proper scrollbar positioning
-        self.tree.grid(row=0, column=0, sticky="nsew")
-        vsb.grid(row=0, column=1, sticky="ns")
-        hsb.grid(row=1, column=0, sticky="ew")
+        # Configure tags for row colors
+        self.tree.tag_configure('running', background='#d5f4e6')
+        self.tree.tag_configure('stopped', background='#fadbd8')
+        self.tree.tag_configure('odd', background='#f8f9fa')
+        self.tree.tag_configure('even', background='#ffffff')
+    
+    def create_audit_log(self):
+        """Create audit log panel"""
+        log_frame = tk.Frame(self.root, bg="#34495e", height=120)
+        log_frame.pack(fill=tk.X, padx=10, pady=(5, 10))
+        log_frame.pack_propagate(False)
         
-        # Configure grid weights so tree expands
-        table_container.grid_rowconfigure(0, weight=1)
-        table_container.grid_columnconfigure(0, weight=1)
-        
-        self.tree.bind("<<TreeviewSelect>>", self.on_select)
-        
-        # Status bar
-        status_bar = tk.Frame(self.root, bg="#34495e", height=30)
-        status_bar.pack(fill=tk.X)
-        status_bar.pack_propagate(False)
-        
-        self.status_label = tk.Label(
-            status_bar,
-            text="Ready",
-            font=("Arial", 9),
+        tk.Label(
+            log_frame,
+            text="Activity Log",
+            font=("Arial", 10, "bold"),
             bg="#34495e",
+            fg="white"
+        ).pack(anchor='w', padx=5, pady=2)
+        
+        log_scroll = tk.Scrollbar(log_frame)
+        log_scroll.pack(side=tk.RIGHT, fill=tk.Y)
+        
+        self.log_text = tk.Text(
+            log_frame,
+            height=5,
+            bg="#2c3e50",
+            fg="#ecf0f1",
+            font=("Courier", 9),
+            yscrollcommand=log_scroll.set,
+            state=tk.DISABLED
+        )
+        self.log_text.pack(fill=tk.BOTH, expand=True, padx=5, pady=2)
+        log_scroll.config(command=self.log_text.yview)
+    
+    def log_activity(self, message):
+        """Add entry to audit log"""
+        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        log_entry = f"[{timestamp}] {message}\n"
+        
+        self.log_text.config(state=tk.NORMAL)
+        self.log_text.insert(tk.END, log_entry)
+        self.log_text.see(tk.END)
+        self.log_text.config(state=tk.DISABLED)
+        
+        logger.info(message)
+    
+    def show_connection_dialog(self):
+        """Show connection dialog (SSL always enabled)"""
+        dialog = tk.Toplevel(self.root)
+        dialog.title("Connect to Proxmox")
+        dialog.geometry("500x320")
+        dialog.configure(bg="#2c3e50")
+        dialog.transient(self.root)
+        dialog.grab_set()
+        
+        # Load saved credentials
+        saved_creds = self.cred_manager.load_credentials()
+        
+        # Form fields
+        fields_frame = tk.Frame(dialog, bg="#2c3e50")
+        fields_frame.pack(padx=20, pady=20, fill=tk.BOTH, expand=True)
+        
+        tk.Label(
+            fields_frame,
+            text="Proxmox Host:",
+            bg="#2c3e50",
             fg="white",
-            anchor="w"
-        )
-        self.status_label.pack(side=tk.LEFT, padx=10, fill=tk.X, expand=True)
-    
-    def authenticate(self):
-        """Handle authentication - API Token Only"""
+            font=("Arial", 10)
+        ).grid(row=0, column=0, sticky='w', pady=5)
         
-        if os.path.exists(CREDENTIALS_FILE):
-            while True:
-                master_password = simpledialog.askstring(
-                    "Master Password",
-                    "Enter your master password:",
-                    show='*',
-                    parent=self.root
+        host_entry = tk.Entry(fields_frame, font=("Arial", 10), width=30)
+        host_entry.grid(row=0, column=1, pady=5, padx=5)
+        if saved_creds:
+            host_entry.insert(0, saved_creds.get('host', ''))
+        
+        tk.Label(
+            fields_frame,
+            text="API Token ID:",
+            bg="#2c3e50",
+            fg="white",
+            font=("Arial", 10)
+        ).grid(row=1, column=0, sticky='w', pady=5)
+        
+        token_id_entry = tk.Entry(fields_frame, font=("Arial", 10), width=30)
+        token_id_entry.grid(row=1, column=1, pady=5, padx=5)
+        if saved_creds:
+            token_id_entry.insert(0, saved_creds.get('token_id', ''))
+        
+        tk.Label(
+            fields_frame,
+            text="API Token Secret:",
+            bg="#2c3e50",
+            fg="white",
+            font=("Arial", 10)
+        ).grid(row=2, column=0, sticky='w', pady=5)
+        
+        token_secret_entry = tk.Entry(fields_frame, font=("Arial", 10), width=30, show='*')
+        token_secret_entry.grid(row=2, column=1, pady=5, padx=5)
+        if saved_creds:
+            token_secret_entry.insert(0, saved_creds.get('token_secret', ''))
+        
+        save_creds_var = tk.BooleanVar(value=True)
+        tk.Checkbutton(
+            fields_frame,
+            text="Save credentials (encrypted)",
+            variable=save_creds_var,
+            bg="#2c3e50",
+            fg="white",
+            selectcolor="#34495e",
+            font=("Arial", 10)
+        ).grid(row=3, column=0, columnspan=2, pady=10)
+        
+        # Security notice
+        security_frame = tk.Frame(fields_frame, bg="#27ae60", relief=tk.SOLID, borderwidth=1)
+        security_frame.grid(row=4, column=0, columnspan=2, pady=10, sticky='ew')
+        
+        tk.Label(
+            security_frame,
+            text="Secure Connection Required",
+            bg="#27ae60",
+            fg="white",
+            font=("Arial", 9, "bold")
+        ).pack(pady=2)
+        
+        tk.Label(
+            security_frame,
+            text="SSL certificate verification is mandatory for security.",
+            bg="#27ae60",
+            fg="white",
+            font=("Arial", 8)
+        ).pack(pady=2)
+        
+        # Buttons
+        button_frame = tk.Frame(dialog, bg="#2c3e50")
+        button_frame.pack(pady=10)
+        
+        def on_connect():
+            host = host_entry.get().strip()
+            token_id = token_id_entry.get().strip()
+            token_secret = token_secret_entry.get().strip()
+            
+            if not host or not token_id or not token_secret:
+                messagebox.showerror("Error", "All fields are required")
+                return
+            
+            # Save credentials if requested
+            if save_creds_var.get():
+                self.cred_manager.save_credentials(host, token_id, token_secret)
+            
+            dialog.destroy()
+            self.connect(host, token_id, token_secret)
+        
+        tk.Button(
+            button_frame,
+            text="Connect",
+            command=on_connect,
+            bg="#27ae60",
+            fg="white",
+            font=("Arial", 10, "bold"),
+            padx=20,
+            pady=5
+        ).pack(side=tk.LEFT, padx=5)
+        
+        tk.Button(
+            button_frame,
+            text="Cancel",
+            command=dialog.destroy,
+            bg="#e74c3c",
+            fg="white",
+            font=("Arial", 10, "bold"),
+            padx=20,
+            pady=5
+        ).pack(side=tk.LEFT, padx=5)
+        
+        # Help button for SSL issues
+        tk.Button(
+            button_frame,
+            text="SSL Help",
+            command=self.show_ssl_help,
+            bg="#3498db",
+            fg="white",
+            font=("Arial", 10, "bold"),
+            padx=20,
+            pady=5
+        ).pack(side=tk.LEFT, padx=5)
+    
+    def show_ssl_help(self):
+        """Show SSL certificate help dialog"""
+        help_text = """SSL Certificate Verification
+
+This dashboard requires secure HTTPS connections with valid SSL certificates.
+
+If you receive an SSL error, your Proxmox server likely uses a self-signed certificate.
+
+SOLUTIONS:
+
+Option 1: Install Valid Certificate (Recommended)
+- Use Let's Encrypt (free): certbot --apache
+- Provides automatic certificate renewal
+- Most secure option
+
+Option 2: Add Self-Signed Certificate to Trusted Store
+- Download certificate from Proxmox
+- Add to your operating system's trusted certificates
+- See documentation for platform-specific instructions
+
+LINUX:
+  openssl s_client -connect PROXMOX_HOST:8006 -showcerts < /dev/null 2>/dev/null | openssl x509 -outform PEM > proxmox.pem
+  sudo cp proxmox.pem /usr/local/share/ca-certificates/proxmox.crt
+  sudo update-ca-certificates
+
+MACOS:
+  sudo security add-trusted-cert -d -r trustRoot -k /Library/Keychains/System.keychain proxmox.pem
+
+WINDOWS:
+  Import certificate via certmgr.msc into "Trusted Root Certification Authorities"
+
+For detailed instructions, see the documentation.
+"""
+        
+        help_dialog = tk.Toplevel(self.root)
+        help_dialog.title("SSL Certificate Help")
+        help_dialog.geometry("700x500")
+        help_dialog.configure(bg="#2c3e50")
+        help_dialog.transient(self.root)
+        
+        text_frame = tk.Frame(help_dialog, bg="#2c3e50")
+        text_frame.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
+        
+        scrollbar = tk.Scrollbar(text_frame)
+        scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+        
+        text_widget = tk.Text(
+            text_frame,
+            wrap=tk.WORD,
+            bg="#34495e",
+            fg="#ecf0f1",
+            font=("Courier", 9),
+            yscrollcommand=scrollbar.set
+        )
+        text_widget.pack(fill=tk.BOTH, expand=True)
+        scrollbar.config(command=text_widget.yview)
+        
+        text_widget.insert('1.0', help_text)
+        text_widget.config(state=tk.DISABLED)
+        
+        tk.Button(
+            help_dialog,
+            text="Close",
+            command=help_dialog.destroy,
+            bg="#3498db",
+            fg="white",
+            font=("Arial", 10, "bold"),
+            padx=20,
+            pady=5
+        ).pack(pady=10)
+    
+    def try_auto_login(self):
+        """Try to connect using saved credentials"""
+        if self.cred_manager.credentials_exist():
+            creds = self.cred_manager.load_credentials()
+            if creds:
+                self.log_activity("Found saved credentials, connecting...")
+                self.connect(
+                    creds['host'],
+                    creds['token_id'],
+                    creds['token_secret']
                 )
-                
-                if master_password is None:
-                    return False
-                
-                try:
-                    creds = CredentialManager.load_credentials(master_password)
-                    if creds:
-                        # Only token authentication supported
-                        self.api = ProxmoxAPI(
-                            creds['host'],
-                            token_id=creds['token_id'],
-                            token_secret=creds['token_secret']
-                        )
-                        
-                        self.status_label.config(text=f"Connected to {creds['host']}")
-                        self.ssl_label.config(text=f"SSL: {self.api.ssl_status}")
-                        self.connection_healthy = True
-                        logger.info(f"Successfully authenticated to {creds['host']}")
-                        return True
-                except Exception as e:
-                    logger.error(f"Authentication failed: {str(e)}")
-                    error_msg = str(e).lower()
-                    
-                    # Check for certificate hostname mismatch
-                    if 'hostname' in error_msg and 'match' in error_msg:
-                        cert_hostname = extract_hostname_from_certificate(PROXMOX_CA_CERT)
-                        if cert_hostname:
-                            messagebox.showwarning(
-                                "Certificate Hostname Mismatch Detected",
-                                f"SSL certificate is for hostname '{cert_hostname}' but you're connecting to '{creds['host']}'.\n\nA fix guide will open next."
-                            )
-                            hostname_guide = HostnameMismatchDialog(self.root, creds['host'], cert_hostname)
-                            self.root.wait_window(hostname_guide)
-                        else:
-                            messagebox.showerror("Error", f"Failed to decrypt or connect:\n{str(e)}")
-                    else:
-                        messagebox.showerror("Error", f"Failed to decrypt or connect:\n{str(e)}")
-        
-        # Show token creation guide first
-        messagebox.showinfo("Setup Required", "No credentials found.\n\nYou'll need to create an API token in Proxmox first.\n\nThe next screen will show you how.")
-        guide = TokenCreationGuide(self.root)
-        self.root.wait_window(guide)
-        
-        # Now show credentials entry
-        dialog = CredentialsDialog(self.root, is_setup=True)
-        self.root.wait_window(dialog)
-        
-        if dialog.result:
-            auth_type, host, user, password, token_id, token_secret, master = dialog.result
-            try:
-                # Only token authentication
-                self.api = ProxmoxAPI(host, token_id=token_id, token_secret=token_secret)
-                CredentialManager.save_credentials(host, master, token_id, token_secret)
-                
-                messagebox.showinfo("Success", "Credentials saved successfully!")
-                self.status_label.config(text=f"Connected to {host}")
-                self.ssl_label.config(text=f"SSL: {self.api.ssl_status}")
-                self.connection_healthy = True
-                logger.info(f"Successfully set up connection to {host}")
-                return True
-            except Exception as e:
-                logger.error(f"Connection setup failed: {str(e)}")
-                error_msg = str(e).lower()
-                
-                # Check for certificate hostname mismatch
-                if 'hostname' in error_msg and 'match' in error_msg:
-                    cert_hostname = extract_hostname_from_certificate(PROXMOX_CA_CERT)
-                    if cert_hostname:
-                        messagebox.showwarning(
-                            "Certificate Hostname Mismatch Detected",
-                            f"SSL certificate is for hostname '{cert_hostname}' but you're connecting to '{host}'.\n\nA fix guide will open next."
-                        )
-                        hostname_guide = HostnameMismatchDialog(self.root, host, cert_hostname)
-                        self.root.wait_window(hostname_guide)
-                    else:
-                        messagebox.showerror("Error", f"Connection failed:\n{str(e)}")
-                else:
-                    messagebox.showerror("Error", f"Connection failed:\n{str(e)}")
-                return False
-        
-        return False
     
-    def start_task_processor(self):
-        """Process async tasks"""
-        def process_tasks():
-            while True:
-                try:
-                    task = self.task_queue.get(timeout=1)
-                    if task:
-                        func, args, callback = task
-                        try:
-                            result = func(*args)
-                            if callback:
-                                self.root.after(0, lambda r=result: callback(r, None))
-                        except Exception as e:
-                            if callback:
-                                self.root.after(0, lambda er=e: callback(None, er))
-                except queue.Empty:
-                    continue
-                except Exception as e:
-                    logger.error(f"Task processor error: {e}")
-                    break
-        
-        task_thread = threading.Thread(target=process_tasks, daemon=True)
-        task_thread.start()
-    
-    def run_async(self, func, args=(), callback=None):
-        """Run function asynchronously"""
-        self.task_queue.put((func, args, callback))
-    
-    def show_loading(self, message="Loading..."):
-        """Show loading indicator"""
-        self.is_loading = True
-        self.status_label.config(text=f"[Loading] {message}")
-        self.root.config(cursor="watch")
-    
-    def hide_loading(self):
-        """Hide loading indicator"""
-        self.is_loading = False
-        self.root.config(cursor="")
-    
-    def start_health_check(self):
-        """Start connection health check"""
-        def health_check_loop():
-            while True:
-                time.sleep(60)
-                try:
-                    if self.api:
-                        self.api.get('/version')
-                        self.connection_healthy = True
-                        self.root.after(0, lambda: [
-                            self.connection_label.config(text="Connected", fg="#27ae60"),
-                            self.update_led_color(self.connection_led, "#27ae60")
-                        ])
-                except Exception:
-                    self.connection_healthy = False
-                    self.root.after(0, lambda: [
-                        self.connection_label.config(text="Disconnected", fg="#e74c3c"),
-                        self.update_led_color(self.connection_led, "#e74c3c")
-                    ])
-                    self.root.after(0, self.attempt_reconnect)
-        
-        self.health_check_thread = threading.Thread(target=health_check_loop, daemon=True)
-        self.health_check_thread.start()
-    
-    def attempt_reconnect(self):
-        """Attempt reconnection"""
-        if self.is_loading:
-            return
-        
-        response = messagebox.askyesno(
-            "Connection Lost",
-            "Connection to Proxmox was lost. Attempt to reconnect?"
-        )
-        
-        if response:
-            self.show_loading("Reconnecting...")
-            
-            def try_reconnect():
-                try:
-                    self.api.get('/version')
-                    return True
-                except Exception:
-                    return False
-            
-            def reconnect_callback(success, error):
-                self.hide_loading()
-                if success:
-                    messagebox.showinfo("Success", "Reconnected successfully!")
-                    self.refresh_data_async()
-                else:
-                    messagebox.showerror("Error", "Reconnection failed. Please restart the application.")
-            
-            self.run_async(try_reconnect, callback=reconnect_callback)
-    
-    def filter_vms(self, event=None):
-        """Filter VMs based on search query"""
-        query = self.search_entry.get().lower()
-        
-        # Save current selection (VM ID) before clearing
-        selected_vm_id = None
-        selected_items = self.tree.selection()
-        if selected_items:
-            try:
-                selected_values = self.tree.item(selected_items[0])['values']
-                if selected_values:
-                    selected_vm_id = selected_values[0]  # VM ID is first column
-            except (IndexError, KeyError):
-                pass
-        
-        # Faster bulk delete
-        self.tree.delete(*self.tree.get_children())
-        
-        # Count statuses for summary
-        running_count = 0
-        stopped_count = 0
-        
-        self.filtered_vm_data = []
-        item_to_select = None
-        
-        for vm in self.vm_data:
-            if (query in str(vm.get('id', '')).lower() or
-                query in vm.get('name', '').lower() or
-                query in vm.get('type', '').lower() or
-                query in vm.get('status', '').lower() or
-                query in vm.get('node', '').lower()):
-                self.filtered_vm_data.append(vm)
-                
-                # Determine status tag
-                status = vm['status'].lower()
-                if status == 'running':
-                    tags = ('running',)
-                    running_count += 1
-                elif status == 'stopped':
-                    tags = ('stopped',)
-                    stopped_count += 1
-                elif status == 'paused':
-                    tags = ('paused',)
-                else:
-                    tags = ('unknown',)
-                
-                item = self.tree.insert('', 'end', values=(
-                    vm['id'], vm['type'], vm['status'], vm['name'], vm['node'],
-                    vm.get('cores', 'N/A'), vm.get('sockets', 'N/A'), vm.get('cpu', 'N/A'),
-                    vm.get('memory', 'N/A'), vm.get('disk', 'N/A'),
-                    vm.get('free_disk', 'N/A'), vm.get('free_pct', 'N/A')
-                ), tags=tags)
-                
-                # Track the item to reselect
-                if selected_vm_id is not None and vm['id'] == selected_vm_id:
-                    item_to_select = item
-        
-        # Restore selection if found
-        if item_to_select:
-            self.tree.selection_set(item_to_select)
-            self.tree.see(item_to_select)  # Ensure visible
-        
-        # Update summary counts
-        self.running_count_label.config(text=f"Running: {running_count}")
-        self.stopped_count_label.config(text=f"Stopped: {stopped_count}")
-        
-        if query:
-            self.status_label.config(
-                text=f"Showing {len(self.filtered_vm_data)} of {len(self.vm_data)} VMs/CTs"
-            )
-        else:
-            self.status_label.config(text=f"Ready - {len(self.vm_data)} VMs/CTs across {self.node_count} node(s)")
-    
-    def format_bytes(self, bytes_val):
-        """Format bytes to human readable (binary units: GiB, MiB, etc)"""
-        if not bytes_val or bytes_val == 'N/A':
-            return 'N/A'
+    def connect(self, host, token_id, token_secret):
+        """Connect to Proxmox API (SSL always enabled)"""
         try:
-            bytes_val = float(bytes_val)
-            for unit in ['B', 'KiB', 'MiB', 'GiB', 'TiB']:
-                if bytes_val < 1024:
-                    return f"{bytes_val:.1f}{unit}"
-                bytes_val /= 1024
-            return f"{bytes_val:.1f}PiB"
-        except Exception:
-            return 'N/A'
-    
-    def fetch_single_vm_data(self, node, vm, vm_type):
-        """Fetch basic data for a single VM/CT"""
-        try:
-            n = node['node']
-            endpoint = 'qemu' if vm_type == 'VM' else 'lxc'
-            vmid = vm['vmid']
+            # SSL verification is ALWAYS enabled
+            self.api = ProxmoxAPI(host, token_id, token_secret)
             
-            # Get config only
-            cfg = self.api.get(f'/nodes/{n}/{endpoint}/{vmid}/config')
+            # Test connection
+            nodes = self.api.get('/nodes')
+            self.node_count = len(nodes)
             
-            # Basic info
-            cores = cfg.get('cores', 'N/A')
+            # Update UI - connection successful
+            self.conn_status_canvas.itemconfig(self.conn_indicator, fill="#27ae60")
+            self.conn_label.config(text="Connected", fg="#27ae60")
             
-            # Memory - STATIC CONFIG VALUES ONLY (not real-time)
-            if vm_type == 'VM':
-                # For VMs: Show minmem-maxmem (from balloon configuration)
-                # If balloon is configured, show minmem-maxmem
-                # Otherwise just show memory
-                memory_val = cfg.get('memory', 0)
-                if 'balloon' in cfg:
-                    # Balloon is configured - show range
-                    minmem = int(cfg.get('balloon', memory_val))
-                    maxmem = int(cfg.get('memory', memory_val))
-                    if minmem > 0 and maxmem > 0:
-                        minmem_str = self.format_bytes(minmem * 1024 * 1024)
-                        maxmem_str = self.format_bytes(maxmem * 1024 * 1024)
-                        memory = f"{minmem_str}-{maxmem_str}"
-                    else:
-                        memory = self.format_bytes(memory_val * 1024 * 1024) if memory_val else 'N/A'
-                else:
-                    # No balloon configured - just show memory
-                    memory = self.format_bytes(memory_val * 1024 * 1024) if memory_val else 'N/A'
-            else:  # CT
-                # For CTs: Show memory-swap
-                memory_mb = int(cfg.get('memory', 0))
-                swap_mb = int(cfg.get('swap', 0))
-                if memory_mb > 0:
-                    mem_str = self.format_bytes(memory_mb * 1024 * 1024)
-                    if swap_mb > 0:
-                        swap_str = self.format_bytes(swap_mb * 1024 * 1024)
-                        memory = f"{mem_str}-{swap_str}"
-                    else:
-                        memory = mem_str
-                else:
-                    memory = 'N/A'
+            # Update security indicator (always secure)
+            self.security_canvas.itemconfig(self.security_lock, fill="#27ae60")
+            self.security_canvas.itemconfig(self.security_shackle, outline="#27ae60")
+            self.ssl_label.config(text="SSL Verified", fg="#27ae60")
             
-            # Disk size
-            total_disk = 'N/A'
-            if vm_type == 'VM':
-                for key in sorted(cfg.keys()):
-                    if key.startswith(('scsi0', 'sata0', 'ide0', 'virtio0')):
-                        value = str(cfg[key])
-                        if 'size=' in value:
-                            size_str = value.split('size=')[1].split(',')[0].strip()
-                            if size_str.endswith('G'):
-                                total_disk = f"{size_str[:-1]}GiB"
-                            break
-            else:  # CT
-                rootfs = cfg.get('rootfs', '')
-                if 'size=' in str(rootfs):
-                    size_str = str(rootfs).split('size=')[1].split(',')[0].strip()
-                    if size_str.endswith('G'):
-                        total_disk = f"{size_str[:-1]}GiB"
+            self.log_activity(f"Connected to Proxmox at {host} ({self.node_count} nodes) - SSL Verified")
             
-            # Free disk and Free% - REAL-TIME DISK VALUES (only if running)
-            free_disk = 'N/A'
-            free_pct = 'N/A'
-            if vm['status'] == 'running':
-                try:
-                    if vm_type == 'VM':
-                        # For VMs: Try QEMU guest agent first for accurate filesystem data
-                        try:
-                            # Get filesystem info from QEMU guest agent
-                            fsinfo = self.api.get(f'/nodes/{n}/qemu/{vmid}/agent/get-fsinfo')
-                            
-                            # Guest agent returns filesystem information
-                            # Sum ONLY relevant filesystems (filter out ISO/tmpfs/etc)
-                            if 'result' in fsinfo and fsinfo['result']:
-                                filesystems = fsinfo['result']
-                                
-                                # Define filesystem filters
-                                excluded_types = ['iso9660', 'udf', 'tmpfs', 'devtmpfs']
-                                included_mountpoints = ['/', '/boot', '/home', '/var', '/tmp', '/usr']
-                                
-                                # Sum only relevant filesystems
-                                total_bytes_sum = 0
-                                used_bytes_sum = 0
-                                
-                                for fs in filesystems:
-                                    # Get filesystem type and mountpoint
-                                    fs_type = fs.get('type', '').lower()
-                                    mountpoint = fs.get('mountpoint', '')
-                                    
-                                    # Skip excluded filesystem types
-                                    if fs_type in excluded_types:
-                                        logger.debug(f"Skipping filesystem type {fs_type} at {mountpoint}")
-                                        continue
-                                    
-                                    # Only include specific mountpoints
-                                    if mountpoint not in included_mountpoints:
-                                        logger.debug(f"Skipping mountpoint {mountpoint} (not in included list)")
-                                        continue
-                                    
-                                    # Include filesystem with valid data
-                                    if 'total-bytes' in fs and 'used-bytes' in fs:
-                                        fs_total = fs.get('total-bytes', 0)
-                                        fs_used = fs.get('used-bytes', 0)
-                                        
-                                        # Sanity check - valid filesystem
-                                        if fs_total > 0:
-                                            logger.debug(f"Including {mountpoint} ({fs_type}): {fs_total} bytes")
-                                            total_bytes_sum += fs_total
-                                            used_bytes_sum += fs_used
-                                
-                                # Calculate free space from summed values
-                                if total_bytes_sum > 0:
-                                    free_bytes = total_bytes_sum - used_bytes_sum
-                                    if free_bytes >= 0:
-                                        free_disk = self.format_bytes(free_bytes)
-                                        free_pct = f"{(free_bytes / total_bytes_sum * 100):.1f}%"
-                        
-                        except Exception as e:
-                            # Guest agent not available or error - fall back to status method
-                            logger.debug(f"Guest agent not available for VM {vmid}, using status method: {e}")
-                            stat = self.api.get(f'/nodes/{n}/qemu/{vmid}/status/current')
-                            disk_used = stat.get('disk', 0)
-                            disk_max = stat.get('maxdisk', 0)
-                            
-                            if disk_max > 0 and disk_used >= 0:
-                                free_bytes = disk_max - disk_used
-                                if free_bytes >= 0:
-                                    free_disk = self.format_bytes(free_bytes)
-                                    free_pct = f"{(free_bytes / disk_max * 100):.1f}%"
-                    
-                    else:  # CT
-                        # For CTs: Use status/current (already works correctly)
-                        stat = self.api.get(f'/nodes/{n}/lxc/{vmid}/status/current')
-                        disk_used = stat.get('disk', 0)
-                        disk_max = stat.get('maxdisk', 0)
-                        
-                        if disk_max > 0 and disk_used >= 0:
-                            free_bytes = disk_max - disk_used
-                            if free_bytes >= 0:
-                                free_disk = self.format_bytes(free_bytes)
-                                free_pct = f"{(free_bytes / disk_max * 100):.1f}%"
-                
-                except Exception as e:
-                    logger.debug(f"Error getting disk data for {vm_type} {vmid}: {e}")
-                    pass
+            # Check temperature API availability
+            self.check_temperature_api_status()
             
-            # Additional CPU info
-            sockets = cfg.get('sockets', 'N/A') if vm_type == 'VM' else 'N/A'
-            cpu_type = cfg.get('cpu', 'N/A') if vm_type == 'VM' else 'N/A'
-            
-            vm_info = {
-                'id': vmid,
-                'type': vm_type,
-                'status': vm['status'],
-                'name': vm['name'],
-                'node': n,
-                'cores': cores,
-                'sockets': sockets,
-                'cpu': cpu_type,
-                'memory': memory,
-                'disk': total_disk,
-                'free_disk': free_disk,
-                'free_pct': free_pct
-            }
-            
-            return vm_info
-            
-        except Exception as e:
-            logger.error(f"Error getting {vm_type} {vm['vmid']}: {e}")
-            return None
-    
-    def refresh_data_async(self):
-        """Refresh data asynchronously with parallel processing"""
-        if self.is_loading:
-            return
-        
-        self.show_loading("Fetching data from Proxmox...")
-        
-        def fetch_data():
-            return self._fetch_vm_data_parallel()
-        
-        def update_ui(result, error):
-            self.hide_loading()
-            if error:
-                self.status_label.config(text=f"Error: {str(error)}")
-                self.connection_label.config(text="Disconnected", fg="#e74c3c")
-                # Update LED to red
-                self.update_led_color(self.connection_led, "#e74c3c")
-                messagebox.showerror("Error", f"Failed to refresh:\n{str(error)}")
+            # Start auto-refresh if enabled
+            if self.auto_refresh_var.get():
+                self.start_auto_refresh()
             else:
-                self.vm_data = result
-                self.filter_vms()
-                now = datetime.now().strftime("%H:%M:%S")
-                
-                # Show live status if enabled
-                if self.auto_refresh:
-                    refresh_rate = self.refresh_rate_var.get()
-                    self.last_update_label.config(text=f"LIVE - Updated: {now} (every {refresh_rate}s)")
-                else:
-                    self.last_update_label.config(text=f"Updated: {now} (paused)")
-                
-                self.connection_label.config(text="Connected", fg="#27ae60")
-                # Update LED to green
-                self.update_led_color(self.connection_led, "#27ae60")
-                
-                # Update Proxmox host temperature (VirtIO-FS only)
-                temp, zone = self.get_host_temperature()
-                temp_text = self.format_temperature(temp, zone)
-                temp_color = self.get_temp_color(temp)
-                self.temp_label.config(text=temp_text, fg=temp_color)
+                self.refresh_data()
         
-        self.run_async(fetch_data, callback=update_ui)
+        except SSLCertificateError as e:
+            # Show helpful SSL error message
+            error_message = str(e)
+            messagebox.showerror(
+                "SSL Certificate Error",
+                error_message,
+                parent=self.root
+            )
+            logger.error(f"SSL verification failed: {e}")
+            
+            # Offer to show help
+            if messagebox.askyesno(
+                "Need Help?",
+                "Would you like to see instructions for fixing SSL certificate issues?",
+                parent=self.root
+            ):
+                self.show_ssl_help()
+        
+        except Exception as e:
+            messagebox.showerror("Connection Error", f"Failed to connect:\n{str(e)}")
+            logger.error(f"Connection failed: {e}")
+    
+    def disconnect(self):
+        """Disconnect from Proxmox"""
+        if self.refresh_job:
+            self.root.after_cancel(self.refresh_job)
+            self.refresh_job = None
+        
+        self.api = None
+        self.vm_data = []
+        self.filtered_data = []
+        
+        # Clear treeview
+        for item in self.tree.get_children():
+            self.tree.delete(item)
+        
+        # Clear temperature displays
+        for label in self.node_temp_labels.values():
+            label.destroy()
+        self.node_temp_labels.clear()
+        
+        # Update UI
+        self.conn_status_canvas.itemconfig(self.conn_indicator, fill="#95a5a6")
+        self.conn_label.config(text="Disconnected", fg="#95a5a6")
+        self.security_canvas.itemconfig(self.security_lock, fill="#95a5a6")
+        self.security_canvas.itemconfig(self.security_shackle, outline="#95a5a6")
+        self.ssl_label.config(text="N/A", fg="#95a5a6")
+        self.stats_label.config(text="VMs/CTs: 0 | Running: 0 | Stopped: 0")
+        
+        self.log_activity("Disconnected from Proxmox")
+    
+    def refresh_data(self):
+        """Refresh VM data from Proxmox"""
+        if not self.api or self.is_refreshing:
+            return
+        
+        self.is_refreshing = True
+        
+        def fetch_data_async():
+            try:
+                vm_data = self._fetch_vm_data_parallel()
+                self.root.after(0, lambda: self.update_ui(vm_data, None))
+            except Exception as e:
+                self.root.after(0, lambda: self.update_ui(None, str(e)))
+        
+        thread = Thread(target=fetch_data_async, daemon=True)
+        thread.start()
     
     def _fetch_vm_data_parallel(self):
         """Fetch VM data using simple serial processing"""
@@ -2003,84 +900,174 @@ class ProxmoxDashboard:
         nodes = self.api.get('/nodes')
         self.node_count = len(nodes)
         
-        # Update node count in UI
-        self.root.after(0, lambda: self.node_label.config(text=f"Nodes: {self.node_count}"))
-        
-        # Count total VMs/CTs first for progress
-        total_count = 0
-        for node in nodes:
-            n = node['node']
-            try:
-                vms = self.api.get(f'/nodes/{n}/qemu')
-                total_count += len(vms)
-            except Exception as e:
-                logger.error(f"Error counting VMs from node {n}: {e}")
-            
-            try:
-                cts = self.api.get(f'/nodes/{n}/lxc')
-                total_count += len(cts)
-            except Exception as e:
-                logger.error(f"Error counting CTs from node {n}: {e}")
-        
-        # Process each VM/CT sequentially
-        current = 0
         for node in nodes:
             n = node['node']
             
-            # Get and process VMs
+            # Get VMs
             try:
                 vms = self.api.get(f'/nodes/{n}/qemu')
                 for vm in vms:
-                    current += 1
-                    
-                    try:
-                        vm_info = self.fetch_single_vm_data(node, vm, 'VM')
-                        if vm_info:
-                            vm_data.append(vm_info)
-                    except Exception as e:
-                        logger.error(f"Error getting VM {vm['vmid']}: {e}")
+                    vm_info = self.fetch_single_vm_data(node, vm, 'VM')
+                    if vm_info:
+                        vm_data.append(vm_info)
             except Exception as e:
-                logger.error(f"Error getting VMs from node {n}: {e}")
+                logger.error(f"Error fetching VMs from node {n}: {e}")
             
-            # Get and process Containers
+            # Get containers
             try:
                 cts = self.api.get(f'/nodes/{n}/lxc')
                 for ct in cts:
-                    current += 1
-                    
-                    try:
-                        ct_info = self.fetch_single_vm_data(node, ct, 'CT')
-                        if ct_info:
-                            vm_data.append(ct_info)
-                    except Exception as e:
-                        logger.error(f"Error getting CT {ct['vmid']}: {e}")
+                    ct_info = self.fetch_single_vm_data(node, ct, 'CT')
+                    if ct_info:
+                        vm_data.append(ct_info)
             except Exception as e:
-                logger.error(f"Error getting CTs from node {n}: {e}")
+                logger.error(f"Error fetching CTs from node {n}: {e}")
         
-        vm_data.sort(key=lambda x: x['id'])
         return vm_data
     
-    def on_select(self, event):
-        """Handle tree selection"""
-        selection = self.tree.selection()
-        if not selection:
+    def fetch_single_vm_data(self, node, vm, vm_type):
+        """Fetch detailed data for a single VM/CT"""
+        try:
+            n = node['node']
+            endpoint = 'qemu' if vm_type == 'VM' else 'lxc'
+            vmid = vm['vmid']
+            
+            # Get configuration
+            cfg = self.api.get(f'/nodes/{n}/{endpoint}/{vmid}/config')
+            
+            # Get current status
+            status = vm.get('status', 'unknown')
+            uptime = vm.get('uptime', 0)
+            
+            # Memory info
+            memory_val = cfg.get('memory', 0)
+            if memory_val >= 1024:
+                memory = f"{memory_val / 1024:.1f}GiB"
+            else:
+                memory = f"{memory_val}MiB"
+            
+            # Disk info
+            disk_info = "N/A"
+            if status == 'running':
+                try:
+                    if vm_type == 'VM':
+                        stat = self.api.get(f'/nodes/{n}/qemu/{vmid}/status/current')
+                        disk_used = stat.get('disk', 0)
+                        disk_max = stat.get('maxdisk', 0)
+                        if disk_max > 0:
+                            disk_info = f"{disk_used / (1024**3):.1f}/{disk_max / (1024**3):.1f}GiB"
+                except:
+                    pass
+            
+            # Uptime formatting
+            if uptime > 0:
+                hours, remainder = divmod(uptime, 3600)
+                minutes, seconds = divmod(remainder, 60)
+                uptime_str = f"{int(hours)}h {int(minutes)}m"
+            else:
+                uptime_str = "N/A"
+            
+            return {
+                'id': vmid,
+                'type': vm_type,
+                'status': status,
+                'name': vm.get('name', f'{vm_type}-{vmid}'),
+                'node': n,
+                'cores': cfg.get('cores', 1),
+                'memory': memory,
+                'disk': disk_info,
+                'uptime': uptime_str
+            }
+        
+        except Exception as e:
+            logger.error(f"Error fetching data for {vm_type} {vm.get('vmid')}: {e}")
+            return None
+    
+    def update_ui(self, vm_data, error):
+        """Update UI with fetched data"""
+        self.is_refreshing = False
+        
+        if error:
+            messagebox.showerror("Error", f"Failed to refresh data:\n{error}")
+            logger.error(f"Refresh error: {error}")
             return
         
-        item = self.tree.item(selection[0])
-        values = item['values']
+        if vm_data is not None:
+            self.vm_data = vm_data
+            self.filter_vms()
+            
+            # Update stats
+            total = len(self.vm_data)
+            running = sum(1 for vm in self.vm_data if vm['status'] == 'running')
+            stopped = total - running
+            
+            self.stats_label.config(
+                text=f"VMs/CTs: {total} | Running: {running} | Stopped: {stopped}"
+            )
+            
+            # Update node temperatures
+            self.update_node_temperatures()
+    
+    def filter_vms(self):
+        """Filter VMs based on search term"""
+        search_term = self.search_var.get().lower()
         
-        # Check for expected number of columns (12 total)
-        if not values or len(values) < 12:
-            return
-        
-        status = values[2]
-        
-        if status == 'running':
-            self.stop_btn.config(bg="#27ae60", state=tk.NORMAL)
-            self.start_btn.config(bg="#e74c3c", state=tk.DISABLED)
+        if not search_term:
+            self.filtered_data = self.vm_data
         else:
-            self.start_btn.config(bg="#27ae60", state=tk.NORMAL)
-            self.stop_btn.config(bg="#e74c3c", state=tk.DISABLED)
+            self.filtered_data = [
+                vm for vm in self.vm_data
+                if search_term in str(vm['id']).lower()
+                or search_term in vm['name'].lower()
+                or search_term in vm['node'].lower()
+                or search_term in vm['status'].lower()
+            ]
+        
+        self.populate_tree()
+    
+    def populate_tree(self):
+        """Populate treeview with filtered data"""
+        # Clear existing items
+        for item in self.tree.get_children():
+            self.tree.delete(item)
+        
+        # Add items
+        for idx, vm in enumerate(self.filtered_data):
+            values = (
+                vm['id'],
+                vm['type'],
+                vm['status'],
+                vm['name'],
+                vm['node'],
+                vm['cores'],
+                vm['memory'],
+                vm['disk'],
+                vm['uptime']
+            )
+            
+            # Determine tag
+            if vm['status'] == 'running':
+                tag = 'running'
+            elif vm['status'] == 'stopped':
+                tag = 'stopped'
+            else:
+                tag = 'odd' if idx % 2 == 1 else 'even'
+            
+            self.tree.insert('', tk.END, values=values, tags=(tag,))
+    
+    def sort_by_column(self, col):
+        """Sort treeview by column"""
+        items = [(self.tree.set(item, col), item) for item in self.tree.get_children('')]
+        
+        try:
+            # Try numeric sort
+            items.sort(key=lambda x: float(x[0].split()[0]) if x[0] else 0)
+        except ValueError:
+            # Fall back to string sort
+            items.sort(key=lambda x: x[0].lower())
+        
+        for index, (val, item) in enumerate(items):
+            self.tree.move(item, '', index)
     
     def get_selected_vm(self):
         """Get selected VM/CT"""
@@ -2092,16 +1079,13 @@ class ProxmoxDashboard:
         item = self.tree.item(selection[0])
         values = item['values']
         
-        if not values or len(values) < 1:
-            messagebox.showerror("Error", "Invalid selection")
-            return None
-        
-        vmid = values[0]
-        
-        for vm in self.vm_data:
-            if vm.get('id') == vmid:
-                return vm
-        return None
+        return {
+            'id': values[0],
+            'type': values[1],
+            'status': values[2],
+            'name': values[3],
+            'node': values[4]
+        }
     
     def start_selected(self):
         """Start selected VM/CT"""
@@ -2109,27 +1093,17 @@ class ProxmoxDashboard:
         if not vm:
             return
         
-        self.show_loading(f"Starting {vm['type']} {vm['id']}...")
-        
         def start_vm():
             try:
                 endpoint = 'qemu' if vm['type'] == 'VM' else 'lxc'
                 self.api.post(f"/nodes/{vm['node']}/{endpoint}/{vm['id']}/status/start")
-                AuditLogger.log_vm_action("START", vm['id'], vm['type'], vm['name'], True)
-                return True
+                self.log_activity(f"Started {vm['type']} {vm['id']} ({vm['name']}) on node {vm['node']}")
+                self.root.after(2000, self.refresh_data)
             except Exception as e:
-                AuditLogger.log_vm_action("START", vm['id'], vm['type'], vm['name'], False, str(e))
-                raise
+                self.root.after(0, lambda: messagebox.showerror("Error", f"Failed to start:\n{str(e)}"))
         
-        def start_callback(success, error):
-            self.hide_loading()
-            if error:
-                messagebox.showerror("Error", f"Failed to start:\n{str(error)}")
-            else:
-                self.status_label.config(text=f"Started {vm['type']} {vm['id']} ({vm['name']})")
-                self.root.after(2000, self.refresh_data_async)
-        
-        self.run_async(start_vm, callback=start_callback)
+        thread = Thread(target=start_vm, daemon=True)
+        thread.start()
     
     def stop_selected(self):
         """Stop selected VM/CT"""
@@ -2140,204 +1114,255 @@ class ProxmoxDashboard:
         if not messagebox.askyesno("Confirm", f"Stop {vm['type']} {vm['id']} ({vm['name']})?"):
             return
         
-        self.show_loading(f"Stopping {vm['type']} {vm['id']}...")
-        
         def stop_vm():
             try:
                 endpoint = 'qemu' if vm['type'] == 'VM' else 'lxc'
                 self.api.post(f"/nodes/{vm['node']}/{endpoint}/{vm['id']}/status/stop")
-                AuditLogger.log_vm_action("STOP", vm['id'], vm['type'], vm['name'], True)
-                return True
+                self.log_activity(f"Stopped {vm['type']} {vm['id']} ({vm['name']}) on node {vm['node']}")
+                self.root.after(2000, self.refresh_data)
             except Exception as e:
-                AuditLogger.log_vm_action("STOP", vm['id'], vm['type'], vm['name'], False, str(e))
-                raise
+                self.root.after(0, lambda: messagebox.showerror("Error", f"Failed to stop:\n{str(e)}"))
         
-        def stop_callback(success, error):
-            self.hide_loading()
-            if error:
-                messagebox.showerror("Error", f"Failed to stop:\n{str(error)}")
-            else:
-                self.status_label.config(text=f"Stopped {vm['type']} {vm['id']} ({vm['name']})")
-                self.root.after(2000, self.refresh_data_async)
-        
-        self.run_async(stop_vm, callback=stop_callback)
+        thread = Thread(target=stop_vm, daemon=True)
+        thread.start()
     
     def start_all_stopped(self):
         """Start all stopped VMs/CTs"""
-        stopped = [vm for vm in self.vm_data if vm['status'] != 'running']
+        stopped_vms = [vm for vm in self.vm_data if vm['status'] == 'stopped']
         
-        if not stopped:
-            messagebox.showinfo("Info", "All VMs/CTs are already running")
+        if not stopped_vms:
+            messagebox.showinfo("Info", "No stopped VMs/CTs found")
             return
         
-        if not messagebox.askyesno("Confirm", f"Start {len(stopped)} stopped VMs/CTs?"):
+        if not messagebox.askyesno("Confirm", f"Start {len(stopped_vms)} stopped VMs/CTs?"):
             return
-        
-        self.show_loading(f"Starting {len(stopped)} VMs/CTs...")
         
         def start_all():
-            results = []
-            for vm in stopped:
+            for vm in stopped_vms:
                 try:
                     endpoint = 'qemu' if vm['type'] == 'VM' else 'lxc'
                     self.api.post(f"/nodes/{vm['node']}/{endpoint}/{vm['id']}/status/start")
-                    AuditLogger.log_vm_action("START_ALL", vm['id'], vm['type'], vm['name'], True)
-                    results.append((vm['id'], True))
+                    self.log_activity(f"Started {vm['type']} {vm['id']} ({vm['name']})")
+                    time.sleep(0.5)
                 except Exception as e:
-                    AuditLogger.log_vm_action("START_ALL", vm['id'], vm['type'], vm['name'], False, str(e))
-                    results.append((vm['id'], False))
-            return results
+                    logger.error(f"Failed to start {vm['type']} {vm['id']}: {e}")
+            
+            self.root.after(3000, self.refresh_data)
         
-        def start_all_callback(results, error):
-            self.hide_loading()
-            if error:
-                messagebox.showerror("Error", f"Failed to start all:\n{str(error)}")
-            else:
-                success_count = sum(1 for _, success in results if success)
-                self.status_label.config(text=f"Started {success_count}/{len(stopped)} VMs/CTs")
-                self.root.after(3000, self.refresh_data_async)
-        
-        self.run_async(start_all, callback=start_all_callback)
+        thread = Thread(target=start_all, daemon=True)
+        thread.start()
+    
+    def manual_refresh(self):
+        """Manual refresh button handler"""
+        if self.api:
+            self.log_activity("Manual refresh triggered")
+            self.refresh_data()
     
     def toggle_auto_refresh(self):
-        """Toggle live feed"""
-        self.auto_refresh = not self.auto_refresh
-        self.auto_refresh_var.set(self.auto_refresh)
-        
-        if self.auto_refresh:
-            self.pause_resume_btn.config(
-                text="Pause Live",
-                bg="#e67e22"
-            )
-            self.live_indicator.config(
-                text="LIVE",
-                fg="#27ae60"
-            )
-            # Update LED to green
-            self.update_led_color(self.live_led, "#27ae60")
-            self.status_label.config(text="Live feed enabled")
-            logger.info("Live feed enabled")
+        """Toggle auto-refresh on/off"""
+        if self.auto_refresh_var.get():
+            self.start_auto_refresh()
         else:
-            self.pause_resume_btn.config(
-                text="Resume Live",
-                bg="#27ae60"
-            )
-            self.live_indicator.config(
-                text="PAUSED",
-                fg="#95a5a6"
-            )
-            # Update LED to gray
-            self.update_led_color(self.live_led, "#95a5a6")
-            self.status_label.config(text="Live feed paused")
-            logger.info("Live feed paused")
-    
-    def update_refresh_rate(self):
-        """Update the refresh rate"""
-        new_rate = self.refresh_rate_var.get()
-        logger.info(f"Refresh rate changed to {new_rate} seconds")
-        self.status_label.config(text=f"Update interval set to {new_rate}s")
-        # The new rate will be picked up by the auto-refresh loop
+            self.stop_auto_refresh()
     
     def start_auto_refresh(self):
-        """Start live feed auto-refresh thread"""
-        self.refresh_data_async()
-        
-        def auto_refresh_loop():
-            while True:
-                # Use dynamic refresh rate
-                refresh_interval = self.refresh_rate_var.get()
-                time.sleep(refresh_interval)
-                
-                if self.auto_refresh:
-                    try:
-                        self.root.after(0, self.refresh_data_async)
-                    except Exception:
-                        break
-        
-        self.refresh_thread = threading.Thread(target=auto_refresh_loop, daemon=True)
-        self.refresh_thread.start()
-        logger.info(f"Live feed started with {REFRESH_INTERVAL}s refresh rate")
+        """Start auto-refresh timer"""
+        self.stop_auto_refresh()
+        if self.api:
+            self.refresh_data()
+            interval = self.refresh_rate_var.get() * 1000
+            self.refresh_job = self.root.after(interval, self.start_auto_refresh)
     
-    def on_closing(self):
-        """Handle window close event - cleanup resources"""
-        # Stop auto-refresh to prevent thread from trying to update UI
-        self.auto_refresh = False
-        
-        # Give threads a moment to finish current operations
-        time.sleep(0.5)
-        
-        # Destroy the window
-        self.root.destroy()
+    def stop_auto_refresh(self):
+        """Stop auto-refresh timer"""
+        if self.refresh_job:
+            self.root.after_cancel(self.refresh_job)
+            self.refresh_job = None
     
-    def safe_ui_update(self, callback):
-        """Safely update UI from background thread"""
+    def update_refresh_rate(self, *args):
+        """Update refresh rate"""
+        if self.auto_refresh_var.get():
+            self.start_auto_refresh()
+    
+    # ========================================================================
+    # API TEMPERATURE MONITORING
+    # ========================================================================
+    
+    def check_temperature_api_status(self):
+        """Check which nodes have temperature API available"""
+        if not self.api:
+            return
+        
         try:
-            if self.root.winfo_exists():
-                callback()
-        except tk.TclError:
-            # Window was destroyed, ignore
-            pass
+            nodes = self.api.get('/nodes')
+            available_count = 0
+            
+            for node in nodes:
+                node_name = node['node']
+                try:
+                    result = self.api.get(f'/nodes/{node_name}/temperature?cache=1')
+                    if result.get('status') == 'ok':
+                        available_count += 1
+                        logger.info(f"Temperature API available on {node_name}")
+                except Exception:
+                    logger.info(f"Temperature API not available on {node_name}")
+            
+            if available_count == 0:
+                self.log_activity("Warning: Temperature API not installed on any nodes")
+            else:
+                self.log_activity(f"Temperature API available on {available_count}/{len(nodes)} nodes")
+        
+        except Exception as e:
+            logger.error(f"Failed to check temperature API status: {e}")
+    
+    def get_all_node_temperatures(self):
+        """
+        Get temperature from all nodes via API
+        
+        Returns dict of {node_name: {temp, source, status}}
+        """
+        if not self.api:
+            return {}
+        
+        node_temps = {}
+        refresh_rate = self.refresh_rate_var.get()
+        
+        try:
+            nodes = self.api.get('/nodes')
+        except Exception as e:
+            logger.error(f"Failed to get node list: {e}")
+            return {}
+        
+        # Query each node's temperature API
+        for node in nodes:
+            node_name = node['node']
+            
+            try:
+                result = self.api.get(
+                    f'/nodes/{node_name}/temperature?cache={refresh_rate}'
+                )
+                
+                if result.get('status') == 'ok':
+                    node_temps[node_name] = {
+                        'temp': result['temperature'],
+                        'source': result['source'],
+                        'hwmon': result.get('hwmon', 'unknown'),
+                        'status': 'ok'
+                    }
+                else:
+                    node_temps[node_name] = {
+                        'temp': None,
+                        'source': 'error',
+                        'status': result.get('status', 'unknown_error')
+                    }
+            
+            except Exception as e:
+                logger.debug(f"Temperature API not available for {node_name}: {e}")
+                node_temps[node_name] = {
+                    'temp': None,
+                    'source': 'unavailable',
+                    'status': 'no_api_endpoint'
+                }
+        
+        return node_temps
+    
+    def update_node_temperatures(self):
+        """Update all node temperature displays"""
+        if not self.api:
+            return
+        
+        node_temps = self.get_all_node_temperatures()
+        
+        for node_name, temp_info in node_temps.items():
+            # Create label if doesn't exist
+            if node_name not in self.node_temp_labels:
+                label = tk.Label(
+                    self.node_temp_frame,
+                    font=("Arial", 9, "bold"),
+                    bg="#2c3e50"
+                )
+                label.pack(side=tk.LEFT, padx=8)
+                self.node_temp_labels[node_name] = label
+            
+            # Update display
+            label = self.node_temp_labels[node_name]
+            temp = temp_info.get('temp')
+            
+            if temp is not None:
+                display_text = f"{node_name}: {temp}C"
+                temp_color = self.get_temp_color(temp)
+                label.config(text=display_text, fg=temp_color)
+                
+                # Add tooltip
+                source = temp_info.get('source', 'unknown')
+                hwmon = temp_info.get('hwmon', 'unknown')
+                tooltip = f"Source: {source}\nHwmon: {hwmon}"
+                self._bind_tooltip(label, tooltip)
+            else:
+                label.config(text=f"{node_name}: N/A", fg="#95a5a6")
+                status = temp_info.get('status', 'unknown')
+                if status == 'no_api_endpoint':
+                    tooltip = "Temperature API not installed on this node"
+                else:
+                    tooltip = f"Temperature unavailable\nStatus: {status}"
+                self._bind_tooltip(label, tooltip)
+    
+    def _bind_tooltip(self, widget, text):
+        """Bind tooltip to widget"""
+        def on_enter(event):
+            tooltip = tk.Toplevel()
+            tooltip.wm_overrideredirect(True)
+            tooltip.wm_geometry(f"+{event.x_root+10}+{event.y_root+10}")
+            
+            label = tk.Label(
+                tooltip,
+                text=text,
+                background="#34495e",
+                foreground="#ecf0f1",
+                relief=tk.SOLID,
+                borderwidth=1,
+                font=("Arial", 8),
+                justify=tk.LEFT,
+                padx=5,
+                pady=3
+            )
+            label.pack()
+            
+            widget._tooltip = tooltip
+        
+        def on_leave(event):
+            if hasattr(widget, '_tooltip'):
+                widget._tooltip.destroy()
+                del widget._tooltip
+        
+        # Remove old bindings
+        widget.unbind("<Enter>")
+        widget.unbind("<Leave>")
+        
+        # Add new bindings
+        widget.bind("<Enter>", on_enter)
+        widget.bind("<Leave>", on_leave)
+    
+    def get_temp_color(self, temp):
+        """Get color for temperature value"""
+        if temp is None:
+            return "#95a5a6"  # Gray
+        elif temp < 50:
+            return "#27ae60"  # Green - Cool
+        elif temp < 70:
+            return "#3498db"  # Blue - Normal
+        elif temp < 85:
+            return "#f39c12"  # Orange - Warm
+        else:
+            return "#e74c3c"  # Red - Hot
+
 
 def main():
-    """
-    ═══════════════════════════════════════════════════════════════════════
-    PROXMOX DASHBOARD - VIRTIOFS-ONLY VERSION
-    ═══════════════════════════════════════════════════════════════════════
-    
-    FEATURES:
-    * View all VMs and Containers across all nodes
-    * Start/Stop VMs and Containers
-    * Basic VM information:
-      - ID, Type, Status, Name, Node
-      - CPU cores, sockets, type
-      - Configured memory
-      - Disk size
-      - Free disk space (for running VMs)
-    * Auto-refresh every 3 seconds (configurable 2s-30s)
-    * Search and filter VMs/CTs
-    * Multi-node cluster support
-    * Proxmox HOST temperature monitoring (VirtIO-FS ONLY)
-    
-    TEMPERATURE MONITORING:
-    * VirtIO-FS ONLY: <1ms latency
-    * Dashboard MUST run in Proxmox VM with VirtIO-FS configured
-    * Shows "N/A" if VirtIO-FS not mounted
-    * See docstring at top for VirtIO-FS setup instructions
-    
-    DESIGN PHILOSOPHY:
-    * Simple and straightforward
-    * Fast and lightweight
-    * Only fetches configuration data
-    * No complex metrics or monitoring
-    * Perfect for basic VM management
-    
-    MULTI-NODE SUPPORT:
-    * YES! This script automatically detects and works with ALL nodes
-       in your Proxmox cluster. It fetches the list of nodes from the
-       /nodes API endpoint and processes VMs/CTs from each node.
-    * Node count displayed in the UI
-    * Node name shown for each VM/CT
-    
-    PERFORMANCE:
-    * Very fast - only fetches basic config data
-    * 10 VMs:  ~5-8 seconds
-    * 20 VMs:  ~10-15 seconds
-    * 50 VMs:  ~25-40 seconds
-    * 100 VMs: ~50-80 seconds
-    
-    CONFIGURATION:
-      REFRESH_INTERVAL = 3   # Auto-refresh interval (seconds)
-      MAX_RETRIES = 3        # API retry attempts
-      RETRY_DELAY = 2        # Delay between retries
-    
-    ═══════════════════════════════════════════════════════════════════════
-    """
-    
-    print(__doc__)
-    
+    """Main entry point"""
     root = tk.Tk()
     app = ProxmoxDashboard(root)
     root.mainloop()
 
-if __name__ == '__main__':
+
+if __name__ == "__main__":
     main()
