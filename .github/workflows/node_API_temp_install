@@ -1,19 +1,57 @@
 #!/bin/bash
 # install-proxmox-temp-api.sh
+# Proxmox Temperature API Installation
 # Run this on EACH Proxmox node
+#
+# This installs a temperature endpoint into the Proxmox API:
+#   GET /api2/json/nodes/{node}/temperature
 
 set -e
 
-echo "=== Installing Proxmox Temperature API ==="
+echo "========================================================"
+echo "Proxmox Temperature API Installation"
+echo "========================================================"
 echo ""
+echo "This script will install a temperature API endpoint"
+echo "accessible via the standard Proxmox API:"
+echo ""
+echo "  GET /api2/json/nodes/{node}/temperature"
+echo ""
+echo "Components installed:"
+echo "  1. Temperature reader (Python script)"
+echo "  2. HTTP service (localhost:8899)"
+echo "  3. Systemd service (auto-start)"
+echo "  4. Apache proxy (integrates with Proxmox API)"
+echo ""
+read -p "Continue installation? [y/N] " -n 1 -r
+echo
+if [[ ! $REPLY =~ ^[Yy]$ ]]; then
+    echo "Installation cancelled."
+    exit 0
+fi
 
-# 1. Create temperature reader script
-echo "[1/5] Creating temperature reader script..."
+# Check if running as root
+if [ "$EUID" -ne 0 ]; then
+    echo "ERROR: Please run as root"
+    exit 1
+fi
 
-cat > /usr/local/bin/proxmox-temp-reader.py << 'PYTHON_READER'
+# Check if this is a Proxmox system
+if [ ! -f /etc/pve/.version ]; then
+    echo "ERROR: This doesn't appear to be a Proxmox VE system"
+    exit 1
+fi
+
+echo ""
+echo "========================================================"
+echo "Step 1/5: Installing Temperature Reader"
+echo "========================================================"
+
+cat > /usr/local/bin/proxmox-temp-reader.py << 'PYTHON_READER_EOF'
 #!/usr/bin/env python3
 """
 Robust CPU Temperature Reader with Dynamic Cache
+Handles hwmon device renumbering and multiple CPU sensor types
 """
 import os
 import glob
@@ -22,8 +60,22 @@ import sys
 import time
 
 class CPUTemperatureReader:
-    CPU_SENSOR_NAMES = ['coretemp', 'k10temp', 'zenpower', 'cpu_thermal', 'acpitz']
-    CPU_TEMP_PATTERNS = ['temp1_input', 'temp2_input', 'temp_input', 'package_temp']
+    # Priority order for CPU sensors
+    CPU_SENSOR_NAMES = [
+        'coretemp',     # Intel CPUs
+        'k10temp',      # AMD Ryzen/EPYC
+        'zenpower',     # AMD Zen (alternative driver)
+        'cpu_thermal',  # ARM CPUs
+        'acpitz',       # ACPI thermal zone (fallback)
+    ]
+    
+    # Patterns to identify CPU temp inputs
+    CPU_TEMP_PATTERNS = [
+        'temp1_input',
+        'temp2_input',
+        'temp_input',
+        'package_temp',
+    ]
     
     def __init__(self, cache_timeout=None):
         self.hwmon_base = '/sys/class/hwmon'
@@ -31,12 +83,14 @@ class CPUTemperatureReader:
         self.cache_valid_seconds = cache_timeout if cache_timeout else 30
     
     def find_cpu_sensor(self):
+        """Dynamically find CPU temperature sensor"""
         cached = self._load_cache()
         if cached and self._verify_sensor_exists(cached):
             return cached
         return self._scan_for_cpu_sensor()
     
     def _scan_for_cpu_sensor(self):
+        """Scan hwmon devices for CPU sensor"""
         hwmon_devices = sorted(glob.glob(f'{self.hwmon_base}/hwmon*'))
         
         for hwmon_path in hwmon_devices:
@@ -60,6 +114,7 @@ class CPUTemperatureReader:
         return (None, None, None)
     
     def _find_temp_input(self, hwmon_path):
+        """Find the correct temperature input file"""
         for pattern in self.CPU_TEMP_PATTERNS:
             temp_path = os.path.join(hwmon_path, pattern)
             if os.path.exists(temp_path):
@@ -73,6 +128,7 @@ class CPUTemperatureReader:
         return None
     
     def _verify_sensor_exists(self, cached_sensor):
+        """Verify cached sensor still exists and works"""
         hwmon_path, sensor_name, temp_file = cached_sensor
         try:
             if not os.path.exists(hwmon_path):
@@ -99,6 +155,7 @@ class CPUTemperatureReader:
             return False
     
     def _load_cache(self):
+        """Load cached sensor location"""
         try:
             if not os.path.exists(self.cache_file):
                 return None
@@ -114,6 +171,7 @@ class CPUTemperatureReader:
             return None
     
     def _save_cache(self, sensor_info):
+        """Cache sensor location for faster subsequent reads"""
         hwmon_path, sensor_name, temp_file = sensor_info
         try:
             os.makedirs(os.path.dirname(self.cache_file), exist_ok=True)
@@ -130,6 +188,7 @@ class CPUTemperatureReader:
             pass
     
     def read_temperature(self):
+        """Read CPU temperature"""
         hwmon_path, sensor_name, temp_file = self.find_cpu_sensor()
         
         if not hwmon_path:
@@ -178,35 +237,180 @@ def main():
         print(json.dumps(result))
     else:
         if result['status'] == 'ok':
-            print(f"{result['temperature']}C ({result['source']} @ {result['hwmon']}/{result['file']}) [cache: {result['cache_timeout']}s]")
+            print(f"{result['temperature']}C ({result['source']} @ {result['hwmon']}/{result['file']})")
         else:
             print(f"Error: {result['status']}")
             sys.exit(1)
 
 if __name__ == '__main__':
     main()
-PYTHON_READER
+PYTHON_READER_EOF
 
 chmod +x /usr/local/bin/proxmox-temp-reader.py
+echo "  Installed: /usr/local/bin/proxmox-temp-reader.py"
 
-# 2. Create HTTP service
-echo "[2/5] Creating HTTP service..."
+# Test the reader
+echo ""
+echo "  Testing temperature reader..."
+if /usr/local/bin/proxmox-temp-reader.py; then
+    echo "  Status: OK"
+else
+    echo "  WARNING: No temperature sensors detected"
+    echo "  Temperature monitoring may not work on this system"
+fi
 
-cat > /usr/local/bin/proxmox-temp-service.py << 'PYTHON_SERVICE'
+echo ""
+echo "========================================================"
+echo "Step 2/5: Installing HTTP Service"
+echo "========================================================"
+
+cat > /usr/local/bin/proxmox-temp-service.py << 'PYTHON_SERVICE_EOF'
 #!/usr/bin/env python3
 """
 Proxmox Temperature HTTP Service
+Provides temperature data via HTTP on localhost:8899
+This is proxied through Apache to integrate with Proxmox API
 """
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from urllib.parse import urlparse, parse_qs
 import json
 import sys
 import os
+import glob
+import time
 
-sys.path.insert(0, '/usr/local/bin')
-from proxmox_temp_reader import CPUTemperatureReader
+class CPUTemperatureReader:
+    """CPU Temperature Reader"""
+    CPU_SENSOR_NAMES = ['coretemp', 'k10temp', 'zenpower', 'cpu_thermal', 'acpitz']
+    CPU_TEMP_PATTERNS = ['temp1_input', 'temp2_input', 'temp_input', 'package_temp']
+    
+    def __init__(self, cache_timeout=None):
+        self.hwmon_base = '/sys/class/hwmon'
+        self.cache_file = '/var/cache/proxmox-temp-sensor.cache'
+        self.cache_valid_seconds = cache_timeout if cache_timeout else 30
+    
+    def find_cpu_sensor(self):
+        cached = self._load_cache()
+        if cached and self._verify_sensor_exists(cached):
+            return cached
+        return self._scan_for_cpu_sensor()
+    
+    def _scan_for_cpu_sensor(self):
+        hwmon_devices = sorted(glob.glob(f'{self.hwmon_base}/hwmon*'))
+        for hwmon_path in hwmon_devices:
+            name_file = os.path.join(hwmon_path, 'name')
+            if not os.path.exists(name_file):
+                continue
+            try:
+                with open(name_file, 'r') as f:
+                    sensor_name = f.read().strip()
+                if sensor_name in self.CPU_SENSOR_NAMES:
+                    temp_file = self._find_temp_input(hwmon_path)
+                    if temp_file:
+                        result = (hwmon_path, sensor_name, temp_file)
+                        self._save_cache(result)
+                        return result
+            except (IOError, OSError):
+                continue
+        return (None, None, None)
+    
+    def _find_temp_input(self, hwmon_path):
+        for pattern in self.CPU_TEMP_PATTERNS:
+            temp_path = os.path.join(hwmon_path, pattern)
+            if os.path.exists(temp_path):
+                try:
+                    with open(temp_path, 'r') as f:
+                        value = int(f.read().strip())
+                        if 0 < value < 150000:
+                            return pattern
+                except (IOError, ValueError):
+                    continue
+        return None
+    
+    def _verify_sensor_exists(self, cached_sensor):
+        hwmon_path, sensor_name, temp_file = cached_sensor
+        try:
+            if not os.path.exists(hwmon_path):
+                return False
+            name_file = os.path.join(hwmon_path, 'name')
+            with open(name_file, 'r') as f:
+                current_name = f.read().strip()
+            if current_name != sensor_name:
+                return False
+            temp_path = os.path.join(hwmon_path, temp_file)
+            if not os.path.exists(temp_path):
+                return False
+            with open(temp_path, 'r') as f:
+                value = int(f.read().strip())
+                if not (0 < value < 150000):
+                    return False
+            return True
+        except (IOError, ValueError, OSError):
+            return False
+    
+    def _load_cache(self):
+        try:
+            if not os.path.exists(self.cache_file):
+                return None
+            cache_age = time.time() - os.path.getmtime(self.cache_file)
+            if cache_age > self.cache_valid_seconds:
+                return None
+            with open(self.cache_file, 'r') as f:
+                data = json.load(f)
+                return (data['path'], data['name'], data['file'])
+        except (IOError, json.JSONDecodeError, KeyError):
+            return None
+    
+    def _save_cache(self, sensor_info):
+        hwmon_path, sensor_name, temp_file = sensor_info
+        try:
+            os.makedirs(os.path.dirname(self.cache_file), exist_ok=True)
+            with open(self.cache_file, 'w') as f:
+                json.dump({
+                    'path': hwmon_path,
+                    'name': sensor_name,
+                    'file': temp_file,
+                    'cached_at': time.time(),
+                    'cache_timeout': self.cache_valid_seconds
+                }, f)
+            os.chmod(self.cache_file, 0o644)
+        except (IOError, OSError):
+            pass
+    
+    def read_temperature(self):
+        hwmon_path, sensor_name, temp_file = self.find_cpu_sensor()
+        if not hwmon_path:
+            return {
+                'temperature': None,
+                'source': 'none',
+                'status': 'no_sensor_found',
+                'cache_timeout': self.cache_valid_seconds
+            }
+        try:
+            temp_path = os.path.join(hwmon_path, temp_file)
+            with open(temp_path, 'r') as f:
+                temp_raw = int(f.read().strip())
+            temp_celsius = round(temp_raw / 1000.0, 1)
+            hwmon_num = os.path.basename(hwmon_path)
+            return {
+                'temperature': temp_celsius,
+                'source': sensor_name,
+                'hwmon': hwmon_num,
+                'file': temp_file,
+                'status': 'ok',
+                'cache_timeout': self.cache_valid_seconds
+            }
+        except (IOError, ValueError, OSError) as e:
+            return {
+                'temperature': None,
+                'source': sensor_name,
+                'status': f'read_error: {str(e)}',
+                'cache_timeout': self.cache_valid_seconds
+            }
 
 class TemperatureHandler(BaseHTTPRequestHandler):
+    """HTTP Request Handler"""
+    
     def do_GET(self):
         parsed_url = urlparse(self.path)
         query_params = parse_qs(parsed_url.query)
@@ -224,24 +428,20 @@ class TemperatureHandler(BaseHTTPRequestHandler):
                 reader = CPUTemperatureReader(cache_timeout=cache_timeout)
                 result = reader.read_temperature()
                 
+                # Wrap in 'data' to match Proxmox API format
+                response = {'data': result}
+                
                 self.send_response(200)
                 self.send_header('Content-Type', 'application/json')
-                self.send_header('Access-Control-Allow-Origin', '*')
                 self.send_header('Cache-Control', f'max-age={result.get("cache_timeout", 30)}')
                 self.end_headers()
-                
-                self.wfile.write(json.dumps(result).encode())
+                self.wfile.write(json.dumps(response).encode())
             
             except Exception as e:
                 self.send_response(500)
                 self.send_header('Content-Type', 'application/json')
                 self.end_headers()
-                
-                error_response = {
-                    'temperature': None,
-                    'source': 'none',
-                    'status': f'error: {str(e)}'
-                }
+                error_response = {'data': {'temperature': None, 'status': f'error: {str(e)}'}}
                 self.wfile.write(json.dumps(error_response).encode())
         
         elif parsed_url.path == '/health':
@@ -255,11 +455,11 @@ class TemperatureHandler(BaseHTTPRequestHandler):
             self.end_headers()
     
     def log_message(self, format, *args):
-        pass
+        pass  # Suppress access logs
 
 def main():
     server = HTTPServer(('127.0.0.1', 8899), TemperatureHandler)
-    print("Proxmox Temperature API listening on localhost:8899")
+    print("Proxmox Temperature Service listening on localhost:8899")
     try:
         server.serve_forever()
     except KeyboardInterrupt:
@@ -267,22 +467,17 @@ def main():
 
 if __name__ == '__main__':
     main()
-PYTHON_SERVICE
+PYTHON_SERVICE_EOF
 
 chmod +x /usr/local/bin/proxmox-temp-service.py
+echo "  Installed: /usr/local/bin/proxmox-temp-service.py"
 
-# 3. Test the temperature reader
-echo "[3/5] Testing temperature reader..."
-if /usr/local/bin/proxmox-temp-reader.py; then
-    echo "  Temperature reader: OK"
-else
-    echo "  WARNING: Temperature reader failed - check your hardware"
-fi
+echo ""
+echo "========================================================"
+echo "Step 3/5: Creating Systemd Service"
+echo "========================================================"
 
-# 4. Create systemd service
-echo "[4/5] Creating systemd service..."
-
-cat > /etc/systemd/system/proxmox-temp-api.service << 'SYSTEMD_UNIT'
+cat > /etc/systemd/system/proxmox-temp-api.service << 'SYSTEMD_EOF'
 [Unit]
 Description=Proxmox Temperature API Service
 After=network.target
@@ -295,6 +490,8 @@ RestartSec=10
 User=root
 StandardOutput=journal
 StandardError=journal
+
+# Security hardening
 NoNewPrivileges=true
 PrivateTmp=true
 ProtectSystem=strict
@@ -303,57 +500,112 @@ ReadWritePaths=/var/cache
 
 [Install]
 WantedBy=multi-user.target
-SYSTEMD_UNIT
+SYSTEMD_EOF
+
+echo "  Created: /etc/systemd/system/proxmox-temp-api.service"
 
 systemctl daemon-reload
 systemctl enable proxmox-temp-api.service
 systemctl start proxmox-temp-api.service
 
-# 5. Test HTTP service
-echo "[5/5] Testing HTTP service..."
-sleep 2
-if curl -s http://localhost:8899/temperature | grep -q "temperature"; then
-    echo "  HTTP service: OK"
-else
-    echo "  WARNING: HTTP service test failed"
-    systemctl status proxmox-temp-api.service
-fi
+echo "  Service enabled and started"
 
-# 6. Optional: Integrate with Proxmox API
 echo ""
-read -p "Integrate with Proxmox API (allows dashboard to use standard API)? [y/N] " -n 1 -r
-echo
-if [[ $REPLY =~ ^[Yy]$ ]]; then
-    echo "Configuring Apache proxy..."
-    
-    cat > /etc/apache2/conf-available/proxmox-temp-api.conf << 'APACHE_CONF'
-# Custom Temperature API Endpoint
-<Location /api2/json/nodes/*/temperature>
+echo "========================================================"
+echo "Step 4/5: Configuring Proxmox API Integration"
+echo "========================================================"
+
+# Enable Apache proxy module
+a2enmod proxy_http > /dev/null 2>&1 || true
+
+# Create Apache configuration
+cat > /etc/apache2/conf-available/proxmox-temp-api.conf << 'APACHE_EOF'
+# Proxmox Temperature API Endpoint
+# Integrates temperature service with Proxmox API
+# Endpoint: /api2/json/nodes/*/temperature
+
+<LocationMatch "^/api2/json/nodes/[^/]+/temperature$">
     ProxyPass http://127.0.0.1:8899/temperature
     ProxyPassReverse http://127.0.0.1:8899/temperature
-    AuthType PVE
-    Require valid-user
-</Location>
-APACHE_CONF
-    
-    a2enmod proxy_http 2>/dev/null || true
-    a2enconf proxmox-temp-api
-    systemctl reload apache2
-    
-    echo "  Apache integration: OK"
+</LocationMatch>
+APACHE_EOF
+
+echo "  Created: /etc/apache2/conf-available/proxmox-temp-api.conf"
+
+# Enable configuration
+a2enconf proxmox-temp-api > /dev/null 2>&1
+
+# Reload Apache
+systemctl reload apache2
+
+echo "  Apache proxy configured and reloaded"
+
+echo ""
+echo "========================================================"
+echo "Step 5/5: Testing Installation"
+echo "========================================================"
+
+sleep 2
+
+# Test internal service
+echo ""
+echo "  Testing internal service (localhost:8899)..."
+if curl -s http://localhost:8899/health > /dev/null 2>&1; then
+    echo "    Health check: OK"
+    TEMP_RESULT=$(curl -s http://localhost:8899/temperature)
+    TEMP_VALUE=$(echo "$TEMP_RESULT" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('data',{}).get('temperature','N/A'))" 2>/dev/null || echo "N/A")
+    echo "    Temperature: ${TEMP_VALUE}°C"
+else
+    echo "    WARNING: Internal service not responding"
+    systemctl status proxmox-temp-api.service --no-pager
+fi
+
+# Test via Proxmox API
+echo ""
+echo "  Testing via Proxmox API..."
+NODE_NAME=$(hostname)
+API_TEST=$(curl -sk "https://localhost:8006/api2/json/nodes/${NODE_NAME}/temperature" 2>/dev/null)
+if echo "$API_TEST" | grep -q '"status"'; then
+    echo "    API endpoint: OK"
+    API_TEMP=$(echo "$API_TEST" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('data',{}).get('temperature','N/A'))" 2>/dev/null || echo "N/A")
+    echo "    Temperature via API: ${API_TEMP}°C"
+else
+    echo "    Note: API test requires authentication"
+    echo "    Use 'pvesh get /nodes/${NODE_NAME}/temperature' to test with auth"
 fi
 
 echo ""
-echo "=== Installation Complete! ==="
+echo "========================================================"
+echo "Installation Complete!"
+echo "========================================================"
 echo ""
-echo "Test commands:"
-echo "  Direct:  curl http://localhost:8899/temperature"
-echo "  Health:  curl http://localhost:8899/health"
-if [[ $REPLY =~ ^[Yy]$ ]]; then
-    echo "  Via API: pvesh get /nodes/\$(hostname)/temperature"
-fi
+echo "The temperature API is now available at:"
+echo "  /api2/json/nodes/${NODE_NAME}/temperature"
+echo ""
+echo "Test with pvesh:"
+echo "  pvesh get /nodes/${NODE_NAME}/temperature"
+echo ""
+echo "Test with curl (requires API token):"
+echo "  curl -k -H 'Authorization: PVEAPIToken=USER@REALM!TOKEN=SECRET' \\"
+echo "       https://$(hostname):8006/api2/json/nodes/${NODE_NAME}/temperature"
+echo ""
+echo "Response format:"
+echo "  {\"data\":{\"temperature\":45.0,\"source\":\"coretemp\",\"status\":\"ok\"}}"
 echo ""
 echo "Service management:"
-echo "  Status:  systemctl status proxmox-temp-api"
-echo "  Logs:    journalctl -u proxmox-temp-api -f"
+echo "  systemctl status proxmox-temp-api"
+echo "  systemctl restart proxmox-temp-api"
+echo "  journalctl -u proxmox-temp-api -f"
+echo ""
+echo "Files installed:"
+echo "  /usr/local/bin/proxmox-temp-reader.py"
+echo "  /usr/local/bin/proxmox-temp-service.py"
+echo "  /etc/systemd/system/proxmox-temp-api.service"
+echo "  /etc/apache2/conf-available/proxmox-temp-api.conf"
+echo ""
+echo "These files survive Proxmox updates!"
+echo ""
+echo "========================================================"
+echo "NEXT: Install this script on ALL other Proxmox nodes"
+echo "========================================================"
 echo ""
