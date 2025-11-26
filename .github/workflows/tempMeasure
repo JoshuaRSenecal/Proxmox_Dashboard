@@ -8,14 +8,20 @@ FEATURES:
 - Live data feed with 3-second default refresh (configurable 2s-30s)
 - Pause/Resume live feed
 - Host laptop/PC temperature monitoring
-- Proxmox NODE temperature monitoring via API (NEW!)
+- Proxmox NODE temperature monitoring via Proxmox API
 - API Token authentication only (more secure than passwords)
 - Master password protects locally stored credentials
 - All passwords obscured during entry (anti-shoulder surfing)
 - Mandatory SSL/TLS certificate verification for secure connections
 - Graphical status indicators (LED indicators and colored rows)
 
-Version: 2.3 - With Node Temperature API Monitoring
+Version: 2.3 - With Node Temperature Monitoring via Proxmox API
+
+INSTALLATION:
+1. Install temperature API on each Proxmox node:
+   bash install-proxmox-temp-api.sh
+   
+2. Run this dashboard on your laptop/PC
 """
 
 import tkinter as tk
@@ -1157,7 +1163,7 @@ class ProxmoxDashboard:
             for node in nodes:
                 node_name = node['node']
                 try:
-                    result = self.api.get(f'/nodes/{node_name}/temperature?cache=1')
+                    result = self.api.get(f'/nodes/{node_name}/temperature')
                     if isinstance(result, dict) and result.get('status') == 'ok':
                         available_count += 1
                         self.node_temp_api_available[node_name] = True
@@ -1179,7 +1185,7 @@ class ProxmoxDashboard:
     
     def get_all_node_temperatures(self):
         """
-        Get temperature from all nodes via API
+        Get temperature from all nodes via Proxmox API
         
         Returns dict of {node_name: {temp, source, status}}
         """
@@ -1200,9 +1206,7 @@ class ProxmoxDashboard:
             node_name = node['node']
             
             try:
-                result = self.api.get(
-                    f'/nodes/{node_name}/temperature?cache={refresh_rate}'
-                )
+                result = self.api.get(f'/nodes/{node_name}/temperature?cache={refresh_rate}')
                 
                 if isinstance(result, dict) and result.get('status') == 'ok':
                     node_temps[node_name] = {
@@ -2452,13 +2456,15 @@ def main():
     * Search and filter VMs/CTs
     * Multi-node cluster support
     * Host temperature monitoring (local machine)
-    * NODE temperature monitoring via API (NEW!)
+    * NODE temperature monitoring via Proxmox API
     
     NODE TEMPERATURE API:
-    * Monitors temperatures from each Proxmox node via custom API
+    * Monitors temperatures from each Proxmox node via Proxmox API
+    * Endpoint: /api2/json/nodes/{node}/temperature
     * Displays color-coded temperatures (green/blue/orange/red)
     * Hover tooltips show temperature source and hwmon info
-    * Requires temperature API plugin installed on Proxmox nodes
+    * Requires temperature API installed on Proxmox nodes
+    * Install on each node: bash install-proxmox-temp-api.sh
     * Falls back gracefully if API not available
     
     MULTI-NODE SUPPORT:
