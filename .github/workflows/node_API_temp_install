@@ -79,7 +79,7 @@ class CPUTemperatureReader:
     
     def __init__(self, cache_timeout=None):
         self.hwmon_base = '/sys/class/hwmon'
-        self.cache_file = '/var/cache/proxmox-temp-sensor.cache'
+        self.cache_file = '/var/cache/proxmox-temp/sensor.cache'
         self.cache_valid_seconds = cache_timeout if cache_timeout else 30
     
     def find_cpu_sensor(self):
@@ -286,7 +286,7 @@ class CPUTemperatureReader:
     
     def __init__(self, cache_timeout=None):
         self.hwmon_base = '/sys/class/hwmon'
-        self.cache_file = '/var/cache/proxmox-temp-sensor.cache'
+        self.cache_file = '/var/cache/proxmox-temp/sensor.cache'
         self.cache_valid_seconds = cache_timeout if cache_timeout else 30
     
     def find_cpu_sensor(self):
@@ -470,12 +470,30 @@ if __name__ == '__main__':
 PYTHON_SERVICE_EOF
 
 chmod +x /usr/local/bin/proxmox-temp-service.py
-echo "  Installed: /usr/local/bin/proxmox-temp-service.py"
+echo "  Created: /usr/local/bin/proxmox-temp-service.py"
 
 echo ""
 echo "========================================================"
-echo "Step 3/5: Creating Systemd Service"
+echo "Step 3/5: Creating Service User and Systemd Service"
 echo "========================================================"
+
+# Create unprivileged user for the service
+if ! id "proxmox-temp" &>/dev/null; then
+    useradd --system --no-create-home --shell /usr/sbin/nologin proxmox-temp
+    echo "  Created user: proxmox-temp"
+else
+    echo "  User proxmox-temp already exists"
+fi
+
+# Create cache directory with proper permissions
+mkdir -p /var/cache/proxmox-temp
+chown proxmox-temp:proxmox-temp /var/cache/proxmox-temp
+chmod 755 /var/cache/proxmox-temp
+echo "  Created cache directory: /var/cache/proxmox-temp"
+
+# Update the cache path in the service script
+sed -i "s|/var/cache/proxmox-temp/sensor.cache|/var/cache/proxmox-temp/sensor.cache|g" /usr/local/bin/proxmox-temp-service.py
+sed -i "s|/var/cache/proxmox-temp/sensor.cache|/var/cache/proxmox-temp/sensor.cache|g" /usr/local/bin/proxmox-temp-reader.py
 
 cat > /etc/systemd/system/proxmox-temp-api.service << 'SYSTEMD_EOF'
 [Unit]
@@ -487,7 +505,12 @@ Type=simple
 ExecStart=/usr/bin/python3 /usr/local/bin/proxmox-temp-service.py
 Restart=always
 RestartSec=10
-User=root
+
+# Run as unprivileged user
+User=proxmox-temp
+Group=proxmox-temp
+
+# Logging
 StandardOutput=journal
 StandardError=journal
 
@@ -496,7 +519,12 @@ NoNewPrivileges=true
 PrivateTmp=true
 ProtectSystem=strict
 ProtectHome=true
-ReadWritePaths=/var/cache
+ReadWritePaths=/var/cache/proxmox-temp
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
 
 [Install]
 WantedBy=multi-user.target
