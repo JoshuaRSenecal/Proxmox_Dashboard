@@ -942,12 +942,15 @@ class ProxmoxDashboard:
             self.root.destroy()
             return
         
-        # Check temperature API availability on nodes (NEW)
+        # Start task processor FIRST (before any async operations)
+        self.start_task_processor()
+        
+        # Check temperature API availability on nodes (runs async, non-blocking)
         self.check_temperature_api_status()
         
+        # Start auto-refresh and health check
         self.start_auto_refresh()
         self.start_health_check()
-        self.start_task_processor()
     
     def setup_styles(self):
         style = ttk.Style()
@@ -1152,40 +1155,83 @@ class ProxmoxDashboard:
     # ========================================================================
     
     def check_temperature_api_status(self):
-        """Check which nodes have temperature API available"""
+        """
+        Check which nodes have temperature API available.
+        This runs in a background thread to avoid blocking the UI.
+        Checks all nodes in parallel for faster results.
+        """
         if not self.api:
             return
         
-        try:
-            nodes = self.api.get('/nodes')
-            available_count = 0
+        def check_async():
+            try:
+                nodes = self.api.get('/nodes')
+                
+                # Check all nodes in parallel using ThreadPoolExecutor
+                from concurrent.futures import ThreadPoolExecutor, as_completed
+                
+                def check_node(node_name):
+                    try:
+                        result = self._get_node_temperature_quick(node_name, timeout=1.5)
+                        if result and result.get('status') == 'ok':
+                            return node_name, True
+                        return node_name, False
+                    except Exception:
+                        return node_name, False
+                
+                with ThreadPoolExecutor(max_workers=min(len(nodes), 5)) as executor:
+                    futures = {executor.submit(check_node, node['node']): node['node'] for node in nodes}
+                    
+                    for future in as_completed(futures, timeout=5):
+                        try:
+                            node_name, available = future.result()
+                            self.node_temp_api_available[node_name] = available
+                            if available:
+                                logger.info(f"Temperature API available on {node_name}")
+                            else:
+                                logger.debug(f"Temperature API not available on {node_name}")
+                        except Exception:
+                            node_name = futures[future]
+                            self.node_temp_api_available[node_name] = False
+                
+                available_count = sum(1 for v in self.node_temp_api_available.values() if v)
+                if available_count == 0:
+                    logger.info("Temperature API not installed on any nodes (this is optional)")
+                else:
+                    logger.info(f"Temperature API available on {available_count}/{len(nodes)} nodes")
             
-            for node in nodes:
-                node_name = node['node']
-                try:
-                    result = self.api.get(f'/nodes/{node_name}/temperature')
-                    if isinstance(result, dict) and result.get('status') == 'ok':
-                        available_count += 1
-                        self.node_temp_api_available[node_name] = True
-                        logger.info(f"Temperature API available on {node_name}")
-                    else:
-                        self.node_temp_api_available[node_name] = False
-                        logger.info(f"Temperature API not available on {node_name}")
-                except Exception:
-                    self.node_temp_api_available[node_name] = False
-                    logger.info(f"Temperature API not available on {node_name}")
-            
-            if available_count == 0:
-                logger.warning("Temperature API not installed on any nodes")
-            else:
-                logger.info(f"Temperature API available on {available_count}/{len(nodes)} nodes")
+            except Exception as e:
+                logger.error(f"Failed to check temperature API status: {e}")
         
-        except Exception as e:
-            logger.error(f"Failed to check temperature API status: {e}")
+        # Run in background thread
+        thread = threading.Thread(target=check_async, daemon=True)
+        thread.start()
+    
+    def _get_node_temperature_quick(self, node_name, timeout=2):
+        """
+        Quick temperature check with short timeout.
+        Returns None if API not available or timeout.
+        """
+        try:
+            # Use requests directly with short timeout instead of self.api.get()
+            url = f"{self.api.base}/nodes/{node_name}/temperature"
+            response = self.api.session.get(
+                url,
+                headers=self.api.headers,
+                verify=self.api.verify,
+                timeout=timeout
+            )
+            if response.status_code == 200:
+                data = response.json()
+                return data.get('data', {})
+            return None
+        except Exception:
+            return None
     
     def get_all_node_temperatures(self):
         """
-        Get temperature from all nodes via Proxmox API
+        Get temperature from all nodes via Proxmox API.
+        Uses short timeout, skips unavailable nodes, runs checks in parallel.
         
         Returns dict of {node_name: {temp, source, status}}
         """
@@ -1193,7 +1239,6 @@ class ProxmoxDashboard:
             return {}
         
         node_temps = {}
-        refresh_rate = self.refresh_rate_var.get()
         
         try:
             nodes = self.api.get('/nodes')
@@ -1201,44 +1246,81 @@ class ProxmoxDashboard:
             logger.error(f"Failed to get node list: {e}")
             return {}
         
-        # Query each node's temperature API
+        # Separate nodes into available and unavailable
+        nodes_to_check = []
         for node in nodes:
             node_name = node['node']
-            
-            try:
-                result = self.api.get(f'/nodes/{node_name}/temperature?cache={refresh_rate}')
-                
-                if isinstance(result, dict) and result.get('status') == 'ok':
-                    node_temps[node_name] = {
-                        'temp': result.get('temperature'),
-                        'source': result.get('source', 'unknown'),
-                        'hwmon': result.get('hwmon', 'unknown'),
-                        'status': 'ok'
-                    }
-                else:
-                    node_temps[node_name] = {
-                        'temp': None,
-                        'source': 'error',
-                        'status': result.get('status', 'unknown_error') if isinstance(result, dict) else 'invalid_response'
-                    }
-            
-            except Exception as e:
-                logger.debug(f"Temperature API not available for {node_name}: {e}")
+            if node_name in self.node_temp_api_available and not self.node_temp_api_available[node_name]:
                 node_temps[node_name] = {
                     'temp': None,
                     'source': 'unavailable',
-                    'status': 'no_api_endpoint'
+                    'status': 'not_installed'
                 }
+            else:
+                nodes_to_check.append(node_name)
+        
+        # Query available nodes in parallel
+        if nodes_to_check:
+            from concurrent.futures import ThreadPoolExecutor, as_completed
+            
+            def fetch_temp(node_name):
+                try:
+                    result = self._get_node_temperature_quick(node_name, timeout=1.5)
+                    if result and result.get('status') == 'ok':
+                        return node_name, {
+                            'temp': result.get('temperature'),
+                            'source': result.get('source', 'unknown'),
+                            'hwmon': result.get('hwmon', 'unknown'),
+                            'status': 'ok'
+                        }, True
+                    else:
+                        return node_name, {
+                            'temp': None,
+                            'source': 'error',
+                            'status': result.get('status', 'unknown_error') if result else 'no_response'
+                        }, False
+                except Exception:
+                    return node_name, {
+                        'temp': None,
+                        'source': 'unavailable',
+                        'status': 'no_api_endpoint'
+                    }, False
+            
+            with ThreadPoolExecutor(max_workers=min(len(nodes_to_check), 5)) as executor:
+                futures = {executor.submit(fetch_temp, n): n for n in nodes_to_check}
+                
+                for future in as_completed(futures, timeout=5):
+                    try:
+                        node_name, temp_data, available = future.result()
+                        node_temps[node_name] = temp_data
+                        self.node_temp_api_available[node_name] = available
+                    except Exception:
+                        node_name = futures[future]
+                        node_temps[node_name] = {
+                            'temp': None,
+                            'source': 'unavailable',
+                            'status': 'timeout'
+                        }
+                        self.node_temp_api_available[node_name] = False
         
         return node_temps
     
     def update_node_temperatures(self):
-        """Update all node temperature displays"""
+        """Update all node temperature displays in background thread"""
         if not self.api:
             return
         
-        node_temps = self.get_all_node_temperatures()
+        def update_async():
+            node_temps = self.get_all_node_temperatures()
+            # Schedule UI updates on main thread
+            self.root.after(0, lambda: self._update_temp_ui(node_temps))
         
+        # Run in background to not block UI
+        thread = threading.Thread(target=update_async, daemon=True)
+        thread.start()
+    
+    def _update_temp_ui(self, node_temps):
+        """Update temperature UI elements (must run on main thread)"""
         for node_name, temp_info in node_temps.items():
             # Create label if doesn't exist
             if node_name not in self.node_temp_labels:
@@ -1267,8 +1349,8 @@ class ProxmoxDashboard:
             else:
                 label.config(text=f"{node_name}: N/A", fg="#95a5a6")
                 status = temp_info.get('status', 'unknown')
-                if status == 'no_api_endpoint':
-                    tooltip = "Temperature API not installed on this node"
+                if status in ('no_api_endpoint', 'not_installed'):
+                    tooltip = "Temperature API not installed\nRun install-proxmox-temp-api.sh on this node"
                 else:
                     tooltip = f"Temperature unavailable\nStatus: {status}"
                 self._bind_tooltip(label, tooltip)
