@@ -1,0 +1,102 @@
+#!/bin/bash
+# backup-before-temp-api.sh
+# Creates a backup and generates a revert script
+
+BACKUP_DIR="/root/temp-api-backup-$(date +%Y%m%d-%H%M%S)"
+mkdir -p "$BACKUP_DIR"
+
+echo "Creating backup in $BACKUP_DIR..."
+
+# Backup existing files (if they exist)
+echo "Checking for existing files..."
+
+FILES_TO_CHECK=(
+    "/usr/local/bin/proxmox-temp-reader.py"
+    "/usr/local/bin/proxmox-temp-service.py"
+    "/etc/systemd/system/proxmox-temp-api.service"
+    "/etc/apache2/conf-available/proxmox-temp-api.conf"
+)
+
+for file in "${FILES_TO_CHECK[@]}"; do
+    if [ -f "$file" ]; then
+        echo "  Backing up: $file"
+        cp -p "$file" "$BACKUP_DIR/"
+    fi
+done
+
+# Check service status
+echo "Checking service status..."
+if systemctl list-unit-files | grep -q proxmox-temp-api; then
+    systemctl is-enabled proxmox-temp-api.service > "$BACKUP_DIR/service-was-enabled.txt" 2>&1 || true
+    systemctl is-active proxmox-temp-api.service > "$BACKUP_DIR/service-was-active.txt" 2>&1 || true
+fi
+
+# Check Apache config status
+if [ -f "/etc/apache2/conf-available/proxmox-temp-api.conf" ]; then
+    if [ -L "/etc/apache2/conf-enabled/proxmox-temp-api.conf" ]; then
+        echo "enabled" > "$BACKUP_DIR/apache-conf-was-enabled.txt"
+    fi
+fi
+
+# Create automatic revert script
+cat > "$BACKUP_DIR/REVERT.sh" << 'EOF'
+#!/bin/bash
+# Automatic revert script
+# Generated during backup
+
+echo "=== Reverting Temperature API Installation ==="
+
+# Stop and disable service
+echo "Stopping service..."
+systemctl stop proxmox-temp-api.service 2>/dev/null || true
+systemctl disable proxmox-temp-api.service 2>/dev/null || true
+
+# Remove files
+echo "Removing installed files..."
+rm -f /usr/local/bin/proxmox-temp-reader.py
+rm -f /usr/local/bin/proxmox-temp-service.py
+rm -f /etc/systemd/system/proxmox-temp-api.service
+rm -f /var/cache/proxmox-temp-sensor.cache
+
+# Disable Apache config
+echo "Removing Apache config..."
+a2disconf proxmox-temp-api 2>/dev/null || true
+rm -f /etc/apache2/conf-available/proxmox-temp-api.conf
+
+# Reload services
+systemctl daemon-reload
+systemctl reload apache2 2>/dev/null || true
+
+echo ""
+echo "=== Revert Complete ==="
+echo "The temperature API has been removed."
+echo ""
+EOF
+
+chmod +x "$BACKUP_DIR/REVERT.sh"
+
+# Create status file
+cat > "$BACKUP_DIR/README.txt" << EOF
+Temperature API Installation Backup
+Created: $(date)
+Location: $BACKUP_DIR
+
+To revert changes:
+    cd $BACKUP_DIR
+    ./REVERT.sh
+
+Files backed up:
+$(ls -lh $BACKUP_DIR/)
+
+System state before installation:
+$(cat "$BACKUP_DIR/service-was-enabled.txt" 2>/dev/null || echo "Service did not exist")
+EOF
+
+echo ""
+echo "=== Backup Complete ==="
+echo "Location: $BACKUP_DIR"
+echo ""
+echo "To revert after installation:"
+echo "  cd $BACKUP_DIR"
+echo "  ./REVERT.sh"
+echo ""
