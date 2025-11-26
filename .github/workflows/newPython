@@ -4,6 +4,7 @@ Proxmox VM/Container Dashboard with API Temperature Monitoring
 
 Version: 2.2 - SSL Required
 Security: SSL certificate verification is MANDATORY
+Temperature: API-based monitoring from all nodes
 """
 
 import tkinter as tk
@@ -70,7 +71,7 @@ class ProxmoxAPI:
                 "To fix this, you have two options:\n"
                 "1. Install a valid SSL certificate on your Proxmox server (recommended)\n"
                 "2. Add your Proxmox self-signed certificate to your system's trusted certificates\n\n"
-                "See the documentation for detailed instructions."
+                "Click 'SSL Help' in the connection dialog for detailed instructions."
             )
         except requests.exceptions.RequestException as e:
             logger.error(f"API request failed: {e}")
@@ -92,7 +93,7 @@ class ProxmoxAPI:
                 "To fix this, you have two options:\n"
                 "1. Install a valid SSL certificate on your Proxmox server (recommended)\n"
                 "2. Add your Proxmox self-signed certificate to your system's trusted certificates\n\n"
-                "See the documentation for detailed instructions."
+                "Click 'SSL Help' in the connection dialog for detailed instructions."
             )
         except requests.exceptions.RequestException as e:
             logger.error(f"API request failed: {e}")
@@ -441,8 +442,6 @@ class ProxmoxDashboard:
             bg="#2c3e50",
             fg="#bdc3c7"
         ).pack(side=tk.LEFT, padx=5)
-        
-        # Temperature labels will be created dynamically
     
     def create_main_content(self):
         """Create main content area with VM list and search"""
@@ -724,32 +723,44 @@ If you receive an SSL error, your Proxmox server likely uses a self-signed certi
 SOLUTIONS:
 
 Option 1: Install Valid Certificate (Recommended)
-- Use Let's Encrypt (free): certbot --apache
-- Provides automatic certificate renewal
-- Most secure option
+  Use Let's Encrypt (free and automatic):
+    apt install certbot
+    certbot --apache -d proxmox.yourdomain.com
+  
+  Provides automatic certificate renewal and highest security.
 
 Option 2: Add Self-Signed Certificate to Trusted Store
-- Download certificate from Proxmox
-- Add to your operating system's trusted certificates
-- See documentation for platform-specific instructions
+  Download certificate from Proxmox and add to your OS trusted certificates.
 
 LINUX:
+  # Download certificate
   openssl s_client -connect PROXMOX_HOST:8006 -showcerts < /dev/null 2>/dev/null | openssl x509 -outform PEM > proxmox.pem
+  
+  # Add to trusted certificates
   sudo cp proxmox.pem /usr/local/share/ca-certificates/proxmox.crt
   sudo update-ca-certificates
 
 MACOS:
+  # Download certificate first (same as Linux)
+  # Then add to keychain
   sudo security add-trusted-cert -d -r trustRoot -k /Library/Keychains/System.keychain proxmox.pem
 
 WINDOWS:
-  Import certificate via certmgr.msc into "Trusted Root Certification Authorities"
+  1. Download certificate using OpenSSL or browser
+  2. Open certmgr.msc (Certificate Manager)
+  3. Navigate to: Trusted Root Certification Authorities > Certificates
+  4. Right-click > All Tasks > Import
+  5. Select the proxmox.pem file
+  6. Complete the import wizard
 
-For detailed instructions, see the documentation.
+After adding the certificate, restart this dashboard application.
+
+For detailed instructions and troubleshooting, consult the Proxmox documentation.
 """
         
         help_dialog = tk.Toplevel(self.root)
         help_dialog.title("SSL Certificate Help")
-        help_dialog.geometry("700x500")
+        help_dialog.geometry("700x550")
         help_dialog.configure(bg="#2c3e50")
         help_dialog.transient(self.root)
         
