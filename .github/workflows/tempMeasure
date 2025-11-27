@@ -1265,29 +1265,9 @@ class ProxmoxDashboard:
         )
         self.node_label.pack()
         
-        # Row 2: Host Temperature and Last update
-        temp_frame = tk.Frame(self.status_frame, bg="#2c3e50")
-        temp_frame.grid(row=2, column=0, sticky="w", padx=5, pady=3)
-        
-        tk.Label(
-            temp_frame,
-            text="Host Temp:",
-            font=("Arial", 10),
-            bg="#2c3e50",
-            fg="#bdc3c7"
-        ).pack(side=tk.LEFT, padx=(0, 5))
-        
-        self.temp_label = tk.Label(
-            temp_frame,
-            text="--",
-            font=("Arial", 10, "bold"),
-            bg="#2c3e50",
-            fg="#95a5a6"
-        )
-        self.temp_label.pack(side=tk.LEFT)
-        
+        # Row 2: Last update
         update_frame = tk.Frame(self.status_frame, bg="#2c3e50")
-        update_frame.grid(row=2, column=1, sticky="w", padx=15, pady=3)
+        update_frame.grid(row=2, column=0, sticky="w", padx=5, pady=3, columnspan=2)
         
         self.last_update_label = tk.Label(
             update_frame,
@@ -1950,12 +1930,6 @@ class ProxmoxDashboard:
                 
                 self.connection_label.config(text="Connected", fg="#27ae60")
                 self.update_led_color(self.connection_led, "#27ae60")
-                
-                # Update host temperature
-                temp, zone = self.get_host_temperature()
-                temp_text = self.format_temperature(temp, zone)
-                temp_color = self.get_temp_color(temp)
-                self.temp_label.config(text=temp_text, fg=temp_color)
                 
                 # Update node temperatures (NEW)
                 self.update_node_temperatures()
