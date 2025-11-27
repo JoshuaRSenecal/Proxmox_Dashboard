@@ -1,28 +1,6 @@
 #!/usr/bin/env python3
-"""
-Proxmox Dashboard - Live Data Feed Edition with Node Temperature Monitoring
-Near-constant live updates for real-time VM/Container monitoring
-SUPPORTS MULTIPLE PROXMOX NODES
-
-FEATURES:
-- Live data feed with 3-second default refresh (configurable 2s-30s)
-- Pause/Resume live feed
-- Host laptop/PC temperature monitoring
-- Proxmox NODE temperature monitoring via Proxmox API
-- API Token authentication only (more secure than passwords)
-- Master password protects locally stored credentials
-- All passwords obscured during entry (anti-shoulder surfing)
-- Mandatory SSL/TLS certificate verification for secure connections
-- Graphical status indicators (LED indicators and colored rows)
-
-Version: 2.3 - With Node Temperature Monitoring via Proxmox API
-
-INSTALLATION:
-1. Install temperature API on each Proxmox node:
-   bash install-proxmox-temp-api.sh
-   
-2. Run this dashboard on your laptop/PC
-"""
+# Proxmox Dashboard - Live Data Feed with Node Temperature Monitoring
+# Version 2.4
 
 import tkinter as tk
 from tkinter import ttk, messagebox, simpledialog
@@ -42,7 +20,6 @@ from datetime import datetime, timedelta
 from cryptography.fernet import Fernet
 from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
-import psutil
 
 # Disable hostname verification warnings (we verify certificate but allow IP addresses)
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
@@ -309,316 +286,6 @@ def extract_hostname_from_certificate(cert_path):
     return None
 
 
-class HostnameMismatchDialog(tk.Toplevel):
-    """Dialog to help user fix certificate hostname mismatch"""
-    
-    def __init__(self, parent, ip_address, certificate_hostname):
-        super().__init__(parent)
-        self.title("Certificate Hostname Mismatch - Fix Required")
-        self.geometry("750x700")
-        self.resizable(True, True)
-        
-        self.ip_address = ip_address
-        self.cert_hostname = certificate_hostname
-        
-        self.update_idletasks()
-        x = (self.winfo_screenwidth() // 2) - 375
-        y = (self.winfo_screenheight() // 2) - 350
-        self.geometry(f"750x700+{x}+{y}")
-        
-        self.create_widgets()
-        self.protocol("WM_DELETE_WINDOW", self.on_close)
-        self.grab_set()
-    
-    def create_widgets(self):
-        # Title
-        title_frame = tk.Frame(self, bg="#e74c3c", height=70)
-        title_frame.pack(fill=tk.X)
-        title_frame.pack_propagate(False)
-        
-        title_label = tk.Label(
-            title_frame,
-            text="⚠ Certificate Hostname Mismatch",
-            font=("Arial", 16, "bold"),
-            bg="#e74c3c",
-            fg="white"
-        )
-        title_label.pack(pady=20)
-        
-        # Main content with scrollbar
-        main_frame = tk.Frame(self, bg="white")
-        main_frame.pack(fill=tk.BOTH, expand=True, padx=20, pady=20)
-        
-        # Create canvas and scrollbar
-        canvas = tk.Canvas(main_frame, bg="white", highlightthickness=0)
-        scrollbar = tk.Scrollbar(main_frame, orient="vertical", command=canvas.yview)
-        scrollable_frame = tk.Frame(canvas, bg="white")
-        
-        scrollable_frame.bind(
-            "<Configure>",
-            lambda e: canvas.configure(scrollregion=canvas.bbox("all"))
-        )
-        
-        canvas.create_window((0, 0), window=scrollable_frame, anchor="nw")
-        canvas.configure(yscrollcommand=scrollbar.set)
-        
-        # Problem explanation
-        tk.Label(
-            scrollable_frame,
-            text="The Problem:",
-            font=("Arial", 12, "bold"),
-            bg="white",
-            fg="#2c3e50",
-            anchor="w"
-        ).pack(anchor="w", pady=(0, 5))
-        
-        problem_text = f"""Your Proxmox SSL certificate is issued for the hostname '{self.cert_hostname}', but you're trying to connect using the IP address '{self.ip_address}'.
-
-SSL validation requires the connection address to match the certificate hostname."""
-        
-        tk.Label(
-            scrollable_frame,
-            text=problem_text,
-            font=("Arial", 10),
-            bg="white",
-            fg="#34495e",
-            justify=tk.LEFT,
-            wraplength=680,
-            anchor="w"
-        ).pack(anchor="w", pady=(0, 15))
-        
-        # Solution
-        tk.Label(
-            scrollable_frame,
-            text="The Solution:",
-            font=("Arial", 12, "bold"),
-            bg="white",
-            fg="#27ae60",
-            anchor="w"
-        ).pack(anchor="w", pady=(0, 5))
-        
-        solution_text = f"Use the hostname '{self.cert_hostname}' instead of the IP address '{self.ip_address}' when connecting."
-        
-        tk.Label(
-            scrollable_frame,
-            text=solution_text,
-            font=("Arial", 10),
-            bg="white",
-            fg="#34495e",
-            justify=tk.LEFT,
-            wraplength=680,
-            anchor="w"
-        ).pack(anchor="w", pady=(0, 15))
-        
-        # Step-by-step fix
-        tk.Label(
-            scrollable_frame,
-            text="How to Fix:",
-            font=("Arial", 12, "bold"),
-            bg="white",
-            fg="#2c3e50",
-            anchor="w"
-        ).pack(anchor="w", pady=(0, 10))
-        
-        # Step 1
-        step1_frame = tk.Frame(scrollable_frame, bg="#ecf0f1", relief=tk.SOLID, borderwidth=1)
-        step1_frame.pack(fill=tk.X, pady=5)
-        
-        tk.Label(
-            step1_frame,
-            text="Step 1: Add hostname to your hosts file",
-            font=("Arial", 10, "bold"),
-            bg="#ecf0f1",
-            fg="#2c3e50",
-            anchor="w"
-        ).pack(anchor="w", padx=10, pady=(10, 5))
-        
-        tk.Label(
-            step1_frame,
-            text="Open a terminal and run this command:",
-            font=("Arial", 9),
-            bg="#ecf0f1",
-            fg="#7f8c8d",
-            anchor="w"
-        ).pack(anchor="w", padx=10, pady=(0, 5))
-        
-        # Command box
-        cmd_frame = tk.Frame(step1_frame, bg="#2c3e50")
-        cmd_frame.pack(fill=tk.X, padx=10, pady=(0, 10))
-        
-        hosts_command = f"echo '{self.ip_address}    {self.cert_hostname}' | sudo tee -a /etc/hosts"
-        
-        cmd_text = tk.Text(
-            cmd_frame,
-            height=2,
-            font=("Courier", 9),
-            bg="#2c3e50",
-            fg="#2ecc71",
-            wrap=tk.WORD,
-            relief=tk.FLAT
-        )
-        cmd_text.pack(fill=tk.X, padx=5, pady=5)
-        cmd_text.insert("1.0", hosts_command)
-        cmd_text.config(state=tk.DISABLED)
-        
-        # Copy button
-        copy_btn = tk.Button(
-            step1_frame,
-            text="Copy Command to Clipboard",
-            command=lambda: self.copy_to_clipboard(hosts_command),
-            bg="#3498db",
-            fg="white",
-            font=("Arial", 9, "bold"),
-            cursor="hand2"
-        )
-        copy_btn.pack(pady=(0, 10))
-        
-        # Step 2
-        step2_frame = tk.Frame(scrollable_frame, bg="#ecf0f1", relief=tk.SOLID, borderwidth=1)
-        step2_frame.pack(fill=tk.X, pady=5)
-        
-        tk.Label(
-            step2_frame,
-            text="Step 2: Test the hostname works",
-            font=("Arial", 10, "bold"),
-            bg="#ecf0f1",
-            fg="#2c3e50",
-            anchor="w"
-        ).pack(anchor="w", padx=10, pady=(10, 5))
-        
-        tk.Label(
-            step2_frame,
-            text="Run this command to verify:",
-            font=("Arial", 9),
-            bg="#ecf0f1",
-            fg="#7f8c8d",
-            anchor="w"
-        ).pack(anchor="w", padx=10, pady=(0, 5))
-        
-        test_cmd_frame = tk.Frame(step2_frame, bg="#2c3e50")
-        test_cmd_frame.pack(fill=tk.X, padx=10, pady=(0, 10))
-        
-        test_command = f"ping -c 3 {self.cert_hostname}"
-        
-        test_cmd_text = tk.Text(
-            test_cmd_frame,
-            height=1,
-            font=("Courier", 9),
-            bg="#2c3e50",
-            fg="#2ecc71",
-            wrap=tk.NONE,
-            relief=tk.FLAT
-        )
-        test_cmd_text.pack(fill=tk.X, padx=5, pady=5)
-        test_cmd_text.insert("1.0", test_command)
-        test_cmd_text.config(state=tk.DISABLED)
-        
-        # Step 3
-        step3_frame = tk.Frame(scrollable_frame, bg="#ecf0f1", relief=tk.SOLID, borderwidth=1)
-        step3_frame.pack(fill=tk.X, pady=5)
-        
-        tk.Label(
-            step3_frame,
-            text="Step 3: Reconnect using hostname",
-            font=("Arial", 10, "bold"),
-            bg="#ecf0f1",
-            fg="#2c3e50",
-            anchor="w"
-        ).pack(anchor="w", padx=10, pady=(10, 5))
-        
-        reconnect_text = f"""After adding the hostname to /etc/hosts:
-
-1. Click 'Close' below to return to the dashboard
-2. Delete your saved credentials (if any)
-3. Click 'Change Credentials' in the dashboard
-4. Enter hostname: {self.cert_hostname}
-5. Re-enter your token credentials
-
-The connection should now work!"""
-        
-        tk.Label(
-            step3_frame,
-            text=reconnect_text,
-            font=("Arial", 9),
-            bg="#ecf0f1",
-            fg="#34495e",
-            justify=tk.LEFT,
-            anchor="w"
-        ).pack(anchor="w", padx=10, pady=(0, 10))
-        
-        # Alternative solution
-        tk.Label(
-            scrollable_frame,
-            text="\nAlternative: If you can't modify /etc/hosts",
-            font=("Arial", 10, "bold"),
-            bg="white",
-            fg="#e67e22",
-            anchor="w"
-        ).pack(anchor="w", pady=(10, 5))
-        
-        alt_text = """You can regenerate the Proxmox certificate to include your IP address, but this is more complex. Using the hostname (above solution) is easier and recommended."""
-        
-        tk.Label(
-            scrollable_frame,
-            text=alt_text,
-            font=("Arial", 9),
-            bg="white",
-            fg="#7f8c8d",
-            justify=tk.LEFT,
-            wraplength=680,
-            anchor="w"
-        ).pack(anchor="w", pady=(0, 10))
-        
-        canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
-        scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
-        
-        # Button frame
-        btn_frame = tk.Frame(self, bg="white")
-        btn_frame.pack(fill=tk.X, padx=20, pady=20)
-        
-        tk.Button(
-            btn_frame,
-            text="I've Fixed It - Close",
-            command=self.on_close,
-            bg="#27ae60",
-            fg="white",
-            font=("Arial", 12, "bold"),
-            width=30,
-            height=2,
-            cursor="hand2"
-        ).pack(pady=5)
-        
-        tk.Button(
-            btn_frame,
-            text="Delete Credentials & Exit",
-            command=self.delete_and_exit,
-            bg="#95a5a6",
-            fg="white",
-            font=("Arial", 10),
-            width=30,
-            cursor="hand2"
-        ).pack(pady=5)
-    
-    def copy_to_clipboard(self, text):
-        """Copy text to clipboard"""
-        self.clipboard_clear()
-        self.clipboard_append(text)
-        messagebox.showinfo("Copied", "Command copied to clipboard!\n\nPaste it in your terminal and press Enter.")
-    
-    def delete_and_exit(self):
-        """Delete credentials file and exit"""
-        cred_file = os.path.expanduser("~/.proxmox_credentials.enc")
-        if os.path.exists(cred_file):
-            os.remove(cred_file)
-            messagebox.showinfo("Deleted", "Credentials deleted.\n\nRestart the dashboard after fixing the hostname issue.")
-        self.destroy()
-        import sys
-        sys.exit(0)
-    
-    def on_close(self):
-        self.destroy()
-
-
 class TokenCreationGuide(tk.Toplevel):
     """Guide dialog for creating API tokens in Proxmox"""
     
@@ -687,7 +354,7 @@ class TokenCreationGuide(tk.Toplevel):
             ("4. Fill in the form:", "bold", "#27ae60"),
             ("   • User: root@pam", "normal", "#7f8c8d"),
             ("   • Token ID: dashboard (or any name you want)", "normal", "#7f8c8d"),
-            ("   • Privilege Separation: UNCHECK THIS BOX ☐", "normal", "#e74c3c"),
+            ("   • Privilege Separation: UNCHECK THIS BOX", "normal", "#e74c3c"),
             ("   • Expire: Never", "normal", "#7f8c8d"),
             ("   • Comment: Dashboard access (optional)\n", "normal", "#7f8c8d"),
             
@@ -931,6 +598,7 @@ class ProxmoxDashboard:
         # Node temperature storage (NEW - from smaller script)
         self.node_temp_labels = {}
         self.node_temp_api_available = {}
+        self.node_addresses = {}  # Maps node names to IP addresses for temperature API
         
         self.setup_styles()
         self.create_widgets()
@@ -1014,129 +682,6 @@ class ProxmoxDashboard:
         )
         return label
     
-    def get_host_temperature(self):
-        """Get host laptop/PC temperature with improved detection"""
-        try:
-            # Method 1: Try psutil sensors_temperatures
-            try:
-                temps = psutil.sensors_temperatures()
-                
-                if temps:
-                    logger.debug(f"Found temperature sensors: {list(temps.keys())}")
-                    # Priority order for temperature zones
-                    priority_zones = [
-                        'coretemp',      # Intel CPU
-                        'k10temp',       # AMD CPU
-                        'zenpower',      # AMD Zen
-                        'cpu_thermal',   # ARM/Raspberry Pi
-                        'acpitz',        # ACPI thermal zone
-                    ]
-                    
-                    # Try priority zones first
-                    for zone in priority_zones:
-                        if zone in temps and temps[zone]:
-                            # Get average of all sensors in this zone
-                            readings = [s.current for s in temps[zone] if s.current]
-                            if readings:
-                                avg_temp = sum(readings) / len(readings)
-                                logger.info(f"Temperature detected via psutil ({zone}): {avg_temp:.1f}°C")
-                                return round(avg_temp, 1), zone
-                    
-                    # Fallback: use first available zone
-                    for zone_name, sensors in temps.items():
-                        if sensors:
-                            readings = [s.current for s in sensors if s.current]
-                            if readings:
-                                avg_temp = sum(readings) / len(readings)
-                                logger.info(f"Temperature detected via psutil ({zone_name}): {avg_temp:.1f}°C")
-                                return round(avg_temp, 1), zone_name
-                else:
-                    logger.debug("psutil.sensors_temperatures() returned empty dict")
-            except (AttributeError, Exception) as e:
-                logger.debug(f"psutil sensors not available: {e}")
-            
-            # Method 2: Try reading from /sys/class/thermal (Linux)
-            thermal_zones = [
-                '/sys/class/thermal/thermal_zone0/temp',
-                '/sys/class/thermal/thermal_zone1/temp',
-                '/sys/class/thermal/thermal_zone2/temp',
-                '/sys/class/thermal/thermal_zone3/temp',
-            ]
-            
-            for zone_path in thermal_zones:
-                try:
-                    if os.path.exists(zone_path):
-                        with open(zone_path, 'r') as f:
-                            temp_raw = int(f.read().strip())
-                            # Convert from millidegrees to degrees
-                            temp = temp_raw / 1000.0
-                            if 0 < temp < 150:  # Sanity check
-                                logger.info(f"Temperature detected via {zone_path}: {temp:.1f}°C")
-                                return round(temp, 1), "thermal_zone"
-                except (ValueError, IOError, PermissionError) as e:
-                    logger.debug(f"Could not read {zone_path}: {e}")
-                    continue
-            
-            # Method 3: Try hwmon sensors
-            hwmon_paths = []
-            hwmon_base = '/sys/class/hwmon'
-            if os.path.exists(hwmon_base):
-                try:
-                    for hwmon_dir in os.listdir(hwmon_base):
-                        hwmon_path = os.path.join(hwmon_base, hwmon_dir)
-                        # Check for temp1_input, temp2_input, etc.
-                        for i in range(1, 10):
-                            temp_file = os.path.join(hwmon_path, f'temp{i}_input')
-                            if os.path.exists(temp_file):
-                                hwmon_paths.append(temp_file)
-                except (OSError, PermissionError) as e:
-                    logger.debug(f"Could not list hwmon: {e}")
-            
-            for hwmon_path in hwmon_paths:
-                try:
-                    with open(hwmon_path, 'r') as f:
-                        temp_raw = int(f.read().strip())
-                        temp = temp_raw / 1000.0
-                        if 0 < temp < 150:  # Sanity check
-                            logger.info(f"Temperature detected via {hwmon_path}: {temp:.1f}°C")
-                            return round(temp, 1), "hwmon"
-                except (ValueError, IOError, PermissionError) as e:
-                    logger.debug(f"Could not read {hwmon_path}: {e}")
-                    continue
-            
-            # Method 4: Try sensors command (if installed)
-            try:
-                import subprocess
-                result = subprocess.run(['sensors', '-u'], capture_output=True, text=True, timeout=2)
-                if result.returncode == 0:
-                    lines = result.stdout.split('\n')
-                    for line in lines:
-                        if 'temp' in line.lower() and 'input' in line.lower():
-                            parts = line.split(':')
-                            if len(parts) == 2:
-                                try:
-                                    temp = float(parts[1].strip())
-                                    if 0 < temp < 150:
-                                        logger.info(f"Temperature detected via sensors command: {temp:.1f}°C")
-                                        return round(temp, 1), "sensors"
-                                except ValueError:
-                                    continue
-            except (FileNotFoundError, subprocess.TimeoutExpired, Exception) as e:
-                logger.debug(f"sensors command not available: {e}")
-            
-            logger.warning("No temperature sensors detected on this system")
-            return None, "No sensors detected"
-            
-        except Exception as e:
-            logger.error(f"Temperature read error: {e}")
-            return None, "Error"
-    
-    def format_temperature(self, temp, zone):
-        """Format temperature for display"""
-        if temp is None:
-            return "N/A"
-        return f"{temp}°C"
-    
     def get_temp_color(self, temp):
         """Get color for temperature"""
         if temp is None:
@@ -1151,14 +696,14 @@ class ProxmoxDashboard:
             return "#e74c3c"  # Red - Hot
     
     # ========================================================================
-    # NODE TEMPERATURE API MONITORING (NEW - from smaller script)
+    # NODE TEMPERATURE API MONITORING (NEW - MODIFIED WITH DEBUG LOGGING)
     # ========================================================================
     
     def check_temperature_api_status(self):
         """
         Check which nodes have temperature API available.
         This runs in a background thread to avoid blocking the UI.
-        Checks all nodes in parallel for faster results.
+        Connects directly to port 8899 on each node.
         """
         if not self.api:
             return
@@ -1167,15 +712,29 @@ class ProxmoxDashboard:
             try:
                 nodes = self.api.get('/nodes')
                 
+                # For single-node setups, use the API host
+                # For clusters, try to get node IPs from /cluster/status
+                try:
+                    cluster_status = self.api.get('/cluster/status')
+                    for item in cluster_status:
+                        if item.get('type') == 'node' and item.get('ip'):
+                            self.node_addresses[item['name']] = item['ip']
+                except Exception:
+                    pass  # Single-node setup or cluster API unavailable
+                
+                # Default any missing nodes to API host
+                for node in nodes:
+                    node_name = node['node']
+                    if node_name not in self.node_addresses:
+                        self.node_addresses[node_name] = self.api.host
+                
                 # Check all nodes in parallel using ThreadPoolExecutor
                 from concurrent.futures import ThreadPoolExecutor, as_completed
                 
                 def check_node(node_name):
                     try:
-                        result = self._get_node_temperature_quick(node_name, timeout=1.5)
-                        if result and result.get('status') == 'ok':
-                            return node_name, True
-                        return node_name, False
+                        result = self._get_node_temperature_direct(node_name, timeout=1.5)
+                        return node_name, (result and result.get('status') == 'ok')
                     except Exception:
                         return node_name, False
                 
@@ -1187,14 +746,15 @@ class ProxmoxDashboard:
                             node_name, available = future.result()
                             self.node_temp_api_available[node_name] = available
                             if available:
-                                logger.info(f"Temperature API available on {node_name}")
+                                logger.info(f"Temperature API available on {node_name} ({self.node_addresses.get(node_name)}:8899)")
                             else:
                                 logger.debug(f"Temperature API not available on {node_name}")
-                        except Exception:
+                        except Exception as e:
                             node_name = futures[future]
                             self.node_temp_api_available[node_name] = False
                 
                 available_count = sum(1 for v in self.node_temp_api_available.values() if v)
+                
                 if available_count == 0:
                     logger.info("Temperature API not installed on any nodes (this is optional)")
                 else:
@@ -1207,23 +767,21 @@ class ProxmoxDashboard:
         thread = threading.Thread(target=check_async, daemon=True)
         thread.start()
     
-    def _get_node_temperature_quick(self, node_name, timeout=2):
+    def _get_node_temperature_direct(self, node_name, timeout=2):
         """
-        Quick temperature check with short timeout.
-        Returns None if API not available or timeout.
+        Get temperature directly from node's port 8899.
+        Returns None if service not available or timeout.
         """
         try:
-            # Use requests directly with short timeout instead of self.api.get()
-            url = f"{self.api.base}/nodes/{node_name}/temperature"
-            response = self.api.session.get(
-                url,
-                headers=self.api.headers,
-                verify=self.api.verify,
-                timeout=timeout
-            )
+            node_ip = self.node_addresses.get(node_name, self.api.host)
+            url = f"http://{node_ip}:8899/temperature"
+            response = requests.get(url, timeout=timeout)
+            
             if response.status_code == 200:
                 data = response.json()
                 return data.get('data', {})
+            return None
+        except (requests.Timeout, requests.ConnectionError, requests.RequestException):
             return None
         except Exception:
             return None
@@ -1265,7 +823,7 @@ class ProxmoxDashboard:
             
             def fetch_temp(node_name):
                 try:
-                    result = self._get_node_temperature_quick(node_name, timeout=1.5)
+                    result = self._get_node_temperature_direct(node_name, timeout=1.5)
                     if result and result.get('status') == 'ok':
                         return node_name, {
                             'temp': result.get('temperature'),
@@ -1273,17 +831,16 @@ class ProxmoxDashboard:
                             'hwmon': result.get('hwmon', 'unknown'),
                             'status': 'ok'
                         }, True
-                    else:
-                        return node_name, {
-                            'temp': None,
-                            'source': 'error',
-                            'status': result.get('status', 'unknown_error') if result else 'no_response'
-                        }, False
+                    return node_name, {
+                        'temp': None,
+                        'source': 'error',
+                        'status': result.get('status', 'unknown_error') if result else 'no_response'
+                    }, False
                 except Exception:
                     return node_name, {
                         'temp': None,
                         'source': 'unavailable',
-                        'status': 'no_api_endpoint'
+                        'status': 'exception'
                     }, False
             
             with ThreadPoolExecutor(max_workers=min(len(nodes_to_check), 5)) as executor:
@@ -1344,15 +901,17 @@ class ProxmoxDashboard:
                 # Add tooltip
                 source = temp_info.get('source', 'unknown')
                 hwmon = temp_info.get('hwmon', 'unknown')
-                tooltip = f"Source: {source}\nHwmon: {hwmon}"
+                node_ip = self.node_addresses.get(node_name, 'unknown')
+                tooltip = f"IP: {node_ip}:8899\nSource: {source}\nHwmon: {hwmon}"
                 self._bind_tooltip(label, tooltip)
             else:
                 label.config(text=f"{node_name}: N/A", fg="#95a5a6")
                 status = temp_info.get('status', 'unknown')
+                node_ip = self.node_addresses.get(node_name, 'unknown')
                 if status in ('no_api_endpoint', 'not_installed'):
-                    tooltip = "Temperature API not installed\nRun install-proxmox-temp-api.sh on this node"
+                    tooltip = f"IP: {node_ip}:8899\nTemperature API not installed\nRun install-proxmox-temp-api.sh on this node"
                 else:
-                    tooltip = f"Temperature unavailable\nStatus: {status}"
+                    tooltip = f"IP: {node_ip}:8899\nTemperature unavailable\nStatus: {status}"
                 self._bind_tooltip(label, tooltip)
     
     def _bind_tooltip(self, widget, text):
@@ -1521,29 +1080,9 @@ class ProxmoxDashboard:
         )
         self.node_label.pack()
         
-        # Row 2: Host Temperature and Last update
-        temp_frame = tk.Frame(self.status_frame, bg="#2c3e50")
-        temp_frame.grid(row=2, column=0, sticky="w", padx=5, pady=3)
-        
-        tk.Label(
-            temp_frame,
-            text="Host Temp:",
-            font=("Arial", 10),
-            bg="#2c3e50",
-            fg="#bdc3c7"
-        ).pack(side=tk.LEFT, padx=(0, 5))
-        
-        self.temp_label = tk.Label(
-            temp_frame,
-            text="--",
-            font=("Arial", 10, "bold"),
-            bg="#2c3e50",
-            fg="#95a5a6"
-        )
-        self.temp_label.pack(side=tk.LEFT)
-        
+        # Row 2: Last update
         update_frame = tk.Frame(self.status_frame, bg="#2c3e50")
-        update_frame.grid(row=2, column=1, sticky="w", padx=15, pady=3)
+        update_frame.grid(row=2, column=0, sticky="w", padx=5, pady=3, columnspan=2)
         
         self.last_update_label = tk.Label(
             update_frame,
@@ -1812,22 +1351,7 @@ class ProxmoxDashboard:
                         return True
                 except Exception as e:
                     logger.error(f"Authentication failed: {str(e)}")
-                    error_msg = str(e).lower()
-                    
-                    # Check for certificate hostname mismatch
-                    if 'hostname' in error_msg and 'match' in error_msg:
-                        cert_hostname = extract_hostname_from_certificate(PROXMOX_CA_CERT)
-                        if cert_hostname:
-                            messagebox.showwarning(
-                                "Certificate Hostname Mismatch Detected",
-                                f"SSL certificate is for hostname '{cert_hostname}' but you're connecting to '{creds['host']}'.\n\nA fix guide will open next."
-                            )
-                            hostname_guide = HostnameMismatchDialog(self.root, creds['host'], cert_hostname)
-                            self.root.wait_window(hostname_guide)
-                        else:
-                            messagebox.showerror("Error", f"Failed to decrypt or connect:\n{str(e)}")
-                    else:
-                        messagebox.showerror("Error", f"Failed to decrypt or connect:\n{str(e)}")
+                    messagebox.showerror("Error", f"Failed to decrypt or connect:\n{str(e)}")
         
         # Show token creation guide first
         messagebox.showinfo("Setup Required", "No credentials found.\n\nYou'll need to create an API token in Proxmox first.\n\nThe next screen will show you how.")
@@ -1853,22 +1377,7 @@ class ProxmoxDashboard:
                 return True
             except Exception as e:
                 logger.error(f"Connection setup failed: {str(e)}")
-                error_msg = str(e).lower()
-                
-                # Check for certificate hostname mismatch
-                if 'hostname' in error_msg and 'match' in error_msg:
-                    cert_hostname = extract_hostname_from_certificate(PROXMOX_CA_CERT)
-                    if cert_hostname:
-                        messagebox.showwarning(
-                            "Certificate Hostname Mismatch Detected",
-                            f"SSL certificate is for hostname '{cert_hostname}' but you're connecting to '{host}'.\n\nA fix guide will open next."
-                        )
-                        hostname_guide = HostnameMismatchDialog(self.root, host, cert_hostname)
-                        self.root.wait_window(hostname_guide)
-                    else:
-                        messagebox.showerror("Error", f"Connection failed:\n{str(e)}")
-                else:
-                    messagebox.showerror("Error", f"Connection failed:\n{str(e)}")
+                messagebox.showerror("Error", f"Connection failed:\n{str(e)}")
                 return False
         
         return False
@@ -2045,12 +1554,11 @@ class ProxmoxDashboard:
             return 'N/A'
         try:
             bytes_val = float(bytes_val)
-            for unit in ['B', 'KiB', 'MiB', 'GiB', 'TiB']:
-                if bytes_val < 1024:
+            for unit in ['B', 'KiB', 'MiB', 'GiB', 'TiB', 'PiB']:
+                if bytes_val < 1024 or unit == 'PiB':
                     return f"{bytes_val:.1f}{unit}"
                 bytes_val /= 1024
-            return f"{bytes_val:.1f}PiB"
-        except Exception:
+        except (ValueError, TypeError):
             return 'N/A'
     
     def fetch_single_vm_data(self, node, vm, vm_type):
@@ -2236,12 +1744,6 @@ class ProxmoxDashboard:
                 
                 self.connection_label.config(text="Connected", fg="#27ae60")
                 self.update_led_color(self.connection_led, "#27ae60")
-                
-                # Update host temperature
-                temp, zone = self.get_host_temperature()
-                temp_text = self.format_temperature(temp, zone)
-                temp_color = self.get_temp_color(temp)
-                self.temp_label.config(text=temp_text, fg=temp_color)
                 
                 # Update node temperatures (NEW)
                 self.update_node_temperatures()
@@ -2520,46 +2022,6 @@ class ProxmoxDashboard:
 
 
 def main():
-    """
-    ═══════════════════════════════════════════════════════════════════════
-    PROXMOX DASHBOARD - WITH NODE TEMPERATURE MONITORING
-    ═══════════════════════════════════════════════════════════════════════
-    
-    FEATURES:
-    * View all VMs and Containers across all nodes
-    * Start/Stop VMs and Containers
-    * Basic VM information:
-      - ID, Type, Status, Name, Node
-      - CPU cores, sockets, type
-      - Configured memory
-      - Disk size
-      - Free disk space (for running VMs)
-    * Auto-refresh every 3 seconds (configurable 2s-30s)
-    * Search and filter VMs/CTs
-    * Multi-node cluster support
-    * Host temperature monitoring (local machine)
-    * NODE temperature monitoring via Proxmox API
-    
-    NODE TEMPERATURE API:
-    * Monitors temperatures from each Proxmox node via Proxmox API
-    * Endpoint: /api2/json/nodes/{node}/temperature
-    * Displays color-coded temperatures (green/blue/orange/red)
-    * Hover tooltips show temperature source and hwmon info
-    * Requires temperature API installed on Proxmox nodes
-    * Install on each node: bash install-proxmox-temp-api.sh
-    * Falls back gracefully if API not available
-    
-    MULTI-NODE SUPPORT:
-    * Automatically detects all nodes in your Proxmox cluster
-    * Fetches VMs/CTs from each node
-    * Node count displayed in the UI
-    * Node name shown for each VM/CT
-    
-    ═══════════════════════════════════════════════════════════════════════
-    """
-    
-    print(__doc__)
-    
     root = tk.Tk()
     app = ProxmoxDashboard(root)
     root.mainloop()
