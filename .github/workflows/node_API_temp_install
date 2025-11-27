@@ -702,16 +702,24 @@ if [ "$SKIP_FIREWALL" = false ]; then
         # Check if rules already exist
         EXISTING_RULES=$(iptables -L INPUT -n | grep -c "dpt:8899" || true)
         if [ "$EXISTING_RULES" -gt 0 ]; then
-            echo "  Found existing rules for port 8899"
-            read -p "  Remove existing rules and reconfigure? [y/N] " -n 1 -r
+            echo "  Found $EXISTING_RULES existing rule(s) for port 8899:"
+            iptables -L INPUT -n | grep "dpt:8899" | head -5
+            echo ""
+            read -p "  Remove all existing rules and reconfigure? [y/N] " -n 1 -r
             echo
             if [[ $REPLY =~ ^[Yy]$ ]]; then
-                # Remove existing rules
-                while iptables -D INPUT -p tcp --dport 8899 -j ACCEPT 2>/dev/null; do :; done
-                while iptables -D INPUT -p tcp --dport 8899 -j DROP 2>/dev/null; do :; done
-                echo "  Removed existing rules"
+                # Remove all existing rules for port 8899
+                echo "  Removing existing rules..."
+                while iptables -D INPUT -p tcp --dport 8899 -j ACCEPT 2>/dev/null; do 
+                    echo "    Removed ACCEPT rule"
+                done
+                while iptables -D INPUT -p tcp --dport 8899 -j DROP 2>/dev/null; do 
+                    echo "    Removed DROP rule"
+                done
+                echo "  All existing rules removed"
             else
-                echo "  Keeping existing rules"
+                echo "  Keeping existing rules - skipping firewall configuration"
+                echo "  WARNING: You may have duplicate or conflicting rules!"
                 DASHBOARD_IP=""  # Skip adding new rules
             fi
         fi
