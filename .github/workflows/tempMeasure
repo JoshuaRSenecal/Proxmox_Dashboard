@@ -4,12 +4,9 @@ Proxmox Dashboard - Live Data Feed Edition with Node Temperature Monitoring
 Near-constant live updates for real-time VM/Container monitoring
 SUPPORTS MULTIPLE PROXMOX NODES
 
-VERSION WITH DEBUG LOGGING FOR TEMPERATURE MONITORING
-
 FEATURES:
 - Live data feed with 3-second default refresh (configurable 2s-30s)
 - Pause/Resume live feed
-- Host laptop/PC temperature monitoring
 - Proxmox NODE temperature monitoring via DIRECT PORT 8899 CONNECTION
 - API Token authentication only (more secure than passwords)
 - Master password protects locally stored credentials
@@ -17,7 +14,7 @@ FEATURES:
 - Mandatory SSL/TLS certificate verification for secure connections
 - Graphical status indicators (LED indicators and colored rows)
 
-Version: 2.4-DEBUG - With Debug Logging
+Version: 2.4 - With Node Temperature Monitoring
 
 INSTALLATION:
 1. Install temperature API on each Proxmox node:
@@ -853,17 +850,12 @@ class ProxmoxDashboard:
         This runs in a background thread to avoid blocking the UI.
         Connects directly to port 8899 on each node.
         """
-        print("DEBUG: check_temperature_api_status() called")
-        
         if not self.api:
-            print("DEBUG: No API connection")
             return
         
         def check_async():
             try:
-                print("DEBUG: Starting async temperature check...")
                 nodes = self.api.get('/nodes')
-                print(f"DEBUG: Found {len(nodes)} node(s): {[n['node'] for n in nodes]}")
                 
                 # For single-node setups, use the API host
                 # For clusters, try to get node IPs from /cluster/status
@@ -872,35 +864,26 @@ class ProxmoxDashboard:
                     for item in cluster_status:
                         if item.get('type') == 'node' and item.get('ip'):
                             self.node_addresses[item['name']] = item['ip']
-                            print(f"DEBUG: Got node IP from cluster: {item['name']} -> {item['ip']}")
                 except Exception as e:
-                    print(f"DEBUG: Could not get cluster status: {e}")
+                    pass
                 
                 # Default any missing nodes to API host
                 for node in nodes:
                     node_name = node['node']
                     if node_name not in self.node_addresses:
                         self.node_addresses[node_name] = self.api.host
-                        print(f"DEBUG: Using API host for {node_name}: {self.api.host}")
-                
-                print(f"DEBUG: Node addresses: {self.node_addresses}")
                 
                 # Check all nodes in parallel using ThreadPoolExecutor
                 from concurrent.futures import ThreadPoolExecutor, as_completed
                 
                 def check_node(node_name):
                     try:
-                        node_ip = self.node_addresses.get(node_name)
-                        print(f"DEBUG: Checking {node_name} at {node_ip}:8899")
                         result = self._get_node_temperature_direct(node_name, timeout=1.5)
                         if result and result.get('status') == 'ok':
-                            print(f"DEBUG: ✓ Temperature API AVAILABLE on {node_name}")
                             return node_name, True
                         else:
-                            print(f"DEBUG: ✗ Temperature API NOT available on {node_name}, result: {result}")
                             return node_name, False
                     except Exception as e:
-                        print(f"DEBUG: Exception checking {node_name}: {e}")
                         return node_name, False
                 
                 with ThreadPoolExecutor(max_workers=min(len(nodes), 5)) as executor:
@@ -916,12 +899,9 @@ class ProxmoxDashboard:
                                 logger.debug(f"Temperature API not available on {node_name}")
                         except Exception as e:
                             node_name = futures[future]
-                            print(f"DEBUG: Future exception for {node_name}: {e}")
                             self.node_temp_api_available[node_name] = False
                 
                 available_count = sum(1 for v in self.node_temp_api_available.values() if v)
-                print(f"DEBUG: === SUMMARY: {available_count}/{len(nodes)} nodes have temperature API ===")
-                print(f"DEBUG: Availability map: {self.node_temp_api_available}")
                 
                 if available_count == 0:
                     logger.info("Temperature API not installed on any nodes (this is optional)")
@@ -929,9 +909,6 @@ class ProxmoxDashboard:
                     logger.info(f"Temperature API available on {available_count}/{len(nodes)} nodes")
             
             except Exception as e:
-                print(f"DEBUG: EXCEPTION in check_async: {e}")
-                import traceback
-                traceback.print_exc()
                 logger.error(f"Failed to check temperature API status: {e}")
         
         # Run in background thread
@@ -946,28 +923,19 @@ class ProxmoxDashboard:
         try:
             node_ip = self.node_addresses.get(node_name, self.api.host)
             url = f"http://{node_ip}:8899/temperature"
-            print(f"DEBUG: Fetching temperature from {url}")
             
             response = requests.get(url, timeout=timeout)
-            print(f"DEBUG: Got response status {response.status_code}")
             
             if response.status_code == 200:
                 data = response.json()
-                print(f"DEBUG: Temperature data: {data}")
                 return data.get('data', {})
             else:
-                print(f"DEBUG: Non-200 status: {response.status_code}")
                 return None
         except requests.Timeout:
-            print(f"DEBUG: TIMEOUT for {node_name} at {node_ip}:8899")
             return None
         except requests.ConnectionError as e:
-            print(f"DEBUG: CONNECTION ERROR for {node_name}: {e}")
             return None
         except Exception as e:
-            print(f"DEBUG: EXCEPTION for {node_name}: {e}")
-            import traceback
-            traceback.print_exc()
             return None
     
     def get_all_node_temperatures(self):
@@ -2210,15 +2178,31 @@ class ProxmoxDashboard:
 def main():
     """
     ═══════════════════════════════════════════════════════════════════════
-    PROXMOX DASHBOARD - WITH NODE TEMPERATURE MONITORING - DEBUG VERSION
+    PROXMOX DASHBOARD - WITH NODE TEMPERATURE MONITORING
     ═══════════════════════════════════════════════════════════════════════
     
-    This version includes extensive debug logging to help diagnose
-    temperature monitoring issues.
+    FEATURES:
+    * View all VMs and Containers across all nodes
+    * Start/Stop VMs and Containers
+    * Basic VM information:
+      - ID, Type, Status, Name, Node
+      - CPU cores, sockets, type
+      - Configured memory
+      - Disk size
+      - Free disk space (for running VMs)
+    * Auto-refresh every 3 seconds (configurable 2s-30s)
+    * Search and filter VMs/CTs
+    * Multi-node cluster support
+    * NODE temperature monitoring via port 8899
     
-    Run with: python3 proxmox-dashboard-DEBUG.py
-    
-    Or save output: python3 proxmox-dashboard-DEBUG.py 2>&1 | tee debug.log
+    NODE TEMPERATURE API:
+    * Monitors temperatures from each Proxmox node
+    * Endpoint: http://{node-ip}:8899/temperature
+    * Displays color-coded temperatures (green/blue/orange/red)
+    * Hover tooltips show temperature source and hwmon info
+    * Requires temperature API installed on Proxmox nodes
+    * Install on each node: bash install-proxmox-temp-api-NO-FIREWALL.sh
+    * Falls back gracefully if API not available
     
     ═══════════════════════════════════════════════════════════════════════
     """
