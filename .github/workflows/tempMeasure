@@ -931,6 +931,7 @@ class ProxmoxDashboard:
         # Node temperature storage (NEW - from smaller script)
         self.node_temp_labels = {}
         self.node_temp_api_available = {}
+        self.node_addresses = {}  # Maps node names to IP addresses for temperature API
         
         self.setup_styles()
         self.create_widgets()
@@ -1158,7 +1159,7 @@ class ProxmoxDashboard:
         """
         Check which nodes have temperature API available.
         This runs in a background thread to avoid blocking the UI.
-        Checks all nodes in parallel for faster results.
+        Connects directly to port 8899 on each node.
         """
         if not self.api:
             return
@@ -1167,12 +1168,28 @@ class ProxmoxDashboard:
             try:
                 nodes = self.api.get('/nodes')
                 
+                # For single-node setups, use the API host
+                # For clusters, try to get node IPs from /cluster/status
+                try:
+                    cluster_status = self.api.get('/cluster/status')
+                    for item in cluster_status:
+                        if item.get('type') == 'node' and item.get('ip'):
+                            self.node_addresses[item['name']] = item['ip']
+                except Exception:
+                    pass
+                
+                # Default any missing nodes to API host
+                for node in nodes:
+                    node_name = node['node']
+                    if node_name not in self.node_addresses:
+                        self.node_addresses[node_name] = self.api.host
+                
                 # Check all nodes in parallel using ThreadPoolExecutor
                 from concurrent.futures import ThreadPoolExecutor, as_completed
                 
                 def check_node(node_name):
                     try:
-                        result = self._get_node_temperature_quick(node_name, timeout=1.5)
+                        result = self._get_node_temperature_direct(node_name, timeout=1.5)
                         if result and result.get('status') == 'ok':
                             return node_name, True
                         return node_name, False
@@ -1187,7 +1204,7 @@ class ProxmoxDashboard:
                             node_name, available = future.result()
                             self.node_temp_api_available[node_name] = available
                             if available:
-                                logger.info(f"Temperature API available on {node_name}")
+                                logger.info(f"Temperature API available on {node_name} ({self.node_addresses.get(node_name)}:8899)")
                             else:
                                 logger.debug(f"Temperature API not available on {node_name}")
                         except Exception:
@@ -1207,20 +1224,15 @@ class ProxmoxDashboard:
         thread = threading.Thread(target=check_async, daemon=True)
         thread.start()
     
-    def _get_node_temperature_quick(self, node_name, timeout=2):
+    def _get_node_temperature_direct(self, node_name, timeout=2):
         """
-        Quick temperature check with short timeout.
-        Returns None if API not available or timeout.
+        Get temperature directly from node's port 8899.
+        Returns None if service not available or timeout.
         """
         try:
-            # Use requests directly with short timeout instead of self.api.get()
-            url = f"{self.api.base}/nodes/{node_name}/temperature"
-            response = self.api.session.get(
-                url,
-                headers=self.api.headers,
-                verify=self.api.verify,
-                timeout=timeout
-            )
+            node_ip = self.node_addresses.get(node_name, self.api.host)
+            url = f"http://{node_ip}:8899/temperature"
+            response = requests.get(url, timeout=timeout)
             if response.status_code == 200:
                 data = response.json()
                 return data.get('data', {})
@@ -1265,7 +1277,7 @@ class ProxmoxDashboard:
             
             def fetch_temp(node_name):
                 try:
-                    result = self._get_node_temperature_quick(node_name, timeout=1.5)
+                    result = self._get_node_temperature_direct(node_name, timeout=1.5)
                     if result and result.get('status') == 'ok':
                         return node_name, {
                             'temp': result.get('temperature'),
@@ -1344,15 +1356,17 @@ class ProxmoxDashboard:
                 # Add tooltip
                 source = temp_info.get('source', 'unknown')
                 hwmon = temp_info.get('hwmon', 'unknown')
-                tooltip = f"Source: {source}\nHwmon: {hwmon}"
+                node_ip = self.node_addresses.get(node_name, 'unknown')
+                tooltip = f"IP: {node_ip}:8899\nSource: {source}\nHwmon: {hwmon}"
                 self._bind_tooltip(label, tooltip)
             else:
                 label.config(text=f"{node_name}: N/A", fg="#95a5a6")
                 status = temp_info.get('status', 'unknown')
+                node_ip = self.node_addresses.get(node_name, 'unknown')
                 if status in ('no_api_endpoint', 'not_installed'):
-                    tooltip = "Temperature API not installed\nRun install-proxmox-temp-api.sh on this node"
+                    tooltip = f"IP: {node_ip}:8899\nTemperature API not installed\nRun install-proxmox-temp-api.sh on this node"
                 else:
-                    tooltip = f"Temperature unavailable\nStatus: {status}"
+                    tooltip = f"IP: {node_ip}:8899\nTemperature unavailable\nStatus: {status}"
                 self._bind_tooltip(label, tooltip)
     
     def _bind_tooltip(self, widget, text):
