@@ -267,8 +267,8 @@ cat > /usr/local/bin/proxmox-temp-service.py << 'PYTHON_SERVICE_EOF'
 #!/usr/bin/env python3
 """
 Proxmox Temperature HTTP Service
-Provides temperature data via HTTP on localhost:8899
-This is proxied through Apache to integrate with Proxmox API
+Provides temperature data via HTTP on port 8899
+Accessed directly by the Proxmox Dashboard
 """
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from urllib.parse import urlparse, parse_qs
@@ -490,10 +490,6 @@ chown proxmox-temp:proxmox-temp /var/cache/proxmox-temp
 chmod 755 /var/cache/proxmox-temp
 echo "  Created cache directory: /var/cache/proxmox-temp"
 
-# Update the cache path in the service script
-sed -i "s|/var/cache/proxmox-temp/sensor.cache|/var/cache/proxmox-temp/sensor.cache|g" /usr/local/bin/proxmox-temp-service.py
-sed -i "s|/var/cache/proxmox-temp/sensor.cache|/var/cache/proxmox-temp/sensor.cache|g" /usr/local/bin/proxmox-temp-reader.py
-
 cat > /etc/systemd/system/proxmox-temp-api.service << 'SYSTEMD_EOF'
 [Unit]
 Description=Proxmox Temperature API Service
@@ -591,6 +587,20 @@ echo "========================================================"
 echo ""
 echo "If you have a firewall, allow port 8899 from your dashboard:"
 echo "  iptables -I INPUT -p tcp --dport 8899 -s YOUR_LAPTOP_IP -j ACCEPT"
+echo ""
+echo "========================================================"
+echo "UNINSTALL"
+echo "========================================================"
+echo ""
+echo "To remove this installation, run:"
+echo "  systemctl stop proxmox-temp-api"
+echo "  systemctl disable proxmox-temp-api"
+echo "  rm /etc/systemd/system/proxmox-temp-api.service"
+echo "  rm /usr/local/bin/proxmox-temp-reader.py"
+echo "  rm /usr/local/bin/proxmox-temp-service.py"
+echo "  rm -rf /var/cache/proxmox-temp"
+echo "  userdel proxmox-temp"
+echo "  systemctl daemon-reload"
 echo ""
 echo "========================================================"
 echo "NEXT: Install this script on ALL other Proxmox nodes"
