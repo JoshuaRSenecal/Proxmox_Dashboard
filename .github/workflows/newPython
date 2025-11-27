@@ -118,6 +118,15 @@ class SSLAdapter(HTTPAdapter):
         
         kwargs['ssl_context'] = context
         return super().init_poolmanager(*args, **kwargs)
+    
+    def proxy_manager_for(self, *args, **kwargs):
+        # Also disable hostname checking for proxy connections
+        context = ssl.create_default_context(cafile=PROXMOX_CA_CERT)
+        context.check_hostname = False
+        context.verify_mode = ssl.CERT_REQUIRED
+        
+        kwargs['ssl_context'] = context
+        return super().proxy_manager_for(*args, **kwargs)
 
 
 class ProxmoxAPI:
@@ -127,9 +136,8 @@ class ProxmoxAPI:
         self.base = f"https://{host}:8006/api2/json"
         self.host = host
         
-        # SSL verification with CA cert but hostname checking disabled (allows IP addresses)
-        self.verify = PROXMOX_CA_CERT
-        self.ssl_status = "Verified"
+        # SSL verification handled by SSLAdapter (allows IP addresses)
+        self.ssl_status = "Verified (CA cert, hostname check disabled for IP support)"
         
         # Create session with custom SSL adapter
         self.session = requests.Session()
@@ -162,7 +170,6 @@ class ProxmoxAPI:
                     r = self.session.get(
                         f"{self.base}{path}",
                         headers=self.headers,
-                        verify=self.verify,
                         timeout=10,
                         **kwargs
                     )
@@ -170,7 +177,6 @@ class ProxmoxAPI:
                     r = self.session.post(
                         f"{self.base}{path}",
                         headers=self.headers,
-                        verify=self.verify,
                         timeout=10,
                         **kwargs
                     )
