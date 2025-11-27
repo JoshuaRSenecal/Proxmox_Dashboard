@@ -171,11 +171,16 @@ class ProxmoxAPI:
                 
                 if r.status_code in [200, 201]:
                     return r
+                elif r.status_code == 401:
+                    # Authentication failure - don't retry
+                    r.raise_for_status()
                 elif r.status_code >= 500 and attempt < retries - 1:
+                    # Server error - retry with backoff
                     delay = RETRY_DELAY * (2 ** attempt)
                     time.sleep(delay)
                     continue
                 else:
+                    # Other errors - fail immediately
                     r.raise_for_status()
                     
             except requests.ConnectionError:
@@ -186,6 +191,9 @@ class ProxmoxAPI:
                 if attempt == retries - 1:
                     raise Exception(f"Request timeout after {retries} attempts")
                 time.sleep(RETRY_DELAY * (2 ** attempt))
+            except requests.HTTPError as e:
+                # Don't retry HTTP errors (401, 403, 404, etc.)
+                raise
             except Exception as e:
                 if attempt == retries - 1:
                     raise
@@ -543,20 +551,20 @@ class CredentialsDialog(tk.Toplevel):
         master = self.master_entry.get()
         
         if not host or not master:
-            messagebox.showerror("Error", "Host and master password are required!")
+            messagebox.showerror("Error", "Host and master password are required!", parent=self)
             return
         
         if self.is_setup:
             confirm = self.master_confirm.get()
             if master != confirm:
-                messagebox.showerror("Error", "Master passwords don't match!")
+                messagebox.showerror("Error", "Master passwords don't match!", parent=self)
                 return
         
         token_id = self.token_id_entry.get().strip()
         token_secret = self.token_secret_entry.get()
         
         if not token_id or not token_secret:
-            messagebox.showerror("Error", "Token ID and Token Secret are required!")
+            messagebox.showerror("Error", "Token ID and Token Secret are required!", parent=self)
             return
         
         # Always return token authentication
