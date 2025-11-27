@@ -1,5 +1,5 @@
 #!/bin/bash
-# install-temp-api.sh
+# install_temp_api.sh
 # Proxmox Temperature API Installation
 # Run this on EACH Proxmox node
 #
