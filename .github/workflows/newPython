@@ -143,10 +143,16 @@ class ProxmoxAPI:
             self._api_request('get', '/version')
             AuditLogger.log_authentication(host, token_id, True)
             logger.info(f"Successfully authenticated with token: {token_id}")
-        except Exception as e:
+        except requests.exceptions.HTTPError as e:
+            # Authentication or HTTP error - preserve original error message
             AuditLogger.log_authentication(host, token_id, False)
-            logger.error(f"API token authentication failed: {str(e)}")
-            raise Exception(f"API token authentication failed: {str(e)}")
+            logger.error(f"API authentication failed: {str(e)}")
+            raise
+        except Exception as e:
+            # Other errors (connection, timeout, etc.)
+            AuditLogger.log_authentication(host, token_id, False)
+            logger.error(f"API connection failed: {str(e)}")
+            raise
     
     def _api_request(self, method, path, retries=MAX_RETRIES, **kwargs):
         """Make API request with retry logic - Token authentication only"""
@@ -172,7 +178,7 @@ class ProxmoxAPI:
                 if r.status_code in [200, 201]:
                     return r
                 elif r.status_code == 401:
-                    # Authentication failure - don't retry
+                    # Authentication failure - don't retry, fail immediately
                     r.raise_for_status()
                 elif r.status_code >= 500 and attempt < retries - 1:
                     # Server error - retry with backoff
@@ -182,22 +188,21 @@ class ProxmoxAPI:
                 else:
                     # Other errors - fail immediately
                     r.raise_for_status()
-                    
-            except requests.ConnectionError:
-                if attempt == retries - 1:
-                    raise Exception(f"Connection failed after {retries} attempts")
-                time.sleep(RETRY_DELAY * (2 ** attempt))
-            except requests.Timeout:
-                if attempt == retries - 1:
-                    raise Exception(f"Request timeout after {retries} attempts")
-                time.sleep(RETRY_DELAY * (2 ** attempt))
-            except requests.HTTPError as e:
-                # Don't retry HTTP errors (401, 403, 404, etc.)
+            
+            except requests.exceptions.HTTPError:
+                # HTTP errors (401, 403, 404, etc.) - never retry, re-raise immediately
                 raise
-            except Exception as e:
+            except requests.exceptions.ConnectionError as e:
                 if attempt == retries - 1:
                     raise
                 time.sleep(RETRY_DELAY * (2 ** attempt))
+            except requests.exceptions.Timeout as e:
+                if attempt == retries - 1:
+                    raise
+                time.sleep(RETRY_DELAY * (2 ** attempt))
+            except Exception as e:
+                # Unknown error - fail immediately
+                raise
         
         raise Exception(f"API request failed after {retries} attempts")
     
