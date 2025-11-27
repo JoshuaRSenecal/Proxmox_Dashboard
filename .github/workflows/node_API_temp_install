@@ -1,10 +1,10 @@
 #!/bin/bash
-# install_temp_api.sh
+# install-proxmox-temp-api.sh
 # Proxmox Temperature API Installation
 # Run this on EACH Proxmox node
 #
-# This installs a temperature endpoint into the Proxmox API:
-#   GET /api2/json/nodes/{node}/temperature
+# This installs a temperature service on port 8899:
+#   GET http://{node-ip}:8899/temperature
 
 set -e
 
@@ -12,16 +12,15 @@ echo "========================================================"
 echo "Proxmox Temperature API Installation"
 echo "========================================================"
 echo ""
-echo "This script will install a temperature API endpoint"
-echo "accessible via the standard Proxmox API:"
+echo "This script will install a temperature service"
+echo "accessible directly on port 8899:"
 echo ""
-echo "  GET /api2/json/nodes/{node}/temperature"
+echo "  GET http://{node-ip}:8899/temperature"
 echo ""
 echo "Components installed:"
 echo "  1. Temperature reader (Python script)"
-echo "  2. HTTP service (localhost:8899)"
+echo "  2. HTTP service (port 8899)"
 echo "  3. Systemd service (auto-start)"
-echo "  4. Apache proxy (integrates with Proxmox API)"
 echo ""
 read -p "Continue installation? [y/N] " -n 1 -r
 echo
@@ -44,7 +43,7 @@ fi
 
 echo ""
 echo "========================================================"
-echo "Step 1/5: Installing Temperature Reader"
+echo "Step 1/4: Installing Temperature Reader"
 echo "========================================================"
 
 cat > /usr/local/bin/proxmox-temp-reader.py << 'PYTHON_READER_EOF'
@@ -261,7 +260,7 @@ fi
 
 echo ""
 echo "========================================================"
-echo "Step 2/5: Installing HTTP Service"
+echo "Step 2/4: Installing HTTP Service"
 echo "========================================================"
 
 cat > /usr/local/bin/proxmox-temp-service.py << 'PYTHON_SERVICE_EOF'
@@ -458,8 +457,8 @@ class TemperatureHandler(BaseHTTPRequestHandler):
         pass  # Suppress access logs
 
 def main():
-    server = HTTPServer(('127.0.0.1', 8899), TemperatureHandler)
-    print("Proxmox Temperature Service listening on localhost:8899")
+    server = HTTPServer(('0.0.0.0', 8899), TemperatureHandler)
+    print("Proxmox Temperature Service listening on 0.0.0.0:8899")
     try:
         server.serve_forever()
     except KeyboardInterrupt:
@@ -474,7 +473,7 @@ echo "  Created: /usr/local/bin/proxmox-temp-service.py"
 
 echo ""
 echo "========================================================"
-echo "Step 3/5: Creating Service User and Systemd Service"
+echo "Step 3/4: Creating Service User and Systemd Service"
 echo "========================================================"
 
 # Create unprivileged user for the service
@@ -540,66 +539,22 @@ echo "  Service enabled and started"
 
 echo ""
 echo "========================================================"
-echo "Step 4/5: Configuring Proxmox API Integration"
-echo "========================================================"
-
-# Enable Apache proxy module
-a2enmod proxy_http > /dev/null 2>&1 || true
-
-# Create Apache configuration
-cat > /etc/apache2/conf-available/proxmox-temp-api.conf << 'APACHE_EOF'
-# Proxmox Temperature API Endpoint
-# Integrates temperature service with Proxmox API
-# Endpoint: /api2/json/nodes/*/temperature
-
-<LocationMatch "^/api2/json/nodes/[^/]+/temperature$">
-    ProxyPass http://127.0.0.1:8899/temperature
-    ProxyPassReverse http://127.0.0.1:8899/temperature
-</LocationMatch>
-APACHE_EOF
-
-echo "  Created: /etc/apache2/conf-available/proxmox-temp-api.conf"
-
-# Enable configuration
-a2enconf proxmox-temp-api > /dev/null 2>&1
-
-# Reload Apache
-systemctl reload apache2
-
-echo "  Apache proxy configured and reloaded"
-
-echo ""
-echo "========================================================"
-echo "Step 5/5: Testing Installation"
+echo "Step 4/4: Testing Installation"
 echo "========================================================"
 
 sleep 2
 
-# Test internal service
+# Test the service
 echo ""
-echo "  Testing internal service (localhost:8899)..."
+echo "  Testing temperature service (port 8899)..."
 if curl -s http://localhost:8899/health > /dev/null 2>&1; then
     echo "    Health check: OK"
     TEMP_RESULT=$(curl -s http://localhost:8899/temperature)
     TEMP_VALUE=$(echo "$TEMP_RESULT" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('data',{}).get('temperature','N/A'))" 2>/dev/null || echo "N/A")
     echo "    Temperature: ${TEMP_VALUE}°C"
 else
-    echo "    WARNING: Internal service not responding"
+    echo "    WARNING: Service not responding"
     systemctl status proxmox-temp-api.service --no-pager
-fi
-
-# Test via Proxmox API
-echo ""
-echo "  Testing via Proxmox API..."
-NODE_NAME=$(hostname)
-API_TEST=$(curl -sk "https://localhost:8006/api2/json/nodes/${NODE_NAME}/temperature" 2>/dev/null)
-if echo "$API_TEST" | grep -q '"status"'; then
-    echo "    API endpoint: OK"
-    API_TEMP=$(echo "$API_TEST" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('data',{}).get('temperature','N/A'))" 2>/dev/null || echo "N/A")
-    echo "    Temperature via API: ${API_TEMP}°C"
-else
-    echo "    Note: API test requires authentication"
-    echo "    Use 'pvesh get /nodes/${NODE_NAME}/temperature' to test with auth"
 fi
 
 echo ""
@@ -607,15 +562,13 @@ echo "========================================================"
 echo "Installation Complete!"
 echo "========================================================"
 echo ""
-echo "The temperature API is now available at:"
-echo "  /api2/json/nodes/${NODE_NAME}/temperature"
+NODE_IP=$(hostname -I | awk '{print $1}')
+NODE_NAME=$(hostname)
+echo "The temperature service is now available at:"
+echo "  http://${NODE_IP}:8899/temperature"
 echo ""
-echo "Test with pvesh:"
-echo "  pvesh get /nodes/${NODE_NAME}/temperature"
-echo ""
-echo "Test with curl (requires API token):"
-echo "  curl -k -H 'Authorization: PVEAPIToken=USER@REALM!TOKEN=SECRET' \\"
-echo "       https://$(hostname):8006/api2/json/nodes/${NODE_NAME}/temperature"
+echo "Test with curl:"
+echo "  curl http://${NODE_IP}:8899/temperature"
 echo ""
 echo "Response format:"
 echo "  {\"data\":{\"temperature\":45.0,\"source\":\"coretemp\",\"status\":\"ok\"}}"
@@ -629,9 +582,15 @@ echo "Files installed:"
 echo "  /usr/local/bin/proxmox-temp-reader.py"
 echo "  /usr/local/bin/proxmox-temp-service.py"
 echo "  /etc/systemd/system/proxmox-temp-api.service"
-echo "  /etc/apache2/conf-available/proxmox-temp-api.conf"
 echo ""
 echo "These files survive Proxmox updates!"
+echo ""
+echo "========================================================"
+echo "FIREWALL NOTE"
+echo "========================================================"
+echo ""
+echo "If you have a firewall, allow port 8899 from your dashboard:"
+echo "  iptables -I INPUT -p tcp --dport 8899 -s YOUR_LAPTOP_IP -j ACCEPT"
 echo ""
 echo "========================================================"
 echo "NEXT: Install this script on ALL other Proxmox nodes"
