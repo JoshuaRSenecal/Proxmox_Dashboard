@@ -1,12 +1,55 @@
 #!/bin/bash
-# install-proxmox-temp-api.sh
-# Proxmox Temperature API Installation
+# install-proxmox-temp-api-with-firewall.sh
+# Proxmox Temperature API Installation with Optional Firewall Security
 # Run this on EACH Proxmox node
 #
 # This installs a temperature service on port 8899:
 #   GET http://{node-ip}:8899/temperature
+#
+# Usage:
+#   bash install-proxmox-temp-api-with-firewall.sh              # Interactive (asks about firewall)
+#   bash install-proxmox-temp-api-with-firewall.sh --skip-firewall  # Skip firewall setup
+#   bash install-proxmox-temp-api-with-firewall.sh --firewall-ip 192.168.1.50  # Auto-configure firewall
 
 set -e
+
+# Parse command line arguments
+SKIP_FIREWALL=false
+FIREWALL_IP=""
+AUTO_FIREWALL=false
+
+while [[ $# -gt 0 ]]; do
+    case $1 in
+        --skip-firewall)
+            SKIP_FIREWALL=true
+            shift
+            ;;
+        --firewall-ip)
+            FIREWALL_IP="$2"
+            AUTO_FIREWALL=true
+            shift 2
+            ;;
+        --help)
+            echo "Usage: $0 [OPTIONS]"
+            echo ""
+            echo "Options:"
+            echo "  --skip-firewall          Skip firewall configuration"
+            echo "  --firewall-ip IP         Auto-configure firewall for specified IP"
+            echo "  --help                   Show this help message"
+            echo ""
+            echo "Examples:"
+            echo "  $0                                    # Interactive mode"
+            echo "  $0 --skip-firewall                    # Install without firewall"
+            echo "  $0 --firewall-ip 192.168.1.50         # Auto-configure for IP"
+            exit 0
+            ;;
+        *)
+            echo "Unknown option: $1"
+            echo "Use --help for usage information"
+            exit 1
+            ;;
+    esac
+done
 
 echo "========================================================"
 echo "Proxmox Temperature API Installation"
@@ -21,6 +64,9 @@ echo "Components installed:"
 echo "  1. Temperature reader (Python script)"
 echo "  2. HTTP service (port 8899)"
 echo "  3. Systemd service (auto-start)"
+if [ "$SKIP_FIREWALL" = false ]; then
+    echo "  4. Firewall configuration (optional)"
+fi
 echo ""
 read -p "Continue installation? [y/N] " -n 1 -r
 echo
@@ -566,8 +612,159 @@ echo ""
 echo "Test with curl:"
 echo "  curl http://${NODE_IP}:8899/temperature"
 echo ""
-echo "Response format:"
-echo "  {\"data\":{\"temperature\":45.0,\"source\":\"coretemp\",\"status\":\"ok\"}}"
+
+# ============================================================================
+# FIREWALL CONFIGURATION (OPTIONAL)
+# ============================================================================
+
+if [ "$SKIP_FIREWALL" = false ]; then
+    echo ""
+    echo "========================================================"
+    echo "OPTIONAL: Firewall Security Configuration"
+    echo "========================================================"
+    echo ""
+    echo "The temperature service is currently accessible from"
+    echo "ANY IP address on your network."
+    echo ""
+    echo "Would you like to configure firewall rules to restrict"
+    echo "access to specific IP addresses? (Recommended)"
+    echo ""
+    
+    if [ "$AUTO_FIREWALL" = true ]; then
+        # Auto mode - use provided IP
+        CONFIGURE_FIREWALL="y"
+        DASHBOARD_IP="$FIREWALL_IP"
+        echo "Auto-configuring firewall for IP: $FIREWALL_IP"
+    else
+        # Interactive mode - ask user
+        read -p "Configure firewall now? [Y/n] " -n 1 -r
+        echo
+        CONFIGURE_FIREWALL="$REPLY"
+    fi
+    
+    if [[ $CONFIGURE_FIREWALL =~ ^[Yy]$|^$ ]]; then
+        echo ""
+        echo "Setting up firewall rules for port 8899..."
+        echo ""
+        
+        # Get dashboard IP if not provided
+        if [ -z "$DASHBOARD_IP" ]; then
+            CURRENT_IP=$(who am i | awk '{print $5}' | tr -d '()')
+            if [ -z "$CURRENT_IP" ]; then
+                CURRENT_IP="YOUR_LAPTOP_IP"
+            fi
+            
+            echo "Your current IP appears to be: $CURRENT_IP"
+            echo ""
+            read -p "Enter dashboard IP address [$CURRENT_IP]: " INPUT_IP
+            DASHBOARD_IP=${INPUT_IP:-$CURRENT_IP}
+        fi
+        
+        # Ask for additional IPs (only in interactive mode)
+        ADDITIONAL_IPS=""
+        if [ "$AUTO_FIREWALL" = false ]; then
+            echo ""
+            echo "Additional IPs to allow (comma-separated, or press Enter to skip):"
+            read -p "Additional IPs: " ADDITIONAL_IPS
+        fi
+        
+        # Check if iptables-persistent is installed
+        if ! command -v iptables-save &> /dev/null; then
+            echo ""
+            echo "Installing iptables-persistent..."
+            apt-get update -qq
+            DEBIAN_FRONTEND=noninteractive apt-get install -y iptables-persistent >/dev/null 2>&1
+            echo "  Installed iptables-persistent"
+        fi
+        
+        echo ""
+        echo "Configuring firewall rules..."
+        
+        # Check if rules already exist
+        EXISTING_RULES=$(iptables -L INPUT -n | grep -c "dpt:8899" || true)
+        if [ "$EXISTING_RULES" -gt 0 ]; then
+            echo "  Found existing rules for port 8899"
+            read -p "  Remove existing rules and reconfigure? [y/N] " -n 1 -r
+            echo
+            if [[ $REPLY =~ ^[Yy]$ ]]; then
+                # Remove existing rules
+                while iptables -D INPUT -p tcp --dport 8899 -j ACCEPT 2>/dev/null; do :; done
+                while iptables -D INPUT -p tcp --dport 8899 -j DROP 2>/dev/null; do :; done
+                echo "  Removed existing rules"
+            else
+                echo "  Keeping existing rules"
+                DASHBOARD_IP=""  # Skip adding new rules
+            fi
+        fi
+        
+        # Add new rules if needed
+        if [ -n "$DASHBOARD_IP" ] && [ "$DASHBOARD_IP" != "YOUR_LAPTOP_IP" ]; then
+            # Allow localhost
+            iptables -I INPUT -p tcp --dport 8899 -s 127.0.0.1 -j ACCEPT 2>/dev/null || true
+            
+            # Allow dashboard IP
+            iptables -I INPUT -p tcp --dport 8899 -s "$DASHBOARD_IP" -j ACCEPT
+            echo "  Allowed: $DASHBOARD_IP"
+            
+            # Allow additional IPs
+            if [ -n "$ADDITIONAL_IPS" ]; then
+                IFS=',' read -ra IPS <<< "$ADDITIONAL_IPS"
+                for ip in "${IPS[@]}"; do
+                    ip=$(echo "$ip" | xargs)  # Trim whitespace
+                    if [ -n "$ip" ]; then
+                        iptables -I INPUT -p tcp --dport 8899 -s "$ip" -j ACCEPT
+                        echo "  Allowed: $ip"
+                    fi
+                done
+            fi
+            
+            # Drop all other connections to port 8899
+            iptables -A INPUT -p tcp --dport 8899 -j DROP 2>/dev/null || true
+            echo "  All other IPs blocked"
+            
+            # Save rules
+            echo ""
+            echo "Saving firewall rules..."
+            iptables-save > /etc/iptables/rules.v4
+            echo "  Rules saved to /etc/iptables/rules.v4"
+            
+            echo ""
+            echo "══════════════════════════════════════════════════"
+            echo "Firewall Configuration Complete"
+            echo "══════════════════════════════════════════════════"
+            echo ""
+            echo "Active rules for port 8899:"
+            iptables -L INPUT -n -v | grep 8899 || echo "  (No rules found)"
+            echo ""
+            echo "To manage firewall rules later:"
+            echo ""
+            echo "  Add IP:    iptables -I INPUT -p tcp --dport 8899 -s NEW_IP -j ACCEPT"
+            echo "             iptables-save > /etc/iptables/rules.v4"
+            echo ""
+            echo "  Remove IP: iptables -D INPUT -p tcp --dport 8899 -s OLD_IP -j ACCEPT"
+            echo "             iptables-save > /etc/iptables/rules.v4"
+            echo ""
+            echo "  View:      iptables -L INPUT -n -v | grep 8899"
+            echo ""
+        fi
+    else
+        echo ""
+        echo "Skipping firewall configuration."
+        echo ""
+        echo "WARNING: Port 8899 is accessible from any IP!"
+        echo ""
+        echo "To configure firewall later, run:"
+        echo "  iptables -I INPUT -p tcp --dport 8899 -s YOUR_LAPTOP_IP -j ACCEPT"
+        echo "  iptables -A INPUT -p tcp --dport 8899 -j DROP"
+        echo "  iptables-save > /etc/iptables/rules.v4"
+        echo ""
+    fi
+fi
+
+echo ""
+echo "========================================================"
+echo "Setup Summary"
+echo "========================================================"
 echo ""
 echo "Service management:"
 echo "  systemctl status proxmox-temp-api"
@@ -580,27 +777,6 @@ echo "  /usr/local/bin/proxmox-temp-service.py"
 echo "  /etc/systemd/system/proxmox-temp-api.service"
 echo ""
 echo "These files survive Proxmox updates!"
-echo ""
-echo "========================================================"
-echo "FIREWALL NOTE"
-echo "========================================================"
-echo ""
-echo "If you have a firewall, allow port 8899 from your dashboard:"
-echo "  iptables -I INPUT -p tcp --dport 8899 -s YOUR_LAPTOP_IP -j ACCEPT"
-echo ""
-echo "========================================================"
-echo "UNINSTALL"
-echo "========================================================"
-echo ""
-echo "To remove this installation, run:"
-echo "  systemctl stop proxmox-temp-api"
-echo "  systemctl disable proxmox-temp-api"
-echo "  rm /etc/systemd/system/proxmox-temp-api.service"
-echo "  rm /usr/local/bin/proxmox-temp-reader.py"
-echo "  rm /usr/local/bin/proxmox-temp-service.py"
-echo "  rm -rf /var/cache/proxmox-temp"
-echo "  userdel proxmox-temp"
-echo "  systemctl daemon-reload"
 echo ""
 echo "========================================================"
 echo "NEXT: Install this script on ALL other Proxmox nodes"
