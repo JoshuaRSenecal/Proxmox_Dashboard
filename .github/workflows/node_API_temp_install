@@ -5,11 +5,6 @@
 #
 # This installs a temperature service on port 8899:
 #   GET http://{node-ip}:8899/temperature
-#
-# Usage:
-#   bash install-proxmox-temp-api-with-firewall.sh              # Interactive (asks about firewall)
-#   bash install-proxmox-temp-api-with-firewall.sh --skip-firewall  # Skip firewall setup
-#   bash install-proxmox-temp-api-with-firewall.sh --firewall-ip 192.168.1.50  # Auto-configure firewall
 
 set -e
 
