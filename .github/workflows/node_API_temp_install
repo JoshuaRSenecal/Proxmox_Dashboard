@@ -5,6 +5,11 @@
 #
 # This installs a temperature service on port 8899:
 #   GET http://{node-ip}:8899/temperature
+#
+# Usage:
+#   bash install-proxmox-temp-api-with-firewall.sh              # Interactive (asks about firewall)
+#   bash install-proxmox-temp-api-with-firewall.sh --skip-firewall  # Skip firewall setup
+#   bash install-proxmox-temp-api-with-firewall.sh --firewall-ip 192.168.1.50  # Auto-configure firewall
 
 set -e
 
@@ -644,15 +649,34 @@ if [ "$SKIP_FIREWALL" = false ]; then
         
         # Get dashboard IP if not provided
         if [ -z "$DASHBOARD_IP" ]; then
-            CURRENT_IP=$(who am i | awk '{print $5}' | tr -d '()')
-            if [ -z "$CURRENT_IP" ]; then
-                CURRENT_IP="YOUR_LAPTOP_IP"
+            # Try to detect IP from SSH connection
+            CURRENT_IP=""
+            
+            # Method 1: SSH_CLIENT variable (most reliable)
+            if [ -n "$SSH_CLIENT" ]; then
+                CURRENT_IP=$(echo $SSH_CLIENT | awk '{print $1}')
             fi
             
-            echo "Your current IP appears to be: $CURRENT_IP"
-            echo ""
-            read -p "Enter dashboard IP address [$CURRENT_IP]: " INPUT_IP
-            DASHBOARD_IP=${INPUT_IP:-$CURRENT_IP}
+            # Method 2: SSH_CONNECTION variable (fallback)
+            if [ -z "$CURRENT_IP" ] && [ -n "$SSH_CONNECTION" ]; then
+                CURRENT_IP=$(echo $SSH_CONNECTION | awk '{print $1}')
+            fi
+            
+            # Method 3: who command (last resort)
+            if [ -z "$CURRENT_IP" ]; then
+                CURRENT_IP=$(who am i | awk '{print $5}' | tr -d '()')
+            fi
+            
+            if [ -n "$CURRENT_IP" ] && [ "$CURRENT_IP" != "" ]; then
+                echo "Your current IP appears to be: $CURRENT_IP"
+                echo ""
+                read -p "Enter dashboard IP address [$CURRENT_IP]: " INPUT_IP
+                DASHBOARD_IP=${INPUT_IP:-$CURRENT_IP}
+            else
+                echo "Could not automatically detect your IP address."
+                echo ""
+                read -p "Enter dashboard IP address: " DASHBOARD_IP
+            fi
         fi
         
         # Ask for additional IPs (only in interactive mode)
@@ -693,7 +717,7 @@ if [ "$SKIP_FIREWALL" = false ]; then
         fi
         
         # Add new rules if needed
-        if [ -n "$DASHBOARD_IP" ] && [ "$DASHBOARD_IP" != "YOUR_LAPTOP_IP" ]; then
+        if [ -n "$DASHBOARD_IP" ] && [ "$DASHBOARD_IP" != "YOUR_LAPTOP_IP" ] && [ "$DASHBOARD_IP" != "" ]; then
             # Allow localhost
             iptables -I INPUT -p tcp --dport 8899 -s 127.0.0.1 -j ACCEPT 2>/dev/null || true
             
@@ -720,8 +744,27 @@ if [ "$SKIP_FIREWALL" = false ]; then
             # Save rules
             echo ""
             echo "Saving firewall rules..."
-            iptables-save > /etc/iptables/rules.v4
-            echo "  Rules saved to /etc/iptables/rules.v4"
+            
+            # Ensure directory exists
+            mkdir -p /etc/iptables
+            
+            # Save rules
+            if iptables-save > /etc/iptables/rules.v4 2>/dev/null; then
+                echo "  Rules saved to /etc/iptables/rules.v4"
+            else
+                # Fallback: try alternative method
+                echo "  Attempting alternative save method..."
+                if command -v netfilter-persistent &> /dev/null; then
+                    netfilter-persistent save
+                    echo "  Rules saved via netfilter-persistent"
+                elif [ -f /etc/init.d/iptables-persistent ]; then
+                    /etc/init.d/iptables-persistent save
+                    echo "  Rules saved via iptables-persistent"
+                else
+                    iptables-save > /etc/iptables/rules.v4
+                    echo "  Rules saved to /etc/iptables/rules.v4"
+                fi
+            fi
             
             echo ""
             echo "══════════════════════════════════════════════════"
@@ -740,6 +783,18 @@ if [ "$SKIP_FIREWALL" = false ]; then
             echo "             iptables-save > /etc/iptables/rules.v4"
             echo ""
             echo "  View:      iptables -L INPUT -n -v | grep 8899"
+            echo ""
+        else
+            echo ""
+            echo "ERROR: No valid dashboard IP address provided."
+            echo "Firewall configuration skipped."
+            echo ""
+            echo "WARNING: Port 8899 is accessible from any IP!"
+            echo ""
+            echo "To configure firewall manually:"
+            echo "  iptables -I INPUT -p tcp --dport 8899 -s YOUR_DASHBOARD_IP -j ACCEPT"
+            echo "  iptables -A INPUT -p tcp --dport 8899 -j DROP"
+            echo "  iptables-save > /etc/iptables/rules.v4"
             echo ""
         fi
     else
