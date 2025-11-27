@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+# Proxmox Dashboard - Live Data Feed with Node Temperature Monitoring
+# Version 2.4
 
 import tkinter as tk
 from tkinter import ttk, messagebox, simpledialog
@@ -1173,6 +1175,20 @@ class ProxmoxDashboard:
             bd=2
         ).pack(side=tk.LEFT, padx=5)
         
+        tk.Button(
+            btn_container,
+            text="Change Credentials",
+            command=self.change_credentials,
+            bg="#9b59b6",
+            fg="white",
+            font=("Arial", 10, "bold"),
+            width=15,
+            height=2,
+            cursor="hand2",
+            relief=tk.RAISED,
+            bd=2
+        ).pack(side=tk.LEFT, padx=5)
+        
         # Live feed controls
         live_controls = tk.Frame(btn_container, bg="#ecf0f1")
         live_controls.pack(side=tk.LEFT, padx=15)
@@ -1332,27 +1348,74 @@ class ProxmoxDashboard:
                 if master_password is None:
                     return False
                 
+                # Try to decrypt credentials
                 try:
                     creds = CredentialManager.load_credentials(master_password)
-                    if creds:
-                        # Only token authentication supported
-                        self.api = ProxmoxAPI(
-                            creds['host'],
-                            token_id=creds['token_id'],
-                            token_secret=creds['token_secret']
-                        )
+                except Exception as decrypt_error:
+                    logger.error(f"Failed to decrypt credentials: {str(decrypt_error)}")
+                    messagebox.showerror(
+                        "Decryption Error", 
+                        f"Failed to decrypt credentials:\n{str(decrypt_error)}\n\n"
+                        "Please check your master password."
+                    )
+                    continue  # Ask for password again
+                
+                if not creds:
+                    messagebox.showerror("Error", "No credentials found in file.")
+                    continue
+                
+                # Credentials decrypted successfully, now try to authenticate
+                try:
+                    self.api = ProxmoxAPI(
+                        creds['host'],
+                        token_id=creds['token_id'],
+                        token_secret=creds['token_secret']
+                    )
+                    
+                    self.status_label.config(text=f"Connected to {creds['host']}")
+                    self.ssl_label.config(text=f"SSL: {self.api.ssl_status}")
+                    self.connection_healthy = True
+                    logger.info(f"Successfully authenticated to {creds['host']}")
+                    return True
+                
+                except Exception as auth_error:
+                    # Authentication failed - token might be revoked or invalid
+                    logger.error(f"Authentication failed with stored credentials: {str(auth_error)}")
+                    
+                    # Ask user what to do
+                    response = messagebox.askyesno(
+                        "Authentication Failed",
+                        f"Failed to authenticate with stored credentials:\n\n{str(auth_error)}\n\n"
+                        "The API token may have been revoked or is invalid.\n\n"
+                        "Would you like to delete the old credentials and set up new ones?",
+                        icon='warning'
+                    )
+                    
+                    if response:
+                        # Delete old credentials and go to setup
+                        try:
+                            os.remove(CREDENTIALS_FILE)
+                            logger.info("Deleted invalid credentials file")
+                        except Exception as e:
+                            logger.error(f"Failed to delete credentials file: {e}")
                         
-                        self.status_label.config(text=f"Connected to {creds['host']}")
-                        self.ssl_label.config(text=f"SSL: {self.api.ssl_status}")
-                        self.connection_healthy = True
-                        logger.info(f"Successfully authenticated to {creds['host']}")
-                        return True
-                except Exception as e:
-                    logger.error(f"Authentication failed: {str(e)}")
-                    messagebox.showerror("Error", f"Failed to decrypt or connect:\n{str(e)}")
+                        messagebox.showinfo(
+                            "Credentials Deleted",
+                            "Old credentials have been deleted.\n\n"
+                            "You will now be guided through setting up new credentials."
+                        )
+                        break  # Exit the while loop and go to setup flow
+                    else:
+                        # User chose not to delete, ask for password again
+                        continue
         
-        # Show token creation guide first
-        messagebox.showinfo("Setup Required", "No credentials found.\n\nYou'll need to create an API token in Proxmox first.\n\nThe next screen will show you how.")
+        # No credentials file exists OR user deleted it - show setup flow
+        messagebox.showinfo(
+            "Setup Required", 
+            "No credentials found.\n\n"
+            "You'll need to create an API token in Proxmox first.\n\n"
+            "The next screen will show you how."
+        )
         guide = TokenCreationGuide(self.root)
         self.root.wait_window(guide)
         
@@ -1363,7 +1426,7 @@ class ProxmoxDashboard:
         if dialog.result:
             auth_type, host, user, password, token_id, token_secret, master = dialog.result
             try:
-                # Only token authentication
+                # Try to authenticate with new credentials
                 self.api = ProxmoxAPI(host, token_id=token_id, token_secret=token_secret)
                 CredentialManager.save_credentials(host, master, token_id, token_secret)
                 
@@ -1912,6 +1975,74 @@ class ProxmoxDashboard:
         
         self.run_async(stop_vm, callback=stop_callback)
     
+    def change_credentials(self):
+        """Allow user to change stored credentials"""
+        response = messagebox.askyesno(
+            "Change Credentials",
+            "This will delete your current credentials and guide you through setting up new ones.\n\n"
+            "Continue?",
+            icon='warning'
+        )
+        
+        if not response:
+            return
+        
+        # Delete old credentials
+        try:
+            if os.path.exists(CREDENTIALS_FILE):
+                os.remove(CREDENTIALS_FILE)
+                logger.info("User requested credential change - deleted old credentials")
+        except Exception as e:
+            logger.error(f"Failed to delete credentials file: {e}")
+            messagebox.showerror("Error", f"Failed to delete credentials:\n{str(e)}")
+            return
+        
+        # Close current API connection
+        self.api = None
+        self.connection_healthy = False
+        
+        # Show setup flow
+        messagebox.showinfo(
+            "Setup New Credentials",
+            "You'll need to create a new API token in Proxmox.\n\n"
+            "The next screen will show you how."
+        )
+        
+        guide = TokenCreationGuide(self.root)
+        self.root.wait_window(guide)
+        
+        # Show credentials entry
+        dialog = CredentialsDialog(self.root, is_setup=True)
+        self.root.wait_window(dialog)
+        
+        if dialog.result:
+            auth_type, host, user, password, token_id, token_secret, master = dialog.result
+            try:
+                # Try to authenticate with new credentials
+                self.api = ProxmoxAPI(host, token_id=token_id, token_secret=token_secret)
+                CredentialManager.save_credentials(host, master, token_id, token_secret)
+                
+                messagebox.showinfo("Success", "New credentials saved successfully!\n\nThe dashboard will now refresh.")
+                self.status_label.config(text=f"Connected to {host}")
+                self.ssl_label.config(text=f"SSL: {self.api.ssl_status}")
+                self.connection_healthy = True
+                logger.info(f"Successfully changed credentials to {host}")
+                
+                # Refresh dashboard
+                self.refresh_data()
+            except Exception as e:
+                logger.error(f"Connection setup failed: {str(e)}")
+                messagebox.showerror("Error", f"Connection failed:\n{str(e)}\n\nPlease try again.")
+                self.connection_healthy = False
+        else:
+            messagebox.showwarning(
+                "Cancelled",
+                "Credential change cancelled.\n\n"
+                "Your old credentials were already deleted.\n"
+                "You'll need to restart the dashboard and set up credentials to continue."
+            )
+            self.root.quit()
+
     def start_all_stopped(self):
         """Start all stopped VMs/CTs"""
         stopped = [vm for vm in self.vm_data if vm['status'] != 'running']
