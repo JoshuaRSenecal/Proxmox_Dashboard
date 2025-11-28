@@ -609,6 +609,7 @@ class ProxmoxDashboard:
         self.node_temp_labels = {}
         self.node_temp_api_available = {}
         self.node_addresses = {}  # Maps node names to IP addresses for temperature API
+        self.node_temps_full_data = {}  # Store full temperature data for details view
         
         self.setup_styles()
         self.create_widgets()
@@ -885,8 +886,11 @@ class ProxmoxDashboard:
         thread.start()
 
     def _update_temp_ui(self, node_temps):
-        """Update temperature UI elements (must run on main thread)"""
+        """Update temperature UI elements - COMPACT VIEW showing only CPU package"""
         logger.debug(f"_update_temp_ui called with {len(node_temps)} nodes")
+        
+        # Store full temp data for details view
+        self.node_temps_full_data = node_temps
         
         # Clear existing temperature labels
         cleared_count = 0
@@ -926,20 +930,157 @@ class ProxmoxDashboard:
                 logger.debug(f"    No sensors for {node_name}")
                 continue
             
-            # Create container for this node's sensors
-            node_container = tk.Frame(self.node_temp_frame, bg="#34495e")
-            node_container.is_temp_label = True
-            node_container.pack(side=tk.LEFT, padx=5)
+            # COMPACT VIEW: Show only CPU Package (or highest CPU core if no package)
+            cpu_package = None
+            cpu_cores = []
             
-            # Node name label
-            node_label = tk.Label(
-                node_container,
-                text=f"{node_name}:",
-                font=("Arial", 9, "bold"),
+            for sensor in sensors:
+                sensor_type = sensor.get('type')
+                if sensor_type == 'cpu_package':
+                    cpu_package = sensor
+                    break
+                elif sensor_type == 'cpu_core':
+                    cpu_cores.append(sensor)
+            
+            # Use package temp, or highest core temp as fallback
+            display_sensor = cpu_package
+            if not display_sensor and cpu_cores:
+                display_sensor = max(cpu_cores, key=lambda s: s.get('temperature', 0))
+            
+            if display_sensor:
+                temp = display_sensor.get('temperature')
+                label_text = display_sensor.get('label', 'CPU')
+                temp_color = self.get_temp_color(temp)
+                
+                # Create compact display: "node: temp°C"
+                sensor_label = tk.Label(
+                    self.node_temp_frame,
+                    text=f"{node_name}: {temp}°C",
+                    font=("Arial", 10, "bold"),
+                    bg="#34495e",
+                    fg=temp_color,
+                    cursor="hand2"
+                )
+                sensor_label.is_temp_label = True
+                sensor_label.pack(side=tk.LEFT, padx=10)
+                
+                # Tooltip shows it's clickable
+                tooltip = f"CPU Temperature: {temp}°C\nClick for detailed sensor view"
+                self._bind_tooltip(sensor_label, tooltip)
+                
+                # Click to show details
+                sensor_label.bind("<Button-1>", lambda e, nn=node_name: self.show_temperature_details(nn))
+                
+                logger.debug(f"    Displayed compact temp for {node_name}: {temp}°C")
+            else:
+                # No CPU temp found, show sensor count
+                label = tk.Label(
+                    self.node_temp_frame,
+                    text=f"{node_name}: {len(sensors)} sensors",
+                    font=("Arial", 9),
+                    bg="#34495e",
+                    fg="#bdc3c7",
+                    cursor="hand2"
+                )
+                label.is_temp_label = True
+                label.pack(side=tk.LEFT, padx=8)
+                label.bind("<Button-1>", lambda e, nn=node_name: self.show_temperature_details(nn))
+                self._bind_tooltip(label, "Click for detailed sensor view")
+        
+        logger.debug(f"_update_temp_ui completed")
+    
+    def show_temperature_details(self, node_name=None):
+        """Show detailed temperature window for all sensors"""
+        if not hasattr(self, 'node_temps_full_data'):
+            messagebox.showinfo("Temperature Details", "No temperature data available yet.\nPlease wait for data refresh.")
+            return
+        
+        # Create details window
+        details_window = tk.Toplevel(self.root)
+        details_window.title(f"Temperature Details - {node_name if node_name else 'All Nodes'}")
+        details_window.geometry("800x600")
+        
+        # Center window
+        details_window.update_idletasks()
+        x = (details_window.winfo_screenwidth() // 2) - 400
+        y = (details_window.winfo_screenheight() // 2) - 300
+        details_window.geometry(f"800x600+{x}+{y}")
+        
+        # Title
+        title_frame = tk.Frame(details_window, bg="#2c3e50", height=50)
+        title_frame.pack(fill=tk.X)
+        title_frame.pack_propagate(False)
+        
+        tk.Label(
+            title_frame,
+            text=f"Temperature Sensors - {node_name if node_name else 'All Nodes'}",
+            font=("Arial", 14, "bold"),
+            bg="#2c3e50",
+            fg="white"
+        ).pack(pady=12)
+        
+        # Scrollable content
+        canvas = tk.Canvas(details_window, bg="white")
+        scrollbar = tk.Scrollbar(details_window, orient="vertical", command=canvas.yview)
+        scrollable_frame = tk.Frame(canvas, bg="white")
+        
+        scrollable_frame.bind(
+            "<Configure>",
+            lambda e: canvas.configure(scrollregion=canvas.bbox("all"))
+        )
+        
+        canvas.create_window((0, 0), window=scrollable_frame, anchor="nw")
+        canvas.configure(yscrollcommand=scrollbar.set)
+        
+        # Filter nodes to display
+        nodes_to_show = {}
+        if node_name:
+            if node_name in self.node_temps_full_data:
+                nodes_to_show[node_name] = self.node_temps_full_data[node_name]
+        else:
+            nodes_to_show = self.node_temps_full_data
+        
+        # Display each node's sensors
+        for nn, temp_info in nodes_to_show.items():
+            # Node header
+            node_frame = tk.Frame(scrollable_frame, bg="#ecf0f1", relief=tk.RAISED, borderwidth=2)
+            node_frame.pack(fill=tk.X, padx=10, pady=10)
+            
+            header_frame = tk.Frame(node_frame, bg="#34495e")
+            header_frame.pack(fill=tk.X)
+            
+            tk.Label(
+                header_frame,
+                text=f"Node: {nn}",
+                font=("Arial", 12, "bold"),
                 bg="#34495e",
-                fg="#bdc3c7"
-            )
-            node_label.pack(side=tk.LEFT, padx=(0, 5))
+                fg="white",
+                anchor="w"
+            ).pack(side=tk.LEFT, padx=10, pady=8)
+            
+            node_ip = self.node_addresses.get(nn, 'unknown')
+            tk.Label(
+                header_frame,
+                text=f"IP: {node_ip}:8899",
+                font=("Arial", 9),
+                bg="#34495e",
+                fg="#bdc3c7",
+                anchor="e"
+            ).pack(side=tk.RIGHT, padx=10, pady=8)
+            
+            # Sensor data
+            sensors = temp_info.get('sensors', [])
+            status = temp_info.get('status')
+            
+            if status != 'ok' or not sensors:
+                tk.Label(
+                    node_frame,
+                    text=f"Status: {status}" if status != 'ok' else "No sensors found",
+                    font=("Arial", 10),
+                    bg="#ecf0f1",
+                    fg="#e74c3c"
+                ).pack(padx=10, pady=10)
+                continue
             
             # Group sensors by type
             sensor_groups = {
@@ -955,67 +1096,110 @@ class ProxmoxDashboard:
                 sensor_type = sensor.get('type', 'other')
                 sensor_groups[sensor_type].append(sensor)
             
-            logger.debug(f"    Sensor groups: {[(k, len(v)) for k, v in sensor_groups.items() if v]}")
-            
-            # Display sensors in priority order
+            # Display sensors grouped by type
             display_order = ['cpu_package', 'cpu_core', 'thermal_zone', 'motherboard', 'nvme', 'other']
+            type_names = {
+                'cpu_package': 'CPU Package',
+                'cpu_core': 'CPU Cores',
+                'thermal_zone': 'Thermal Zones',
+                'motherboard': 'Motherboard',
+                'nvme': 'NVMe Drives',
+                'other': 'Other Sensors'
+            }
             
-            displayed = 0
             for sensor_type in display_order:
                 group_sensors = sensor_groups[sensor_type]
                 if not group_sensors:
                     continue
                 
-                for sensor in group_sensors[:3]:  # Limit to 3 sensors per type to avoid clutter
+                # Type header
+                type_frame = tk.Frame(node_frame, bg="#ecf0f1")
+                type_frame.pack(fill=tk.X, padx=10, pady=(10, 5))
+                
+                tk.Label(
+                    type_frame,
+                    text=type_names[sensor_type],
+                    font=("Arial", 10, "bold"),
+                    bg="#ecf0f1",
+                    fg="#2c3e50"
+                ).pack(anchor="w")
+                
+                # Sensors in this group
+                for sensor in group_sensors:
                     temp = sensor.get('temperature')
                     label_text = sensor.get('label', 'Unknown')
+                    chip = sensor.get('chip', 'N/A')
                     
-                    # Create sensor label with color coding
+                    sensor_frame = tk.Frame(node_frame, bg="white")
+                    sensor_frame.pack(fill=tk.X, padx=20, pady=2)
+                    
+                    # Temperature with color
                     temp_color = self.get_temp_color(temp)
-                    sensor_label = tk.Label(
-                        node_container,
-                        text=f"{label_text}: {temp}°C",
-                        font=("Arial", 8),
-                        bg="#34495e",
-                        fg=temp_color
-                    )
-                    sensor_label.pack(side=tk.LEFT, padx=2)
-                    displayed += 1
+                    tk.Label(
+                        sensor_frame,
+                        text=f"{label_text}:",
+                        font=("Arial", 9),
+                        bg="white",
+                        anchor="w",
+                        width=30
+                    ).pack(side=tk.LEFT)
                     
-                    # Add tooltip with detailed info
-                    node_ip = self.node_addresses.get(node_name, 'unknown')
-                    tooltip = (
-                        f"IP: {node_ip}:8899\n"
-                        f"Sensor: {sensor.get('sensor', 'N/A')}\n"
-                        f"Chip: {sensor.get('chip', 'N/A')}\n"
-                        f"Type: {sensor_type}"
-                    )
-                    self._bind_tooltip(sensor_label, tooltip)
-                
-                # Add separator between sensor types
-                if sensor_type != 'other' and any(sensor_groups[t] for t in display_order[display_order.index(sensor_type)+1:]):
-                    sep = tk.Label(
-                        node_container,
-                        text="|",
+                    tk.Label(
+                        sensor_frame,
+                        text=f"{temp}°C",
+                        font=("Arial", 9, "bold"),
+                        bg="white",
+                        fg=temp_color,
+                        width=10
+                    ).pack(side=tk.LEFT)
+                    
+                    tk.Label(
+                        sensor_frame,
+                        text=f"({chip})",
                         font=("Arial", 8),
-                        bg="#34495e",
+                        bg="white",
                         fg="#7f8c8d"
-                    )
-                    sep.pack(side=tk.LEFT, padx=3)
-            
-            logger.debug(f"    Displayed {displayed} temperature labels for {node_name}")
+                    ).pack(side=tk.LEFT, padx=5)
         
-        logger.debug(f"_update_temp_ui completed")
+        # Pack scrollbar and canvas
+        canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+        
+        # Close button
+        btn_frame = tk.Frame(details_window, bg="white")
+        btn_frame.pack(fill=tk.X, pady=10)
+        
+        tk.Button(
+            btn_frame,
+            text="Close",
+            command=details_window.destroy,
+            bg="#95a5a6",
+            fg="white",
+            font=("Arial", 10, "bold"),
+            width=15,
+            cursor="hand2"
+        ).pack()
 
     def _bind_tooltip(self, widget, text):
-        """Bind tooltip to widget"""
+        """Bind tooltip to widget - FIXED: properly destroy on leave"""
+        tooltip_window = None
+        
         def on_enter(event):
-            tooltip = tk.Toplevel()
-            tooltip.wm_overrideredirect(True)
-            tooltip.wm_geometry(f"+{event.x_root+10}+{event.y_root+10}")
+            nonlocal tooltip_window
+            # Destroy any existing tooltip first
+            if tooltip_window:
+                try:
+                    tooltip_window.destroy()
+                except:
+                    pass
+            
+            # Create new tooltip
+            tooltip_window = tk.Toplevel()
+            tooltip_window.wm_overrideredirect(True)
+            tooltip_window.wm_geometry(f"+{event.x_root+10}+{event.y_root+10}")
             
             label = tk.Label(
-                tooltip,
+                tooltip_window,
                 text=text,
                 background="#34495e",
                 foreground="#ecf0f1",
@@ -1027,17 +1211,23 @@ class ProxmoxDashboard:
                 pady=3
             )
             label.pack()
-            
-            widget._tooltip = tooltip
         
         def on_leave(event):
-            if hasattr(widget, '_tooltip'):
-                widget._tooltip.destroy()
-                del widget._tooltip
+            nonlocal tooltip_window
+            # Destroy tooltip when mouse leaves
+            if tooltip_window:
+                try:
+                    tooltip_window.destroy()
+                    tooltip_window = None
+                except:
+                    pass
         
-        # Remove old bindings
-        widget.unbind("<Enter>")
-        widget.unbind("<Leave>")
+        # Remove old bindings if they exist
+        try:
+            widget.unbind("<Enter>")
+            widget.unbind("<Leave>")
+        except:
+            pass
         
         # Add new bindings
         widget.bind("<Enter>", on_enter)
@@ -1068,6 +1258,22 @@ class ProxmoxDashboard:
             bg="#34495e",
             fg="#bdc3c7"
         ).pack(side=tk.LEFT, padx=(0, 10))
+        
+        # Add Details button on the right side
+        details_btn = tk.Button(
+            self.node_temp_container,
+            text="📊 Details",
+            command=lambda: self.show_temperature_details(None),
+            bg="#3498db",
+            fg="white",
+            font=("Arial", 9, "bold"),
+            cursor="hand2",
+            relief=tk.FLAT,
+            padx=10,
+            pady=5
+        )
+        details_btn.pack(side=tk.RIGHT, padx=10, pady=5)
+        self._bind_tooltip(details_btn, "Click to see all temperature sensors")
         
         # Left section: Title
         title_label = tk.Label(
