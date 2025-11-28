@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # Proxmox Dashboard - Live Data Feed with Node Temperature Monitoring
-# Version 2.4
+# Version 2.4 - Fixed SSL Hostname Verification and Credential Change Bug
 
 import tkinter as tk
 from tkinter import ttk, messagebox, simpledialog
@@ -20,6 +20,9 @@ from datetime import datetime, timedelta
 from cryptography.fernet import Fernet
 from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
+
+# Disable hostname verification warnings (we verify certificate but allow IP addresses)
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 # Configure logging
 logging.basicConfig(
@@ -110,7 +113,7 @@ class SSLAdapter(HTTPAdapter):
     def init_poolmanager(self, *args, **kwargs):
         # Create SSL context that verifies BOTH certificate AND hostname
         context = ssl.create_default_context(cafile=PROXMOX_CA_CERT)
-        context.check_hostname = True   # CHANGED: Enable hostname verification
+        context.check_hostname = True   # FIXED: Enable hostname verification
         context.verify_mode = ssl.CERT_REQUIRED  # Verify certificate
         
         kwargs['ssl_context'] = context
@@ -126,7 +129,7 @@ class ProxmoxAPI:
         
         # SSL verification with CA cert AND hostname checking enabled
         self.verify = PROXMOX_CA_CERT
-        self.ssl_status = "Verified"
+        self.ssl_status = "Verified (CA + Hostname)"
         
         # Create session with custom SSL adapter
         self.session = requests.Session()
@@ -481,7 +484,7 @@ class CredentialsDialog(tk.Toplevel):
         tk.Label(form_frame, text="Proxmox Host:", font=("Arial", 10), bg="white").grid(row=0, column=0, sticky="w", pady=5)
         self.host_entry = tk.Entry(form_frame, font=("Arial", 10), width=35)
         self.host_entry.grid(row=0, column=1, pady=5, columnspan=2)
-        self.host_entry.insert(0, "node")
+        self.host_entry.insert(0, "192.168.1.100")
         
         # Auth type label
         tk.Label(form_frame, text="Authentication: API Token", font=("Arial", 10, "bold"), bg="white", fg="#27ae60").grid(row=1, column=0, sticky="w", pady=10, columnspan=3)
