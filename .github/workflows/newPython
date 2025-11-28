@@ -721,6 +721,7 @@ class ProxmoxDashboard:
         def check_async():
             try:
                 nodes = self.api.get('/nodes')
+                logger.info(f"Checking temperature API on {len(nodes)} node(s)")
                 
                 # For single-node setups, use the API host
                 # For clusters, try to get node IPs from /cluster/status
@@ -729,7 +730,9 @@ class ProxmoxDashboard:
                     for item in cluster_status:
                         if item.get('type') == 'node' and item.get('ip'):
                             self.node_addresses[item['name']] = item['ip']
+                            logger.debug(f"Node {item['name']} IP from cluster: {item['ip']}")
                 except Exception:
+                    logger.debug("Single-node setup or cluster API unavailable")
                     pass  # Single-node setup or cluster API unavailable
                 
                 # Default any missing nodes to API host
@@ -737,6 +740,7 @@ class ProxmoxDashboard:
                     node_name = node['node']
                     if node_name not in self.node_addresses:
                         self.node_addresses[node_name] = self.api.host
+                        logger.debug(f"Node {node_name} using default host: {self.api.host}")
                 
                 # Check all nodes in parallel using ThreadPoolExecutor
                 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -744,31 +748,36 @@ class ProxmoxDashboard:
                 def check_node(node_name):
                     try:
                         result = self._get_node_temperature_direct(node_name, timeout=1.5)
-                        return node_name, (result and result.get('status') == 'ok')
-                    except Exception:
-                        return node_name, False
+                        available = result and result.get('status') == 'ok'
+                        sensor_count = len(result.get('sensors', [])) if result else 0
+                        return node_name, available, sensor_count
+                    except Exception as e:
+                        logger.debug(f"Exception checking {node_name}: {e}")
+                        return node_name, False, 0
                 
                 with ThreadPoolExecutor(max_workers=min(len(nodes), 5)) as executor:
                     futures = {executor.submit(check_node, node['node']): node['node'] for node in nodes}
                     
                     for future in as_completed(futures, timeout=5):
                         try:
-                            node_name, available = future.result()
+                            node_name, available, sensor_count = future.result()
                             self.node_temp_api_available[node_name] = available
                             if available:
-                                logger.info(f"Temperature API available on {node_name} ({self.node_addresses.get(node_name)}:8899)")
+                                logger.info(f"✓ Temperature API available on {node_name} ({self.node_addresses.get(node_name)}:8899) - {sensor_count} sensors")
                             else:
-                                logger.debug(f"Temperature API not available on {node_name}")
+                                logger.info(f"✗ Temperature API not available on {node_name}")
                         except Exception as e:
                             node_name = futures[future]
                             self.node_temp_api_available[node_name] = False
+                            logger.warning(f"Error checking {node_name}: {e}")
                 
                 available_count = sum(1 for v in self.node_temp_api_available.values() if v)
                 
                 if available_count == 0:
-                    logger.info("Temperature API not installed on any nodes (this is optional)")
+                    logger.warning("Temperature API not installed on any nodes (this is optional)")
+                    logger.info("To install: Run install-proxmox-temp-api-NO-FIREWALL.sh on each node")
                 else:
-                    logger.info(f"Temperature API available on {available_count}/{len(nodes)} nodes")
+                    logger.info(f"✓ Temperature API available on {available_count}/{len(nodes)} nodes")
             
             except Exception as e:
                 logger.error(f"Failed to check temperature API status: {e}")
@@ -802,12 +811,14 @@ class ProxmoxDashboard:
         Returns dict of {node_name: {sensors: [...], primary_temp: X, status: ...}}
         """
         if not self.api:
+            logger.debug("get_all_node_temperatures: No API connection")
             return {}
         
         node_temps = {}
         
         try:
             nodes = self.api.get('/nodes')
+            logger.debug(f"get_all_node_temperatures: Fetching temps for {len(nodes)} nodes")
         except Exception as e:
             logger.error(f"Failed to get node list: {e}")
             return {}
@@ -821,6 +832,7 @@ class ProxmoxDashboard:
                     'status': 'not_installed',
                     'sensors': []
                 }
+                logger.debug(f"  {node_name}: Skipping (API not installed)")
             else:
                 nodes_to_check.append(node_name)
         
@@ -832,9 +844,13 @@ class ProxmoxDashboard:
                 try:
                     result = self._get_node_temperature_direct(node_name, timeout=1.5)
                     if result and result.get('status') == 'ok':
+                        sensor_count = len(result.get('sensors', []))
+                        logger.debug(f"  {node_name}: Got {sensor_count} sensors")
                         return node_name, result, True
+                    logger.debug(f"  {node_name}: Status={result.get('status') if result else 'None'}")
                     return node_name, result or {'status': 'error', 'sensors': []}, False
-                except Exception:
+                except Exception as e:
+                    logger.debug(f"  {node_name}: Exception: {e}")
                     return node_name, {'status': 'exception', 'sensors': []}, False
             
             with ThreadPoolExecutor(max_workers=min(len(nodes_to_check), 5)) as executor:
@@ -845,11 +861,13 @@ class ProxmoxDashboard:
                         node_name, temp_data, available = future.result()
                         node_temps[node_name] = temp_data
                         self.node_temp_api_available[node_name] = available
-                    except Exception:
+                    except Exception as e:
                         node_name = futures[future]
+                        logger.warning(f"  {node_name}: Timeout/error: {e}")
                         node_temps[node_name] = {'status': 'timeout', 'sensors': []}
                         self.node_temp_api_available[node_name] = False
         
+        logger.debug(f"get_all_node_temperatures: Returning data for {len(node_temps)} nodes")
         return node_temps
 
     def update_node_temperatures(self):
@@ -868,13 +886,19 @@ class ProxmoxDashboard:
 
     def _update_temp_ui(self, node_temps):
         """Update temperature UI elements (must run on main thread)"""
+        logger.debug(f"_update_temp_ui called with {len(node_temps)} nodes")
+        
         # Clear existing temperature labels
+        cleared_count = 0
         for widget in self.node_temp_frame.winfo_children():
             if hasattr(widget, 'is_temp_label'):
                 widget.destroy()
+                cleared_count += 1
+        logger.debug(f"  Cleared {cleared_count} old temperature labels")
         
         for node_name, temp_info in node_temps.items():
             status = temp_info.get('status')
+            logger.debug(f"  {node_name}: status={status}, sensors={len(temp_info.get('sensors', []))}")
             
             if status != 'ok':
                 # Show node with error status
@@ -882,7 +906,7 @@ class ProxmoxDashboard:
                     self.node_temp_frame,
                     text=f"{node_name}: N/A",
                     font=("Arial", 9, "bold"),
-                    bg="#2c3e50",
+                    bg="#34495e",
                     fg="#95a5a6"
                 )
                 label.is_temp_label = True
@@ -893,11 +917,13 @@ class ProxmoxDashboard:
                 if status == 'not_installed':
                     tooltip += "\nTemperature API not installed\nRun install script on this node"
                 self._bind_tooltip(label, tooltip)
+                logger.debug(f"    Created N/A label for {node_name}")
                 continue
             
             # Get all sensors for this node
             sensors = temp_info.get('sensors', [])
             if not sensors:
+                logger.debug(f"    No sensors for {node_name}")
                 continue
             
             # Create container for this node's sensors
@@ -929,9 +955,12 @@ class ProxmoxDashboard:
                 sensor_type = sensor.get('type', 'other')
                 sensor_groups[sensor_type].append(sensor)
             
+            logger.debug(f"    Sensor groups: {[(k, len(v)) for k, v in sensor_groups.items() if v]}")
+            
             # Display sensors in priority order
             display_order = ['cpu_package', 'cpu_core', 'thermal_zone', 'motherboard', 'nvme', 'other']
             
+            displayed = 0
             for sensor_type in display_order:
                 group_sensors = sensor_groups[sensor_type]
                 if not group_sensors:
@@ -951,6 +980,7 @@ class ProxmoxDashboard:
                         fg=temp_color
                     )
                     sensor_label.pack(side=tk.LEFT, padx=2)
+                    displayed += 1
                     
                     # Add tooltip with detailed info
                     node_ip = self.node_addresses.get(node_name, 'unknown')
@@ -972,6 +1002,10 @@ class ProxmoxDashboard:
                         fg="#7f8c8d"
                     )
                     sep.pack(side=tk.LEFT, padx=3)
+            
+            logger.debug(f"    Displayed {displayed} temperature labels for {node_name}")
+        
+        logger.debug(f"_update_temp_ui completed")
 
     def _bind_tooltip(self, widget, text):
         """Bind tooltip to widget"""
