@@ -481,7 +481,7 @@ class CredentialsDialog(tk.Toplevel):
         tk.Label(form_frame, text="Proxmox Host:", font=("Arial", 10), bg="white").grid(row=0, column=0, sticky="w", pady=5)
         self.host_entry = tk.Entry(form_frame, font=("Arial", 10), width=35)
         self.host_entry.grid(row=0, column=1, pady=5, columnspan=2)
-        self.host_entry.insert(0, "192.168.1.100")
+        self.host_entry.insert(0, "node")
         
         # Auth type label
         tk.Label(form_frame, text="Authentication: API Token", font=("Arial", 10, "bold"), bg="white", fg="#27ae60").grid(row=1, column=0, sticky="w", pady=10, columnspan=3)
