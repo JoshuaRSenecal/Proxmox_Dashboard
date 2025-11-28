@@ -126,7 +126,7 @@ class ProxmoxAPI:
         
         # SSL verification with CA cert AND hostname checking enabled
         self.verify = PROXMOX_CA_CERT
-        self.ssl_status = "Verified (CA + Hostname)"
+        self.ssl_status = "Verified"
         
         # Create session with custom SSL adapter
         self.session = requests.Session()
