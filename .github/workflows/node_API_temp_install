@@ -387,33 +387,42 @@ class TemperatureReader:
             }
     
     def _parse_sensors_output(self, output):
-        """Parse sensors output"""
+        """Parse sensors output - matches reader logic"""
         sensors = []
         current_chip = None
         current_sensor = None
+        current_label = None
         current_input = None
         
         for line in output.split('\n'):
             line = line.strip()
             
+            # New chip/adapter
             if line and not line.startswith(' ') and ':' not in line:
                 current_chip = line
                 continue
             
+            # Adapter line
             if line.startswith('Adapter:'):
                 continue
             
-            if line and not line.startswith(' '):
+            # Temperature sensor label (non-indented line with colon)
+            if line and not line.startswith(' ') and ':' in line:
+                # This is a sensor name (e.g., "Core 0:", "Package id 0:")
                 current_sensor = line.rstrip(':')
+                current_label = None
                 current_input = None
                 continue
             
+            # Indented lines contain the actual values
             if line.startswith(' ') and current_sensor:
+                # Parse key-value pairs
                 if ':' in line:
                     key, value = line.split(':', 1)
                     key = key.strip()
                     value = value.strip()
                     
+                    # Look for temperature input values
                     if '_input' in key and 'temp' in key:
                         try:
                             temp_value = float(value)
@@ -421,9 +430,15 @@ class TemperatureReader:
                         except ValueError:
                             continue
                     
+                    # Look for labels
+                    elif '_label' in key and 'temp' in key:
+                        current_label = value
+                    
+                    # When we have input, create sensor entry
                     if current_input is not None:
+                        # Determine sensor type and create meaningful label
                         sensor_type, display_label = self._categorize_sensor(
-                            current_chip, current_sensor, None
+                            current_chip, current_sensor, current_label
                         )
                         
                         sensors.append({
@@ -435,8 +450,10 @@ class TemperatureReader:
                             'unit': 'C'
                         })
                         
-                        current_sensor = None
+                        # Reset for next temperature in same sensor
+                        current_label = None
                         current_input = None
+                        # NOTE: Don't reset current_sensor here - same sensor can have multiple temps
         
         return sensors
     
