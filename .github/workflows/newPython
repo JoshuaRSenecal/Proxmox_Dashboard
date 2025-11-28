@@ -21,9 +21,6 @@ from cryptography.fernet import Fernet
 from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
 
-# Disable hostname verification warnings (we verify certificate but allow IP addresses)
-urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
-
 # Configure logging
 logging.basicConfig(
     level=logging.INFO,
@@ -108,13 +105,13 @@ class AuditLogger:
 
 
 class SSLAdapter(HTTPAdapter):
-    """Custom HTTPAdapter that verifies CA cert but allows any hostname (including IPs)"""
+    """Custom HTTPAdapter that verifies both CA cert AND hostname"""
     
     def init_poolmanager(self, *args, **kwargs):
-        # Create SSL context that verifies certificate but not hostname
+        # Create SSL context that verifies BOTH certificate AND hostname
         context = ssl.create_default_context(cafile=PROXMOX_CA_CERT)
-        context.check_hostname = False  # Allow IP addresses
-        context.verify_mode = ssl.CERT_REQUIRED  # Still verify certificate
+        context.check_hostname = True   # CHANGED: Enable hostname verification
+        context.verify_mode = ssl.CERT_REQUIRED  # Verify certificate
         
         kwargs['ssl_context'] = context
         return super().init_poolmanager(*args, **kwargs)
@@ -127,9 +124,9 @@ class ProxmoxAPI:
         self.base = f"https://{host}:8006/api2/json"
         self.host = host
         
-        # SSL verification with CA cert but hostname checking disabled (allows IP addresses)
+        # SSL verification with CA cert AND hostname checking enabled
         self.verify = PROXMOX_CA_CERT
-        self.ssl_status = "Verified"
+        self.ssl_status = "Verified (CA + Hostname)"
         
         # Create session with custom SSL adapter
         self.session = requests.Session()
