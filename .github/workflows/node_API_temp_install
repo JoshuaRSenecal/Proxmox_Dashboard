@@ -387,18 +387,25 @@ class TemperatureReader:
             }
     
     def _parse_sensors_output(self, output):
-        """Parse sensors output - matches reader logic"""
+        """Parse sensors output - FIXED: check indentation before stripping"""
         sensors = []
         current_chip = None
         current_sensor = None
         current_label = None
         current_input = None
         
-        for line in output.split('\n'):
-            line = line.strip()
+        for original_line in output.split('\n'):
+            # Preserve original for indentation check
+            line = original_line.strip()
             
-            # New chip/adapter
-            if line and not line.startswith(' ') and ':' not in line:
+            if not line:  # Skip empty lines
+                continue
+            
+            # Check if original line is indented
+            is_indented = original_line and original_line[0] in (' ', '\t')
+            
+            # New chip/adapter (not indented, no colon)
+            if not is_indented and ':' not in line:
                 current_chip = line
                 continue
             
@@ -406,54 +413,49 @@ class TemperatureReader:
             if line.startswith('Adapter:'):
                 continue
             
-            # Temperature sensor label (non-indented line with colon)
-            if line and not line.startswith(' ') and ':' in line:
-                # This is a sensor name (e.g., "Core 0:", "Package id 0:")
+            # Sensor name (not indented, ends with colon)
+            if not is_indented and line.endswith(':'):
                 current_sensor = line.rstrip(':')
                 current_label = None
                 current_input = None
                 continue
             
-            # Indented lines contain the actual values
-            if line.startswith(' ') and current_sensor:
-                # Parse key-value pairs
-                if ':' in line:
-                    key, value = line.split(':', 1)
-                    key = key.strip()
-                    value = value.strip()
+            # Value lines (indented, has colon)
+            if is_indented and current_sensor and ':' in line:
+                key, value = line.split(':', 1)
+                key = key.strip()
+                value = value.strip()
+                
+                # Look for temperature input values
+                if '_input' in key and 'temp' in key:
+                    try:
+                        temp_value = float(value)
+                        current_input = temp_value
+                    except ValueError:
+                        continue
+                
+                # Look for labels
+                elif '_label' in key and 'temp' in key:
+                    current_label = value
+                
+                # When we have input, create sensor entry
+                if current_input is not None:
+                    sensor_type, display_label = self._categorize_sensor(
+                        current_chip, current_sensor, current_label
+                    )
                     
-                    # Look for temperature input values
-                    if '_input' in key and 'temp' in key:
-                        try:
-                            temp_value = float(value)
-                            current_input = temp_value
-                        except ValueError:
-                            continue
+                    sensors.append({
+                        'chip': current_chip,
+                        'sensor': current_sensor,
+                        'label': display_label,
+                        'type': sensor_type,
+                        'temperature': round(current_input, 1),
+                        'unit': 'C'
+                    })
                     
-                    # Look for labels
-                    elif '_label' in key and 'temp' in key:
-                        current_label = value
-                    
-                    # When we have input, create sensor entry
-                    if current_input is not None:
-                        # Determine sensor type and create meaningful label
-                        sensor_type, display_label = self._categorize_sensor(
-                            current_chip, current_sensor, current_label
-                        )
-                        
-                        sensors.append({
-                            'chip': current_chip,
-                            'sensor': current_sensor,
-                            'label': display_label,
-                            'type': sensor_type,
-                            'temperature': round(current_input, 1),
-                            'unit': 'C'
-                        })
-                        
-                        # Reset for next temperature in same sensor
-                        current_label = None
-                        current_input = None
-                        # NOTE: Don't reset current_sensor here - same sensor can have multiple temps
+                    # Reset for next temperature (don't reset current_sensor)
+                    current_label = None
+                    current_input = None
         
         return sensors
     
