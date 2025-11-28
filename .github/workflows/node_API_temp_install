@@ -21,9 +21,10 @@ echo ""
 echo "  GET http://{node-ip}:8899/temperature"
 echo ""
 echo "Components installed:"
-echo "  1. Temperature reader (Python script)"
-echo "  2. HTTP service (port 8899)"
-echo "  3. Systemd service (auto-start)"
+echo "  1. lm-sensors for standardized sensor detection"
+echo "  2. Temperature reader (Python script)"
+echo "  3. HTTP service (port 8899)"
+echo "  4. Systemd service (auto-start)"
 echo ""
 read -p "Continue installation? [y/N] " -n 1 -r
 echo
@@ -46,202 +47,271 @@ fi
 
 echo ""
 echo "========================================================"
-echo "Step 1/4: Installing Temperature Reader"
+echo "Step 1/5: Installing lm-sensors"
+echo "========================================================"
+
+# Install lm-sensors if not present
+if ! command -v sensors &> /dev/null; then
+    echo "  Installing lm-sensors package..."
+    apt-get update -qq
+    apt-get install -y lm-sensors > /dev/null 2>&1
+    echo "  lm-sensors installed"
+else
+    echo "  lm-sensors already installed"
+fi
+
+# Detect sensors (non-interactive)
+echo "  Detecting hardware sensors..."
+sensors-detect --auto > /dev/null 2>&1 || true
+echo "  Sensor detection complete"
+
+# Test sensors command
+echo ""
+echo "  Testing sensor detection..."
+if sensors > /dev/null 2>&1; then
+    echo "  Sensors detected successfully"
+    sensors | head -20
+else
+    echo "  WARNING: No sensors detected"
+    echo "  Temperature monitoring may not work on this system"
+fi
+
+echo ""
+echo "========================================================"
+echo "Step 2/5: Installing Temperature Reader"
 echo "========================================================"
 
 cat > /usr/local/bin/proxmox-temp-reader.py << 'PYTHON_READER_EOF'
 #!/usr/bin/env python3
 """
-Robust CPU Temperature Reader with Dynamic Cache
-Handles hwmon device renumbering and multiple CPU sensor types
+Proxmox Temperature Reader using lm-sensors
+Collects all available temperature sensors with proper labels
 """
-import os
-import glob
+import subprocess
 import json
+import re
 import sys
-import time
 
-class CPUTemperatureReader:
-    # Priority order for CPU sensors
-    CPU_SENSOR_NAMES = [
-        'coretemp',     # Intel CPUs
-        'k10temp',      # AMD Ryzen/EPYC
-        'zenpower',     # AMD Zen (alternative driver)
-        'cpu_thermal',  # ARM CPUs
-        'acpitz',       # ACPI thermal zone (fallback)
-    ]
+class TemperatureReader:
+    def __init__(self):
+        self.sensors_cmd = '/usr/bin/sensors'
     
-    # Patterns to identify CPU temp inputs
-    CPU_TEMP_PATTERNS = [
-        'temp1_input',
-        'temp2_input',
-        'temp_input',
-        'package_temp',
-    ]
-    
-    def __init__(self, cache_timeout=None):
-        self.hwmon_base = '/sys/class/hwmon'
-        self.cache_file = '/var/cache/proxmox-temp/sensor.cache'
-        self.cache_valid_seconds = cache_timeout if cache_timeout else 30
-    
-    def find_cpu_sensor(self):
-        """Dynamically find CPU temperature sensor"""
-        cached = self._load_cache()
-        if cached and self._verify_sensor_exists(cached):
-            return cached
-        return self._scan_for_cpu_sensor()
-    
-    def _scan_for_cpu_sensor(self):
-        """Scan hwmon devices for CPU sensor"""
-        hwmon_devices = sorted(glob.glob(f'{self.hwmon_base}/hwmon*'))
-        
-        for hwmon_path in hwmon_devices:
-            name_file = os.path.join(hwmon_path, 'name')
-            if not os.path.exists(name_file):
-                continue
-            
-            try:
-                with open(name_file, 'r') as f:
-                    sensor_name = f.read().strip()
-                
-                if sensor_name in self.CPU_SENSOR_NAMES:
-                    temp_file = self._find_temp_input(hwmon_path)
-                    if temp_file:
-                        result = (hwmon_path, sensor_name, temp_file)
-                        self._save_cache(result)
-                        return result
-            except (IOError, OSError):
-                continue
-        
-        return (None, None, None)
-    
-    def _find_temp_input(self, hwmon_path):
-        """Find the correct temperature input file"""
-        for pattern in self.CPU_TEMP_PATTERNS:
-            temp_path = os.path.join(hwmon_path, pattern)
-            if os.path.exists(temp_path):
-                try:
-                    with open(temp_path, 'r') as f:
-                        value = int(f.read().strip())
-                        if 0 < value < 150000:
-                            return pattern
-                except (IOError, ValueError):
-                    continue
-        return None
-    
-    def _verify_sensor_exists(self, cached_sensor):
-        """Verify cached sensor still exists and works"""
-        hwmon_path, sensor_name, temp_file = cached_sensor
+    def read_all_temperatures(self):
+        """Read all temperature sensors using lm-sensors"""
         try:
-            if not os.path.exists(hwmon_path):
-                return False
+            result = subprocess.run(
+                [self.sensors_cmd, '-A', '-u'],
+                capture_output=True,
+                text=True,
+                timeout=5
+            )
             
-            name_file = os.path.join(hwmon_path, 'name')
-            with open(name_file, 'r') as f:
-                current_name = f.read().strip()
+            if result.returncode != 0:
+                return {
+                    'status': 'error',
+                    'error': 'sensors command failed',
+                    'sensors': []
+                }
             
-            if current_name != sensor_name:
-                return False
-            
-            temp_path = os.path.join(hwmon_path, temp_file)
-            if not os.path.exists(temp_path):
-                return False
-            
-            with open(temp_path, 'r') as f:
-                value = int(f.read().strip())
-                if not (0 < value < 150000):
-                    return False
-            
-            return True
-        except (IOError, ValueError, OSError):
-            return False
-    
-    def _load_cache(self):
-        """Load cached sensor location"""
-        try:
-            if not os.path.exists(self.cache_file):
-                return None
-            
-            cache_age = time.time() - os.path.getmtime(self.cache_file)
-            if cache_age > self.cache_valid_seconds:
-                return None
-            
-            with open(self.cache_file, 'r') as f:
-                data = json.load(f)
-                return (data['path'], data['name'], data['file'])
-        except (IOError, json.JSONDecodeError, KeyError):
-            return None
-    
-    def _save_cache(self, sensor_info):
-        """Cache sensor location for faster subsequent reads"""
-        hwmon_path, sensor_name, temp_file = sensor_info
-        try:
-            os.makedirs(os.path.dirname(self.cache_file), exist_ok=True)
-            with open(self.cache_file, 'w') as f:
-                json.dump({
-                    'path': hwmon_path,
-                    'name': sensor_name,
-                    'file': temp_file,
-                    'cached_at': time.time(),
-                    'cache_timeout': self.cache_valid_seconds
-                }, f)
-            os.chmod(self.cache_file, 0o644)
-        except (IOError, OSError):
-            pass
-    
-    def read_temperature(self):
-        """Read CPU temperature"""
-        hwmon_path, sensor_name, temp_file = self.find_cpu_sensor()
-        
-        if not hwmon_path:
-            return {
-                'temperature': None,
-                'source': 'none',
-                'status': 'no_sensor_found',
-                'cache_timeout': self.cache_valid_seconds
-            }
-        
-        try:
-            temp_path = os.path.join(hwmon_path, temp_file)
-            with open(temp_path, 'r') as f:
-                temp_raw = int(f.read().strip())
-            
-            temp_celsius = round(temp_raw / 1000.0, 1)
-            hwmon_num = os.path.basename(hwmon_path)
+            sensors = self._parse_sensors_output(result.stdout)
             
             return {
-                'temperature': temp_celsius,
-                'source': sensor_name,
-                'hwmon': hwmon_num,
-                'file': temp_file,
                 'status': 'ok',
-                'cache_timeout': self.cache_valid_seconds
+                'sensors': sensors,
+                'count': len(sensors)
             }
-        except (IOError, ValueError, OSError) as e:
+        
+        except FileNotFoundError:
             return {
-                'temperature': None,
-                'source': sensor_name,
-                'status': f'read_error: {str(e)}',
-                'cache_timeout': self.cache_valid_seconds
+                'status': 'error',
+                'error': 'lm-sensors not installed',
+                'sensors': []
             }
+        except subprocess.TimeoutExpired:
+            return {
+                'status': 'error',
+                'error': 'sensors command timeout',
+                'sensors': []
+            }
+        except Exception as e:
+            return {
+                'status': 'error',
+                'error': str(e),
+                'sensors': []
+            }
+    
+    def _parse_sensors_output(self, output):
+        """Parse sensors -A -u output to extract all temperature data"""
+        sensors = []
+        current_chip = None
+        current_sensor = None
+        current_label = None
+        current_input = None
+        
+        for line in output.split('\n'):
+            line = line.strip()
+            
+            # New chip/adapter
+            if line and not line.startswith(' ') and ':' not in line:
+                current_chip = line
+                continue
+            
+            # Adapter line
+            if line.startswith('Adapter:'):
+                continue
+            
+            # Temperature sensor label
+            if line and not line.startswith(' '):
+                # This is a sensor name (e.g., "Core 0:", "Package id 0:")
+                current_sensor = line.rstrip(':')
+                current_label = None
+                current_input = None
+                continue
+            
+            # Indented lines contain the actual values
+            if line.startswith(' ') and current_sensor:
+                # Parse key-value pairs
+                if ':' in line:
+                    key, value = line.split(':', 1)
+                    key = key.strip()
+                    value = value.strip()
+                    
+                    # Look for temperature input values
+                    if '_input' in key and 'temp' in key:
+                        try:
+                            temp_value = float(value)
+                            current_input = temp_value
+                        except ValueError:
+                            continue
+                    
+                    # Look for labels
+                    elif '_label' in key and 'temp' in key:
+                        current_label = value
+                    
+                    # When we have both label and input, create sensor entry
+                    if current_input is not None:
+                        # Determine sensor type and create meaningful label
+                        sensor_type, display_label = self._categorize_sensor(
+                            current_chip, current_sensor, current_label
+                        )
+                        
+                        sensors.append({
+                            'chip': current_chip,
+                            'sensor': current_sensor,
+                            'label': display_label,
+                            'type': sensor_type,
+                            'temperature': round(current_input, 1),
+                            'unit': 'C'
+                        })
+                        
+                        # Reset for next sensor
+                        current_sensor = None
+                        current_label = None
+                        current_input = None
+        
+        return sensors
+    
+    def _categorize_sensor(self, chip, sensor, label):
+        """Categorize sensor and create display label"""
+        chip_lower = chip.lower() if chip else ''
+        sensor_lower = sensor.lower() if sensor else ''
+        label_lower = label.lower() if label else ''
+        
+        # CPU Package Temperature (highest priority)
+        if any(x in chip_lower for x in ['coretemp', 'k10temp', 'zenpower']):
+            if 'package' in sensor_lower or 'tctl' in sensor_lower or 'tdie' in sensor_lower:
+                return 'cpu_package', 'CPU Package'
+            elif 'core' in sensor_lower:
+                core_num = re.search(r'core\s*(\d+)', sensor_lower)
+                if core_num:
+                    return 'cpu_core', f'CPU Core {core_num.group(1)}'
+                return 'cpu_core', 'CPU Core'
+        
+        # x86_pkg_temp (CPU package)
+        if 'x86_pkg_temp' in chip_lower:
+            return 'cpu_package', 'CPU Package'
+        
+        # ACPI Thermal Zone
+        if 'acpitz' in chip_lower or 'thermal' in chip_lower:
+            if label:
+                return 'thermal_zone', f'Thermal Zone ({label})'
+            return 'thermal_zone', 'ACPI Thermal Zone'
+        
+        # Motherboard sensors
+        if any(x in chip_lower for x in ['nct', 'it87', 'w83', 'f71', 'asus', 'gigabyte']):
+            if label:
+                return 'motherboard', f'Motherboard ({label})'
+            return 'motherboard', f'Motherboard ({sensor})'
+        
+        # NVMe drives
+        if 'nvme' in chip_lower:
+            return 'nvme', f'NVMe ({chip})'
+        
+        # Generic fallback
+        if label:
+            return 'other', label
+        return 'other', f'{chip} - {sensor}'
+    
+    def get_summary(self):
+        """Get summary with primary CPU temperature"""
+        data = self.read_all_temperatures()
+        
+        if data['status'] != 'ok' or not data['sensors']:
+            return data
+        
+        # Find CPU package temperature (preferred)
+        cpu_package = None
+        for sensor in data['sensors']:
+            if sensor['type'] == 'cpu_package':
+                cpu_package = sensor
+                break
+        
+        # If no package temp, use first CPU core
+        if not cpu_package:
+            for sensor in data['sensors']:
+                if sensor['type'] == 'cpu_core':
+                    cpu_package = sensor
+                    break
+        
+        # Add summary fields
+        if cpu_package:
+            data['primary_temp'] = cpu_package['temperature']
+            data['primary_label'] = cpu_package['label']
+            data['primary_type'] = cpu_package['type']
+        else:
+            # Use first available sensor as fallback
+            first_sensor = data['sensors'][0]
+            data['primary_temp'] = first_sensor['temperature']
+            data['primary_label'] = first_sensor['label']
+            data['primary_type'] = first_sensor['type']
+        
+        return data
 
 def main():
     import argparse
-    parser = argparse.ArgumentParser(description='Read CPU temperature')
+    parser = argparse.ArgumentParser(description='Read system temperatures')
     parser.add_argument('--json', action='store_true', help='Output JSON')
-    parser.add_argument('--cache', type=int, metavar='SECONDS', help='Cache timeout')
+    parser.add_argument('--summary', action='store_true', help='Show summary only')
     args = parser.parse_args()
     
-    reader = CPUTemperatureReader(cache_timeout=args.cache)
-    result = reader.read_temperature()
+    reader = TemperatureReader()
+    
+    if args.summary:
+        result = reader.get_summary()
+    else:
+        result = reader.read_all_temperatures()
     
     if args.json:
-        print(json.dumps(result))
+        print(json.dumps(result, indent=2))
     else:
         if result['status'] == 'ok':
-            print(f"{result['temperature']}C ({result['source']} @ {result['hwmon']}/{result['file']})")
+            print(f"Found {result['count']} temperature sensors:\n")
+            for sensor in result['sensors']:
+                print(f"  {sensor['label']}: {sensor['temperature']}°C ({sensor['type']})")
+            if 'primary_temp' in result:
+                print(f"\nPrimary: {result['primary_label']} = {result['primary_temp']}°C")
         else:
-            print(f"Error: {result['status']}")
+            print(f"Error: {result.get('error', 'Unknown error')}")
             sys.exit(1)
 
 if __name__ == '__main__':
@@ -263,7 +333,7 @@ fi
 
 echo ""
 echo "========================================================"
-echo "Step 2/4: Installing HTTP Service"
+echo "Step 3/5: Installing HTTP Service"
 echo "========================================================"
 
 cat > /usr/local/bin/proxmox-temp-service.py << 'PYTHON_SERVICE_EOF'
@@ -271,171 +341,180 @@ cat > /usr/local/bin/proxmox-temp-service.py << 'PYTHON_SERVICE_EOF'
 """
 Proxmox Temperature HTTP Service
 Provides temperature data via HTTP on port 8899
-Accessed directly by the Proxmox Dashboard
 """
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from urllib.parse import urlparse, parse_qs
+import subprocess
 import json
-import sys
-import os
-import glob
-import time
+import re
 
-class CPUTemperatureReader:
-    """CPU Temperature Reader"""
-    CPU_SENSOR_NAMES = ['coretemp', 'k10temp', 'zenpower', 'cpu_thermal', 'acpitz']
-    CPU_TEMP_PATTERNS = ['temp1_input', 'temp2_input', 'temp_input', 'package_temp']
+class TemperatureReader:
+    """Temperature reader using lm-sensors"""
     
-    def __init__(self, cache_timeout=None):
-        self.hwmon_base = '/sys/class/hwmon'
-        self.cache_file = '/var/cache/proxmox-temp/sensor.cache'
-        self.cache_valid_seconds = cache_timeout if cache_timeout else 30
+    def __init__(self):
+        self.sensors_cmd = '/usr/bin/sensors'
     
-    def find_cpu_sensor(self):
-        cached = self._load_cache()
-        if cached and self._verify_sensor_exists(cached):
-            return cached
-        return self._scan_for_cpu_sensor()
-    
-    def _scan_for_cpu_sensor(self):
-        hwmon_devices = sorted(glob.glob(f'{self.hwmon_base}/hwmon*'))
-        for hwmon_path in hwmon_devices:
-            name_file = os.path.join(hwmon_path, 'name')
-            if not os.path.exists(name_file):
-                continue
-            try:
-                with open(name_file, 'r') as f:
-                    sensor_name = f.read().strip()
-                if sensor_name in self.CPU_SENSOR_NAMES:
-                    temp_file = self._find_temp_input(hwmon_path)
-                    if temp_file:
-                        result = (hwmon_path, sensor_name, temp_file)
-                        self._save_cache(result)
-                        return result
-            except (IOError, OSError):
-                continue
-        return (None, None, None)
-    
-    def _find_temp_input(self, hwmon_path):
-        for pattern in self.CPU_TEMP_PATTERNS:
-            temp_path = os.path.join(hwmon_path, pattern)
-            if os.path.exists(temp_path):
-                try:
-                    with open(temp_path, 'r') as f:
-                        value = int(f.read().strip())
-                        if 0 < value < 150000:
-                            return pattern
-                except (IOError, ValueError):
-                    continue
-        return None
-    
-    def _verify_sensor_exists(self, cached_sensor):
-        hwmon_path, sensor_name, temp_file = cached_sensor
+    def read_all_temperatures(self):
+        """Read all temperature sensors"""
         try:
-            if not os.path.exists(hwmon_path):
-                return False
-            name_file = os.path.join(hwmon_path, 'name')
-            with open(name_file, 'r') as f:
-                current_name = f.read().strip()
-            if current_name != sensor_name:
-                return False
-            temp_path = os.path.join(hwmon_path, temp_file)
-            if not os.path.exists(temp_path):
-                return False
-            with open(temp_path, 'r') as f:
-                value = int(f.read().strip())
-                if not (0 < value < 150000):
-                    return False
-            return True
-        except (IOError, ValueError, OSError):
-            return False
-    
-    def _load_cache(self):
-        try:
-            if not os.path.exists(self.cache_file):
-                return None
-            cache_age = time.time() - os.path.getmtime(self.cache_file)
-            if cache_age > self.cache_valid_seconds:
-                return None
-            with open(self.cache_file, 'r') as f:
-                data = json.load(f)
-                return (data['path'], data['name'], data['file'])
-        except (IOError, json.JSONDecodeError, KeyError):
-            return None
-    
-    def _save_cache(self, sensor_info):
-        hwmon_path, sensor_name, temp_file = sensor_info
-        try:
-            os.makedirs(os.path.dirname(self.cache_file), exist_ok=True)
-            with open(self.cache_file, 'w') as f:
-                json.dump({
-                    'path': hwmon_path,
-                    'name': sensor_name,
-                    'file': temp_file,
-                    'cached_at': time.time(),
-                    'cache_timeout': self.cache_valid_seconds
-                }, f)
-            os.chmod(self.cache_file, 0o644)
-        except (IOError, OSError):
-            pass
-    
-    def read_temperature(self):
-        hwmon_path, sensor_name, temp_file = self.find_cpu_sensor()
-        if not hwmon_path:
+            result = subprocess.run(
+                [self.sensors_cmd, '-A', '-u'],
+                capture_output=True,
+                text=True,
+                timeout=5
+            )
+            
+            if result.returncode != 0:
+                return {
+                    'status': 'error',
+                    'error': 'sensors command failed',
+                    'sensors': []
+                }
+            
+            sensors = self._parse_sensors_output(result.stdout)
+            
             return {
-                'temperature': None,
-                'source': 'none',
-                'status': 'no_sensor_found',
-                'cache_timeout': self.cache_valid_seconds
-            }
-        try:
-            temp_path = os.path.join(hwmon_path, temp_file)
-            with open(temp_path, 'r') as f:
-                temp_raw = int(f.read().strip())
-            temp_celsius = round(temp_raw / 1000.0, 1)
-            hwmon_num = os.path.basename(hwmon_path)
-            return {
-                'temperature': temp_celsius,
-                'source': sensor_name,
-                'hwmon': hwmon_num,
-                'file': temp_file,
                 'status': 'ok',
-                'cache_timeout': self.cache_valid_seconds
+                'sensors': sensors,
+                'count': len(sensors)
             }
-        except (IOError, ValueError, OSError) as e:
+        
+        except Exception as e:
             return {
-                'temperature': None,
-                'source': sensor_name,
-                'status': f'read_error: {str(e)}',
-                'cache_timeout': self.cache_valid_seconds
+                'status': 'error',
+                'error': str(e),
+                'sensors': []
             }
+    
+    def _parse_sensors_output(self, output):
+        """Parse sensors output"""
+        sensors = []
+        current_chip = None
+        current_sensor = None
+        current_input = None
+        
+        for line in output.split('\n'):
+            line = line.strip()
+            
+            if line and not line.startswith(' ') and ':' not in line:
+                current_chip = line
+                continue
+            
+            if line.startswith('Adapter:'):
+                continue
+            
+            if line and not line.startswith(' '):
+                current_sensor = line.rstrip(':')
+                current_input = None
+                continue
+            
+            if line.startswith(' ') and current_sensor:
+                if ':' in line:
+                    key, value = line.split(':', 1)
+                    key = key.strip()
+                    value = value.strip()
+                    
+                    if '_input' in key and 'temp' in key:
+                        try:
+                            temp_value = float(value)
+                            current_input = temp_value
+                        except ValueError:
+                            continue
+                    
+                    if current_input is not None:
+                        sensor_type, display_label = self._categorize_sensor(
+                            current_chip, current_sensor, None
+                        )
+                        
+                        sensors.append({
+                            'chip': current_chip,
+                            'sensor': current_sensor,
+                            'label': display_label,
+                            'type': sensor_type,
+                            'temperature': round(current_input, 1),
+                            'unit': 'C'
+                        })
+                        
+                        current_sensor = None
+                        current_input = None
+        
+        return sensors
+    
+    def _categorize_sensor(self, chip, sensor, label):
+        """Categorize sensor type"""
+        chip_lower = chip.lower() if chip else ''
+        sensor_lower = sensor.lower() if sensor else ''
+        
+        if any(x in chip_lower for x in ['coretemp', 'k10temp', 'zenpower']):
+            if 'package' in sensor_lower or 'tctl' in sensor_lower or 'tdie' in sensor_lower:
+                return 'cpu_package', 'CPU Package'
+            elif 'core' in sensor_lower:
+                core_num = re.search(r'core\s*(\d+)', sensor_lower)
+                if core_num:
+                    return 'cpu_core', f'CPU Core {core_num.group(1)}'
+                return 'cpu_core', 'CPU Core'
+        
+        if 'x86_pkg_temp' in chip_lower:
+            return 'cpu_package', 'CPU Package'
+        
+        if 'acpitz' in chip_lower or 'thermal' in chip_lower:
+            return 'thermal_zone', 'ACPI Thermal Zone'
+        
+        if any(x in chip_lower for x in ['nct', 'it87', 'w83', 'f71', 'asus', 'gigabyte']):
+            return 'motherboard', f'Motherboard ({sensor})'
+        
+        if 'nvme' in chip_lower:
+            return 'nvme', f'NVMe ({chip})'
+        
+        return 'other', f'{chip} - {sensor}'
+    
+    def get_summary(self):
+        """Get temperature summary"""
+        data = self.read_all_temperatures()
+        
+        if data['status'] != 'ok' or not data['sensors']:
+            return data
+        
+        cpu_package = None
+        for sensor in data['sensors']:
+            if sensor['type'] == 'cpu_package':
+                cpu_package = sensor
+                break
+        
+        if not cpu_package:
+            for sensor in data['sensors']:
+                if sensor['type'] == 'cpu_core':
+                    cpu_package = sensor
+                    break
+        
+        if cpu_package:
+            data['primary_temp'] = cpu_package['temperature']
+            data['primary_label'] = cpu_package['label']
+            data['primary_type'] = cpu_package['type']
+        else:
+            first_sensor = data['sensors'][0]
+            data['primary_temp'] = first_sensor['temperature']
+            data['primary_label'] = first_sensor['label']
+            data['primary_type'] = first_sensor['type']
+        
+        return data
 
 class TemperatureHandler(BaseHTTPRequestHandler):
     """HTTP Request Handler"""
     
     def do_GET(self):
         parsed_url = urlparse(self.path)
-        query_params = parse_qs(parsed_url.query)
         
         if parsed_url.path == '/temperature':
             try:
-                cache_timeout = None
-                if 'cache' in query_params:
-                    try:
-                        cache_timeout = int(query_params['cache'][0])
-                        cache_timeout = max(1, min(300, cache_timeout))
-                    except (ValueError, IndexError):
-                        pass
+                reader = TemperatureReader()
+                result = reader.get_summary()
                 
-                reader = CPUTemperatureReader(cache_timeout=cache_timeout)
-                result = reader.read_temperature()
-                
-                # Wrap in 'data' to match Proxmox API format
                 response = {'data': result}
                 
                 self.send_response(200)
                 self.send_header('Content-Type', 'application/json')
-                self.send_header('Cache-Control', f'max-age={result.get("cache_timeout", 30)}')
+                self.send_header('Cache-Control', 'max-age=2')
                 self.end_headers()
                 self.wfile.write(json.dumps(response).encode())
             
@@ -443,7 +522,13 @@ class TemperatureHandler(BaseHTTPRequestHandler):
                 self.send_response(500)
                 self.send_header('Content-Type', 'application/json')
                 self.end_headers()
-                error_response = {'data': {'temperature': None, 'status': f'error: {str(e)}'}}
+                error_response = {
+                    'data': {
+                        'status': 'error',
+                        'error': str(e),
+                        'sensors': []
+                    }
+                }
                 self.wfile.write(json.dumps(error_response).encode())
         
         elif parsed_url.path == '/health':
@@ -457,7 +542,7 @@ class TemperatureHandler(BaseHTTPRequestHandler):
             self.end_headers()
     
     def log_message(self, format, *args):
-        pass  # Suppress access logs
+        pass
 
 def main():
     server = HTTPServer(('0.0.0.0', 8899), TemperatureHandler)
@@ -476,7 +561,7 @@ echo "  Created: /usr/local/bin/proxmox-temp-service.py"
 
 echo ""
 echo "========================================================"
-echo "Step 3/4: Creating Service User and Systemd Service"
+echo "Step 4/5: Creating Service User and Systemd Service"
 echo "========================================================"
 
 # Create unprivileged user for the service
@@ -486,12 +571,6 @@ if ! id "proxmox-temp" &>/dev/null; then
 else
     echo "  User proxmox-temp already exists"
 fi
-
-# Create cache directory with proper permissions
-mkdir -p /var/cache/proxmox-temp
-chown proxmox-temp:proxmox-temp /var/cache/proxmox-temp
-chmod 755 /var/cache/proxmox-temp
-echo "  Created cache directory: /var/cache/proxmox-temp"
 
 cat > /etc/systemd/system/proxmox-temp-api.service << 'SYSTEMD_EOF'
 [Unit]
@@ -517,7 +596,6 @@ NoNewPrivileges=true
 PrivateTmp=true
 ProtectSystem=strict
 ProtectHome=true
-ReadWritePaths=/var/cache/proxmox-temp
 ProtectKernelTunables=true
 ProtectKernelModules=true
 ProtectControlGroups=true
@@ -538,19 +616,19 @@ echo "  Service enabled and started"
 
 echo ""
 echo "========================================================"
-echo "Step 4/4: Testing Installation"
+echo "Step 5/5: Testing Installation"
 echo "========================================================"
 
 sleep 2
 
-# Test the service
 echo ""
 echo "  Testing temperature service (port 8899)..."
 if curl -s http://localhost:8899/health > /dev/null 2>&1; then
     echo "    Health check: OK"
+    echo ""
+    echo "  Temperature data:"
     TEMP_RESULT=$(curl -s http://localhost:8899/temperature)
-    TEMP_VALUE=$(echo "$TEMP_RESULT" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('data',{}).get('temperature','N/A'))" 2>/dev/null || echo "N/A")
-    echo "    Temperature: ${TEMP_VALUE}°C"
+    echo "$TEMP_RESULT" | python3 -m json.tool 2>/dev/null || echo "$TEMP_RESULT"
 else
     echo "    WARNING: Service not responding"
     systemctl status proxmox-temp-api.service --no-pager
