@@ -797,23 +797,23 @@ class ProxmoxDashboard:
             return None
     
     def _get_node_temperature_direct(self, node_name, timeout=2):
-    """
-    Get all temperature sensors directly from node's port 8899.
-    Returns None if service not available or timeout.
-    """
-    try:
-        node_ip = self.node_addresses.get(node_name, self.api.host)
-        url = f"http://{node_ip}:8899/temperature"
-        response = requests.get(url, timeout=timeout)
+        """
+        Get all temperature sensors directly from node's port 8899.
+        Returns None if service not available or timeout.
+        """
+        try:
+            node_ip = self.node_addresses.get(node_name, self.api.host)
+            url = f"http://{node_ip}:8899/temperature"
+            response = requests.get(url, timeout=timeout)
         
-        if response.status_code == 200:
-            data = response.json()
-            return data.get('data', {})
-        return None
-    except (requests.Timeout, requests.ConnectionError, requests.RequestException):
-        return None
-    except Exception:
-        return None
+            if response.status_code == 200:
+                data = response.json()
+                return data.get('data', {})
+            return None
+        except (requests.Timeout, requests.ConnectionError, requests.RequestException):
+            return None
+        except Exception:
+            return None
 
 def get_all_node_temperatures(self):
     """
