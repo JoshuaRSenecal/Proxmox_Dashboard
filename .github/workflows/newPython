@@ -779,25 +779,6 @@ class ProxmoxDashboard:
     
     def _get_node_temperature_direct(self, node_name, timeout=2):
         """
-        Get temperature directly from node's port 8899.
-        Returns None if service not available or timeout.
-        """
-        try:
-            node_ip = self.node_addresses.get(node_name, self.api.host)
-            url = f"http://{node_ip}:8899/temperature"
-            response = requests.get(url, timeout=timeout)
-            
-            if response.status_code == 200:
-                data = response.json()
-                return data.get('data', {})
-            return None
-        except (requests.Timeout, requests.ConnectionError, requests.RequestException):
-            return None
-        except Exception:
-            return None
-    
-    def _get_node_temperature_direct(self, node_name, timeout=2):
-        """
         Get all temperature sensors directly from node's port 8899.
         Returns None if service not available or timeout.
         """
@@ -815,231 +796,218 @@ class ProxmoxDashboard:
         except Exception:
             return None
 
-def get_all_node_temperatures(self):
-    """
-    Get temperature from all nodes via their temperature API.
-    Returns dict of {node_name: {sensors: [...], primary_temp: X, status: ...}}
-    """
-    if not self.api:
-        return {}
-    
-    node_temps = {}
-    
-    try:
-        nodes = self.api.get('/nodes')
-    except Exception as e:
-        logger.error(f"Failed to get node list: {e}")
-        return {}
-    
-    # Separate nodes into available and unavailable
-    nodes_to_check = []
-    for node in nodes:
-        node_name = node['node']
-        if node_name in self.node_temp_api_available and not self.node_temp_api_available[node_name]:
-            node_temps[node_name] = {
-                'status': 'not_installed',
-                'sensors': []
-            }
-        else:
-            nodes_to_check.append(node_name)
-    
-    # Query available nodes in parallel
-    if nodes_to_check:
-        from concurrent.futures import ThreadPoolExecutor, as_completed
+    def get_all_node_temperatures(self):
+        """
+        Get temperature from all nodes via their temperature API.
+        Returns dict of {node_name: {sensors: [...], primary_temp: X, status: ...}}
+        """
+        if not self.api:
+            return {}
         
-        def fetch_temp(node_name):
-            try:
-                result = self._get_node_temperature_direct(node_name, timeout=1.5)
-                if result and result.get('status') == 'ok':
-                    return node_name, result, True
-                return node_name, result or {'status': 'error', 'sensors': []}, False
-            except Exception:
-                return node_name, {'status': 'exception', 'sensors': []}, False
+        node_temps = {}
         
-        with ThreadPoolExecutor(max_workers=min(len(nodes_to_check), 5)) as executor:
-            futures = {executor.submit(fetch_temp, n): n for n in nodes_to_check}
+        try:
+            nodes = self.api.get('/nodes')
+        except Exception as e:
+            logger.error(f"Failed to get node list: {e}")
+            return {}
+        
+        # Separate nodes into available and unavailable
+        nodes_to_check = []
+        for node in nodes:
+            node_name = node['node']
+            if node_name in self.node_temp_api_available and not self.node_temp_api_available[node_name]:
+                node_temps[node_name] = {
+                    'status': 'not_installed',
+                    'sensors': []
+                }
+            else:
+                nodes_to_check.append(node_name)
+        
+        # Query available nodes in parallel
+        if nodes_to_check:
+            from concurrent.futures import ThreadPoolExecutor, as_completed
             
-            for future in as_completed(futures, timeout=5):
+            def fetch_temp(node_name):
                 try:
-                    node_name, temp_data, available = future.result()
-                    node_temps[node_name] = temp_data
-                    self.node_temp_api_available[node_name] = available
+                    result = self._get_node_temperature_direct(node_name, timeout=1.5)
+                    if result and result.get('status') == 'ok':
+                        return node_name, result, True
+                    return node_name, result or {'status': 'error', 'sensors': []}, False
                 except Exception:
-                    node_name = futures[future]
-                    node_temps[node_name] = {'status': 'timeout', 'sensors': []}
-                    self.node_temp_api_available[node_name] = False
-    
-    return node_temps
-
-def update_node_temperatures(self):
-    """Update all node temperature displays in background thread"""
-    if not self.api:
-        return
-    
-    def update_async():
-        node_temps = self.get_all_node_temperatures()
-        # Schedule UI updates on main thread
-        self.root.after(0, lambda: self._update_temp_ui(node_temps))
-    
-    # Run in background to not block UI
-    thread = threading.Thread(target=update_async, daemon=True)
-    thread.start()
-
-def _update_temp_ui(self, node_temps):
-    """Update temperature UI elements (must run on main thread)"""
-    # Clear existing temperature labels
-    for widget in self.node_temp_frame.winfo_children():
-        if hasattr(widget, 'is_temp_label'):
-            widget.destroy()
-    
-    for node_name, temp_info in node_temps.items():
-        status = temp_info.get('status')
-        
-        if status != 'ok':
-            # Show node with error status
-            label = tk.Label(
-                self.node_temp_frame,
-                text=f"{node_name}: N/A",
-                font=("Arial", 9, "bold"),
-                bg="#2c3e50",
-                fg="#95a5a6"
-            )
-            label.is_temp_label = True
-            label.pack(side=tk.LEFT, padx=8)
+                    return node_name, {'status': 'exception', 'sensors': []}, False
             
-            node_ip = self.node_addresses.get(node_name, 'unknown')
-            tooltip = f"IP: {node_ip}:8899\nStatus: {status}"
-            if status == 'not_installed':
-                tooltip += "\nTemperature API not installed\nRun install script on this node"
-            self._bind_tooltip(label, tooltip)
-            continue
+            with ThreadPoolExecutor(max_workers=min(len(nodes_to_check), 5)) as executor:
+                futures = {executor.submit(fetch_temp, n): n for n in nodes_to_check}
+                
+                for future in as_completed(futures, timeout=5):
+                    try:
+                        node_name, temp_data, available = future.result()
+                        node_temps[node_name] = temp_data
+                        self.node_temp_api_available[node_name] = available
+                    except Exception:
+                        node_name = futures[future]
+                        node_temps[node_name] = {'status': 'timeout', 'sensors': []}
+                        self.node_temp_api_available[node_name] = False
         
-        # Get all sensors for this node
-        sensors = temp_info.get('sensors', [])
-        if not sensors:
-            continue
+        return node_temps
+
+    def update_node_temperatures(self):
+        """Update all node temperature displays in background thread"""
+        if not self.api:
+            return
         
-        # Create container for this node's sensors
-        node_container = tk.Frame(self.node_temp_frame, bg="#34495e")
-        node_container.is_temp_label = True
-        node_container.pack(side=tk.LEFT, padx=5)
+        def update_async():
+            node_temps = self.get_all_node_temperatures()
+            # Schedule UI updates on main thread
+            self.root.after(0, lambda: self._update_temp_ui(node_temps))
         
-        # Node name label
-        node_label = tk.Label(
-            node_container,
-            text=f"{node_name}:",
-            font=("Arial", 9, "bold"),
-            bg="#34495e",
-            fg="#bdc3c7"
-        )
-        node_label.pack(side=tk.LEFT, padx=(0, 5))
+        # Run in background to not block UI
+        thread = threading.Thread(target=update_async, daemon=True)
+        thread.start()
+
+    def _update_temp_ui(self, node_temps):
+        """Update temperature UI elements (must run on main thread)"""
+        # Clear existing temperature labels
+        for widget in self.node_temp_frame.winfo_children():
+            if hasattr(widget, 'is_temp_label'):
+                widget.destroy()
         
-        # Group sensors by type
-        sensor_groups = {
-            'cpu_package': [],
-            'cpu_core': [],
-            'thermal_zone': [],
-            'motherboard': [],
-            'nvme': [],
-            'other': []
-        }
-        
-        for sensor in sensors:
-            sensor_type = sensor.get('type', 'other')
-            sensor_groups[sensor_type].append(sensor)
-        
-        # Display sensors in priority order
-        display_order = ['cpu_package', 'cpu_core', 'thermal_zone', 'motherboard', 'nvme', 'other']
-        
-        for sensor_type in display_order:
-            group_sensors = sensor_groups[sensor_type]
-            if not group_sensors:
+        for node_name, temp_info in node_temps.items():
+            status = temp_info.get('status')
+            
+            if status != 'ok':
+                # Show node with error status
+                label = tk.Label(
+                    self.node_temp_frame,
+                    text=f"{node_name}: N/A",
+                    font=("Arial", 9, "bold"),
+                    bg="#2c3e50",
+                    fg="#95a5a6"
+                )
+                label.is_temp_label = True
+                label.pack(side=tk.LEFT, padx=8)
+                
+                node_ip = self.node_addresses.get(node_name, 'unknown')
+                tooltip = f"IP: {node_ip}:8899\nStatus: {status}"
+                if status == 'not_installed':
+                    tooltip += "\nTemperature API not installed\nRun install script on this node"
+                self._bind_tooltip(label, tooltip)
                 continue
             
-            for sensor in group_sensors[:3]:  # Limit to 3 sensors per type to avoid clutter
-                temp = sensor.get('temperature')
-                label_text = sensor.get('label', 'Unknown')
-                
-                # Create sensor label with color coding
-                temp_color = self.get_temp_color(temp)
-                sensor_label = tk.Label(
-                    node_container,
-                    text=f"{label_text}: {temp}°C",
-                    font=("Arial", 8),
-                    bg="#34495e",
-                    fg=temp_color
-                )
-                sensor_label.pack(side=tk.LEFT, padx=2)
-                
-                # Add tooltip with detailed info
-                node_ip = self.node_addresses.get(node_name, 'unknown')
-                tooltip = (
-                    f"IP: {node_ip}:8899\n"
-                    f"Sensor: {sensor.get('sensor', 'N/A')}\n"
-                    f"Chip: {sensor.get('chip', 'N/A')}\n"
-                    f"Type: {sensor_type}"
-                )
-                self._bind_tooltip(sensor_label, tooltip)
+            # Get all sensors for this node
+            sensors = temp_info.get('sensors', [])
+            if not sensors:
+                continue
             
-            # Add separator between sensor types
-            if sensor_type != 'other' and any(sensor_groups[t] for t in display_order[display_order.index(sensor_type)+1:]):
-                sep = tk.Label(
-                    node_container,
-                    text="|",
-                    font=("Arial", 8),
-                    bg="#34495e",
-                    fg="#7f8c8d"
-                )
-                sep.pack(side=tk.LEFT, padx=3)
+            # Create container for this node's sensors
+            node_container = tk.Frame(self.node_temp_frame, bg="#34495e")
+            node_container.is_temp_label = True
+            node_container.pack(side=tk.LEFT, padx=5)
+            
+            # Node name label
+            node_label = tk.Label(
+                node_container,
+                text=f"{node_name}:",
+                font=("Arial", 9, "bold"),
+                bg="#34495e",
+                fg="#bdc3c7"
+            )
+            node_label.pack(side=tk.LEFT, padx=(0, 5))
+            
+            # Group sensors by type
+            sensor_groups = {
+                'cpu_package': [],
+                'cpu_core': [],
+                'thermal_zone': [],
+                'motherboard': [],
+                'nvme': [],
+                'other': []
+            }
+            
+            for sensor in sensors:
+                sensor_type = sensor.get('type', 'other')
+                sensor_groups[sensor_type].append(sensor)
+            
+            # Display sensors in priority order
+            display_order = ['cpu_package', 'cpu_core', 'thermal_zone', 'motherboard', 'nvme', 'other']
+            
+            for sensor_type in display_order:
+                group_sensors = sensor_groups[sensor_type]
+                if not group_sensors:
+                    continue
+                
+                for sensor in group_sensors[:3]:  # Limit to 3 sensors per type to avoid clutter
+                    temp = sensor.get('temperature')
+                    label_text = sensor.get('label', 'Unknown')
+                    
+                    # Create sensor label with color coding
+                    temp_color = self.get_temp_color(temp)
+                    sensor_label = tk.Label(
+                        node_container,
+                        text=f"{label_text}: {temp}°C",
+                        font=("Arial", 8),
+                        bg="#34495e",
+                        fg=temp_color
+                    )
+                    sensor_label.pack(side=tk.LEFT, padx=2)
+                    
+                    # Add tooltip with detailed info
+                    node_ip = self.node_addresses.get(node_name, 'unknown')
+                    tooltip = (
+                        f"IP: {node_ip}:8899\n"
+                        f"Sensor: {sensor.get('sensor', 'N/A')}\n"
+                        f"Chip: {sensor.get('chip', 'N/A')}\n"
+                        f"Type: {sensor_type}"
+                    )
+                    self._bind_tooltip(sensor_label, tooltip)
+                
+                # Add separator between sensor types
+                if sensor_type != 'other' and any(sensor_groups[t] for t in display_order[display_order.index(sensor_type)+1:]):
+                    sep = tk.Label(
+                        node_container,
+                        text="|",
+                        font=("Arial", 8),
+                        bg="#34495e",
+                        fg="#7f8c8d"
+                    )
+                    sep.pack(side=tk.LEFT, padx=3)
 
-def get_temp_color(self, temp):
-    """Get color for temperature based on value"""
-    if temp is None:
-        return "#95a5a6"  # Gray for N/A
-    elif temp < 50:
-        return "#27ae60"  # Green - Cool
-    elif temp < 70:
-        return "#3498db"  # Blue - Normal
-    elif temp < 85:
-        return "#f39c12"  # Orange - Warm
-    else:
-        return "#e74c3c"  # Red - Hot
-
-def _bind_tooltip(self, widget, text):
-    """Bind tooltip to widget"""
-    def on_enter(event):
-        tooltip = tk.Toplevel()
-        tooltip.wm_overrideredirect(True)
-        tooltip.wm_geometry(f"+{event.x_root+10}+{event.y_root+10}")
+    def _bind_tooltip(self, widget, text):
+        """Bind tooltip to widget"""
+        def on_enter(event):
+            tooltip = tk.Toplevel()
+            tooltip.wm_overrideredirect(True)
+            tooltip.wm_geometry(f"+{event.x_root+10}+{event.y_root+10}")
+            
+            label = tk.Label(
+                tooltip,
+                text=text,
+                background="#34495e",
+                foreground="#ecf0f1",
+                relief=tk.SOLID,
+                borderwidth=1,
+                font=("Arial", 8),
+                justify=tk.LEFT,
+                padx=5,
+                pady=3
+            )
+            label.pack()
+            
+            widget._tooltip = tooltip
         
-        label = tk.Label(
-            tooltip,
-            text=text,
-            background="#34495e",
-            foreground="#ecf0f1",
-            relief=tk.SOLID,
-            borderwidth=1,
-            font=("Arial", 8),
-            justify=tk.LEFT,
-            padx=5,
-            pady=3
-        )
-        label.pack()
+        def on_leave(event):
+            if hasattr(widget, '_tooltip'):
+                widget._tooltip.destroy()
+                del widget._tooltip
         
-        widget._tooltip = tooltip
-    
-    def on_leave(event):
-        if hasattr(widget, '_tooltip'):
-            widget._tooltip.destroy()
-            del widget._tooltip
-    
-    # Remove old bindings
-    widget.unbind("<Enter>")
-    widget.unbind("<Leave>")
-    
-    # Add new bindings
-    widget.bind("<Enter>", on_enter)
-    widget.bind("<Leave>", on_leave)
+        # Remove old bindings
+        widget.unbind("<Enter>")
+        widget.unbind("<Leave>")
+        
+        # Add new bindings
+        widget.bind("<Enter>", on_enter)
+        widget.bind("<Leave>", on_leave)
     
     # ========================================================================
     # END NODE TEMPERATURE API MONITORING
@@ -1051,6 +1019,7 @@ def _bind_tooltip(self, widget, text):
         top_frame.pack(fill=tk.X)
         top_frame.pack_propagate(False)
 
+        # NEW: Node Temperature Frame (below the top bar)
         self.node_temp_container = tk.Frame(self.root, bg="#34495e", height=40)  # Increased height
         self.node_temp_container.pack(fill=tk.X)
         self.node_temp_container.pack_propagate(False)
@@ -1198,22 +1167,6 @@ def _bind_tooltip(self, widget, text):
             fg="#bdc3c7"
         )
         self.last_update_label.pack()
-        
-        # NEW: Node Temperature Frame (below the top bar)
-        self.node_temp_container = tk.Frame(self.root, bg="#34495e", height=35)
-        self.node_temp_container.pack(fill=tk.X)
-        self.node_temp_container.pack_propagate(False)
-        
-        self.node_temp_frame = tk.Frame(self.node_temp_container, bg="#34495e")
-        self.node_temp_frame.pack(side=tk.LEFT, padx=10, pady=5)
-        
-        tk.Label(
-            self.node_temp_frame,
-            text="Node Temps:",
-            font=("Arial", 9, "bold"),
-            bg="#34495e",
-            fg="#bdc3c7"
-        ).pack(side=tk.LEFT, padx=(0, 10))
         
         # Control panel
         control_frame = tk.Frame(self.root, bg="#ecf0f1", height=80)
@@ -2135,7 +2088,7 @@ def _bind_tooltip(self, widget, text):
                 logger.info(f"Successfully changed credentials to {host}")
                 
                 # Refresh dashboard
-                self.refresh_data()
+                self.refresh_data_async()
             except Exception as e:
                 logger.error(f"Connection setup failed: {str(e)}")
                 messagebox.showerror("Error", f"Connection failed:\n{str(e)}\n\nPlease try again.")
