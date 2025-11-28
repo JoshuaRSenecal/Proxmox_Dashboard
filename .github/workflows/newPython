@@ -21,9 +21,6 @@ from cryptography.fernet import Fernet
 from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
 
-# Disable hostname verification warnings (we verify certificate but allow IP addresses)
-urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
-
 # Configure logging
 logging.basicConfig(
     level=logging.INFO,
