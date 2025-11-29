@@ -1,6 +1,6 @@
 #!/bin/bash
-# install-proxmox-temp-api-NO-FIREWALL.sh
-# Proxmox Temperature API Installation (No Firewall)
+# install-temp-api.sh
+# Proxmox Temperature API Installation
 # Run this on EACH Proxmox node
 #
 # This installs a temperature service on port 8899:
@@ -12,7 +12,7 @@
 set -e
 
 echo "========================================================"
-echo "Proxmox Temperature API Installation (No Firewall)"
+echo "Proxmox Temperature API Installation"
 echo "========================================================"
 echo ""
 echo "This script will install a temperature service"
@@ -387,7 +387,7 @@ class TemperatureReader:
             }
     
     def _parse_sensors_output(self, output):
-        """Parse sensors output - FIXED: check indentation before stripping"""
+        """Parse sensors output"""
         sensors = []
         current_chip = None
         current_sensor = None
@@ -663,7 +663,6 @@ NODE_NAME=$(hostname)
 echo "The temperature service is now available at:"
 echo "  http://${NODE_IP}:8899/temperature"
 echo ""
-echo "IMPORTANT: No firewall configured!"
 echo "  Port 8899 is accessible from ANY IP on your network."
 echo "  This is fine for home labs and trusted networks."
 echo ""
