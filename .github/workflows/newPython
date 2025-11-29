@@ -1033,6 +1033,44 @@ class ProxmoxDashboard:
                 fg="white"
             ).pack(pady=12)
             
+            # Color Legend Frame
+            legend_frame = tk.Frame(details_window, bg="#ecf0f1", relief=tk.RIDGE, borderwidth=1)
+            legend_frame.pack(fill=tk.X, padx=10, pady=5)
+            
+            tk.Label(
+                legend_frame,
+                text="Temperature Key:",
+                font=("Arial", 9, "bold"),
+                bg="#ecf0f1",
+                fg="#2c3e50"
+            ).pack(side=tk.LEFT, padx=10, pady=5)
+            
+            # Color indicators
+            color_key = [
+                ("< 50°C Cool", "#27ae60"),
+                ("50-70°C Normal", "#3498db"),
+                ("70-85°C Warm", "#e67e22"),
+                ("≥ 85°C Hot", "#e74c3c")
+            ]
+            
+            for label_text, color in color_key:
+                key_frame = tk.Frame(legend_frame, bg="#ecf0f1")
+                key_frame.pack(side=tk.LEFT, padx=5, pady=5)
+                
+                # Color box
+                color_box = tk.Frame(key_frame, bg=color, width=15, height=15, relief=tk.SOLID, borderwidth=1)
+                color_box.pack(side=tk.LEFT, padx=(0, 3))
+                color_box.pack_propagate(False)
+                
+                # Label
+                tk.Label(
+                    key_frame,
+                    text=label_text,
+                    font=("Arial", 8),
+                    bg="#ecf0f1",
+                    fg="#2c3e50"
+                ).pack(side=tk.LEFT)
+            
             # Scrollable content
             canvas = tk.Canvas(details_window, bg="white")
             scrollbar = tk.Scrollbar(details_window, orient="vertical", command=canvas.yview)
