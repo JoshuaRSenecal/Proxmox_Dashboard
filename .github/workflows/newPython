@@ -1739,7 +1739,7 @@ class ProxmoxDashboard:
         # Basic columns
         columns = (
             "ID", "Type", "Status", "Name", "Node", 
-            "Cores", "Sockets", "CPU", "Memory", "Disk", "Free Disk", "Free%"
+            "Cores", "Sockets", "CPU", "Memory", "Disk", "Total FS", "Free Disk", "Free%"
         )
         
         self.tree = ttk.Treeview(
@@ -1762,7 +1762,7 @@ class ProxmoxDashboard:
         column_widths = {
             "ID": 80, "Type": 80, "Status": 110, "Name": 300, "Node": 150,
             "Cores": 100, "Sockets": 110, "CPU": 180, "Memory": 250,
-            "Disk": 150, "Free Disk": 150, "Free%": 110
+            "Disk": 150, "Total FS": 150, "Free Disk": 150, "Free%": 110
         }
         
         for col in columns:
@@ -2054,7 +2054,7 @@ class ProxmoxDashboard:
                 item = self.tree.insert('', 'end', values=(
                     vm['id'], vm['type'], vm['status'], vm['name'], vm['node'],
                     vm.get('cores', 'N/A'), vm.get('sockets', 'N/A'), vm.get('cpu', 'N/A'),
-                    vm.get('memory', 'N/A'), vm.get('disk', 'N/A'),
+                    vm.get('memory', 'N/A'), vm.get('disk', 'N/A'), vm.get('total_fs', 'N/A'),
                     vm.get('free_disk', 'N/A'), vm.get('free_pct', 'N/A')
                 ), tags=tags)
                 
@@ -2153,6 +2153,7 @@ class ProxmoxDashboard:
             # Free disk and Free% - REAL-TIME DISK VALUES (only if running)
             free_disk = 'N/A'
             free_pct = 'N/A'
+            total_fs = 'N/A'
             if vm['status'] == 'running':
                 try:
                     if vm_type == 'VM':
@@ -2187,6 +2188,7 @@ class ProxmoxDashboard:
                                             used_bytes_sum += fs_used
                                 
                                 if total_bytes_sum > 0:
+                                    total_fs = self.format_bytes(total_bytes_sum)
                                     free_bytes = total_bytes_sum - used_bytes_sum
                                     if free_bytes >= 0:
                                         free_disk = self.format_bytes(free_bytes)
@@ -2199,6 +2201,7 @@ class ProxmoxDashboard:
                             disk_max = stat.get('maxdisk', 0)
                             
                             if disk_max > 0 and disk_used >= 0:
+                                total_fs = self.format_bytes(disk_max)
                                 free_bytes = disk_max - disk_used
                                 if free_bytes >= 0:
                                     free_disk = self.format_bytes(free_bytes)
@@ -2210,6 +2213,7 @@ class ProxmoxDashboard:
                         disk_max = stat.get('maxdisk', 0)
                         
                         if disk_max > 0 and disk_used >= 0:
+                            total_fs = self.format_bytes(disk_max)
                             free_bytes = disk_max - disk_used
                             if free_bytes >= 0:
                                 free_disk = self.format_bytes(free_bytes)
@@ -2234,6 +2238,7 @@ class ProxmoxDashboard:
                 'cpu': cpu_type,
                 'memory': memory,
                 'disk': total_disk,
+                'total_fs': total_fs,
                 'free_disk': free_disk,
                 'free_pct': free_pct
             }
