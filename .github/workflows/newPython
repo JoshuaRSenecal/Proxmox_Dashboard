@@ -1,6 +1,4 @@
 #!/usr/bin/env python3
-# Proxmox Dashboard - Live Data Feed with Node Temperature Monitoring
-# Version 2.4 - Fixed SSL Hostname Verification and Credential Change Bug
 
 import tkinter as tk
 from tkinter import ttk, messagebox, simpledialog
