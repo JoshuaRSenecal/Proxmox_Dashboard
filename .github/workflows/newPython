@@ -2213,6 +2213,14 @@ class ProxmoxDashboard:
         if self.is_loading:
             return
         
+        # Check if API is available
+        if not self.api:
+            logger.warning("Refresh called but API not available - skipping")
+            self.status_label.config(text="Not connected - waiting for credentials")
+            self.connection_label.config(text="Disconnected", fg="#e74c3c")
+            self.update_led_color(self.connection_led, "#e74c3c")
+            return
+        
         self.show_loading("Fetching data from Proxmox...")
         
         def fetch_data():
@@ -2420,6 +2428,10 @@ class ProxmoxDashboard:
         if not response:
             return
         
+        # Stop auto-refresh to prevent errors during credential change
+        logger.info("Stopping auto-refresh for credential change")
+        self.auto_refresh = False
+        
         # Delete old credentials
         try:
             if os.path.exists(CREDENTIALS_FILE):
@@ -2428,11 +2440,16 @@ class ProxmoxDashboard:
         except Exception as e:
             logger.error(f"Failed to delete credentials file: {e}")
             messagebox.showerror("Error", f"Failed to delete credentials:\n{str(e)}")
+            # Re-enable auto-refresh since we're not changing credentials
+            self.auto_refresh = True
             return
         
         # Close current API connection
         self.api = None
         self.connection_healthy = False
+        self.status_label.config(text="Not connected - setting up new credentials")
+        self.connection_label.config(text="Disconnected", fg="#e74c3c")
+        self.update_led_color(self.connection_led, "#e74c3c")
         
         # Show setup flow
         messagebox.showinfo(
@@ -2461,12 +2478,17 @@ class ProxmoxDashboard:
                 self.connection_healthy = True
                 logger.info(f"Successfully changed credentials to {host}")
                 
+                # Re-enable auto-refresh
+                self.auto_refresh = True
+                
                 # Refresh dashboard
                 self.refresh_data_async()
             except Exception as e:
                 logger.error(f"Connection setup failed: {str(e)}")
-                messagebox.showerror("Error", f"Connection failed:\n{str(e)}\n\nPlease try again.")
+                messagebox.showerror("Error", f"Connection failed:\n{str(e)}\n\nPlease restart the dashboard and try again.")
                 self.connection_healthy = False
+                # Don't re-enable auto-refresh since connection failed
+                self.root.quit()
         else:
             messagebox.showwarning(
                 "Cancelled",
