@@ -611,8 +611,16 @@ class ProxmoxDashboard:
         self.node_addresses = {}  # Maps node names to IP addresses for temperature API
         self.node_temps_full_data = {}  # Store full temperature data for details view
         
+        # Safety flags
+        self.tooltips_enabled = False  # DISABLED by default - set to True if tooltips work on your system
+        self.window_ready = False  # Flag to indicate window is fully created
+        
         self.setup_styles()
         self.create_widgets()
+        
+        # Mark window as ready
+        self.window_ready = True
+        logger.info("Dashboard window created successfully")
         
         # Add cleanup handler for window close
         self.root.protocol("WM_DELETE_WINDOW", self.on_closing)
@@ -624,8 +632,8 @@ class ProxmoxDashboard:
         # Start task processor FIRST (before any async operations)
         self.start_task_processor()
         
-        # Check temperature API availability on nodes (runs async, non-blocking)
-        self.check_temperature_api_status()
+        # Delay temperature check to ensure window is fully initialized
+        self.root.after(2000, self.check_temperature_api_status)
         
         # Start auto-refresh and health check
         self.start_auto_refresh()
@@ -1279,64 +1287,85 @@ class ProxmoxDashboard:
                 ).pack()
 
     def _bind_tooltip(self, widget, text):
-        """Bind tooltip to widget - FIXED: properly destroy on leave + limit text length"""
-        tooltip_window = None
+        """Bind tooltip to widget - SAFE VERSION without closures"""
+        # Skip if tooltips are disabled
+        if not self.tooltips_enabled:
+            return
         
         # Truncate very long text to prevent X11 errors
-        max_chars = 200
+        max_chars = 150
         if len(text) > max_chars:
             text = text[:max_chars] + "..."
         
+        # Store text on widget
+        widget._tooltip_text = text
+        
         def on_enter(event):
-            nonlocal tooltip_window
-            # Destroy any existing tooltip first
-            if tooltip_window:
+            w = event.widget
+            if not hasattr(w, '_tooltip_text'):
+                return
+            
+            # Destroy old tooltip if it exists
+            if hasattr(w, '_tooltip_window'):
                 try:
-                    tooltip_window.destroy()
+                    w._tooltip_window.destroy()
                 except:
                     pass
             
             # Create new tooltip
-            tooltip_window = tk.Toplevel()
-            tooltip_window.wm_overrideredirect(True)
-            tooltip_window.wm_geometry(f"+{event.x_root+10}+{event.y_root+10}")
-            
-            # Wrap long text to prevent X11 rendering errors
-            label = tk.Label(
-                tooltip_window,
-                text=text,
-                background="#34495e",
-                foreground="#ecf0f1",
-                relief=tk.SOLID,
-                borderwidth=1,
-                font=("Arial", 8),
-                justify=tk.LEFT,
-                wraplength=300,  # Wrap at 300 pixels
-                padx=5,
-                pady=3
-            )
-            label.pack()
+            try:
+                tooltip = tk.Toplevel()
+                tooltip.wm_overrideredirect(True)
+                
+                # Position slightly offset from cursor
+                x = event.x_root + 10
+                y = event.y_root + 10
+                tooltip.wm_geometry(f"+{x}+{y}")
+                
+                # Simple label with word wrap
+                label = tk.Label(
+                    tooltip,
+                    text=w._tooltip_text,
+                    background="#2c3e50",
+                    foreground="white",
+                    relief=tk.SOLID,
+                    borderwidth=1,
+                    font=("Arial", 8),
+                    justify=tk.LEFT,
+                    wraplength=250,
+                    padx=5,
+                    pady=3
+                )
+                label.pack()
+                
+                # Store reference on widget
+                w._tooltip_window = tooltip
+            except Exception as e:
+                # Silently fail if tooltip can't be created
+                logger.debug(f"Failed to create tooltip: {e}")
         
         def on_leave(event):
-            nonlocal tooltip_window
-            # Destroy tooltip when mouse leaves
-            if tooltip_window:
+            w = event.widget
+            if hasattr(w, '_tooltip_window'):
                 try:
-                    tooltip_window.destroy()
-                    tooltip_window = None
+                    w._tooltip_window.destroy()
+                    delattr(w, '_tooltip_window')
                 except:
                     pass
         
-        # Remove old bindings if they exist
+        # Unbind any existing handlers
         try:
             widget.unbind("<Enter>")
             widget.unbind("<Leave>")
         except:
             pass
         
-        # Add new bindings
-        widget.bind("<Enter>", on_enter)
-        widget.bind("<Leave>", on_leave)
+        # Bind new handlers
+        try:
+            widget.bind("<Enter>", on_enter, add=False)
+            widget.bind("<Leave>", on_leave, add=False)
+        except Exception as e:
+            logger.debug(f"Failed to bind tooltip: {e}")
     
     # ========================================================================
     # END NODE TEMPERATURE API MONITORING
@@ -1367,7 +1396,7 @@ class ProxmoxDashboard:
         # Add Details button on the right side
         details_btn = tk.Button(
             self.node_temp_container,
-            text="📊 Details",
+            text="[Details]",  # Removed emoji - can cause X11 errors
             command=lambda: self.show_temperature_details(None),
             bg="#3498db",
             fg="white",
@@ -1378,7 +1407,7 @@ class ProxmoxDashboard:
             pady=5
         )
         details_btn.pack(side=tk.RIGHT, padx=10, pady=5)
-        self._bind_tooltip(details_btn, "Click to see all temperature sensors")
+        # Don't bind tooltip here - do it later after window is created
         
         # Left section: Title
         title_label = tk.Label(
