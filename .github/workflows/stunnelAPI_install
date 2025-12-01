@@ -646,6 +646,11 @@ cat > /etc/stunnel/proxmox-temp-api.conf << EOF
 ; stunnel configuration for Proxmox Temperature API
 ; Provides TLS encryption for temperature monitoring
 
+; Global options
+pid = /var/run/stunnel-temp-api.pid
+output = /var/log/stunnel-temp-api.log
+
+; Service definition
 [proxmox-temp-api]
 accept = 0.0.0.0:8898
 connect = 127.0.0.1:8899
@@ -658,8 +663,7 @@ options = NO_SSLv3
 ciphers = HIGH:!aNULL:!MD5
 
 ; Logging
-debug = 4
-output = /var/log/stunnel-temp-api.log
+debug = 5
 
 ; Security
 setuid = stunnel4
@@ -667,12 +671,37 @@ setgid = stunnel4
 
 ; Client verification (disabled for self-signed certs)
 verify = 0
+
+; Performance
+TIMEOUTclose = 0
+TIMEOUTidle = 3600
 EOF
 
 echo "  Created: /etc/stunnel/proxmox-temp-api.conf"
 
-# Enable stunnel
-sed -i 's/ENABLED=0/ENABLED=1/' /etc/default/stunnel4 2>/dev/null || echo "ENABLED=1" >> /etc/default/stunnel4
+# Enable stunnel in default config
+if [ -f /etc/default/stunnel4 ]; then
+    sed -i 's/^ENABLED=.*/ENABLED=1/' /etc/default/stunnel4
+    if ! grep -q "^ENABLED=" /etc/default/stunnel4; then
+        echo "ENABLED=1" >> /etc/default/stunnel4
+    fi
+else
+    # Create default config if it doesn't exist
+    echo "ENABLED=1" > /etc/default/stunnel4
+    echo "FILES=\"/etc/stunnel/*.conf\"" >> /etc/default/stunnel4
+    echo "OPTIONS=\"\"" >> /etc/default/stunnel4
+fi
+
+echo "  stunnel4 enabled in /etc/default/stunnel4"
+
+# Ensure log directory exists and has correct permissions
+touch /var/log/stunnel-temp-api.log
+chown stunnel4:stunnel4 /var/log/stunnel-temp-api.log
+chmod 640 /var/log/stunnel-temp-api.log
+
+# Ensure PID directory is writable
+mkdir -p /var/run
+chmod 755 /var/run
 
 echo ""
 echo "========================================================"
@@ -737,6 +766,33 @@ systemctl enable stunnel4.service
 systemctl restart stunnel4.service
 
 echo "  Services enabled and started"
+
+# Wait for services to start
+sleep 2
+
+# Verify stunnel started correctly
+if ! systemctl is-active --quiet stunnel4; then
+    echo ""
+    echo "  ⚠️  WARNING: stunnel4 failed to start"
+    echo "  Checking logs..."
+    systemctl status stunnel4.service --no-pager | tail -20
+    echo ""
+    echo "  stunnel configuration:"
+    cat /etc/stunnel/proxmox-temp-api.conf
+    echo ""
+    echo "  You may need to manually fix stunnel configuration"
+    echo "  Check: journalctl -u stunnel4 -n 50"
+else
+    echo "  ✓ stunnel4 started successfully"
+fi
+
+# Verify temperature API started correctly
+if ! systemctl is-active --quiet proxmox-temp-api; then
+    echo "  ⚠️  WARNING: proxmox-temp-api failed to start"
+    echo "  Check: journalctl -u proxmox-temp-api -n 50"
+else
+    echo "  ✓ proxmox-temp-api started successfully"
+fi
 
 echo ""
 echo "========================================================"
