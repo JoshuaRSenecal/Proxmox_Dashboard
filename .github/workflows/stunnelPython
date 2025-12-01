@@ -2066,6 +2066,8 @@ class ProxmoxDashboard:
         """Filter VMs based on search query"""
         query = self.search_entry.get().lower()
         
+        logger.debug(f"filter_vms called with query: '{query}', vm_data has {len(self.vm_data)} items")
+        
         # Save current selection (VM ID) before clearing
         selected_vm_id = None
         selected_items = self.tree.selection()
@@ -2087,6 +2089,7 @@ class ProxmoxDashboard:
         self.filtered_vm_data = []
         item_to_select = None
         
+        items_added = 0
         for vm in self.vm_data:
             if (query in str(vm.get('id', '')).lower() or
                 query in vm.get('name', '').lower() or
@@ -2108,16 +2111,22 @@ class ProxmoxDashboard:
                 else:
                     tags = ('unknown',)
                 
-                item = self.tree.insert('', 'end', values=(
-                    vm['id'], vm['type'], vm['status'], vm['name'], vm['node'],
-                    vm.get('cores', 'N/A'), vm.get('sockets', 'N/A'), vm.get('cpu', 'N/A'),
-                    vm.get('memory', 'N/A'), vm.get('disk', 'N/A'), vm.get('total_fs', 'N/A'),
-                    vm.get('free_disk', 'N/A'), vm.get('free_pct', 'N/A')
-                ), tags=tags)
-                
-                # Track the item to reselect
-                if selected_vm_id is not None and vm['id'] == selected_vm_id:
-                    item_to_select = item
+                try:
+                    item = self.tree.insert('', 'end', values=(
+                        vm['id'], vm['type'], vm['status'], vm['name'], vm['node'],
+                        vm.get('cores', 'N/A'), vm.get('sockets', 'N/A'), vm.get('cpu', 'N/A'),
+                        vm.get('memory', 'N/A'), vm.get('disk', 'N/A'), vm.get('total_fs', 'N/A'),
+                        vm.get('free_disk', 'N/A'), vm.get('free_pct', 'N/A')
+                    ), tags=tags)
+                    items_added += 1
+                    
+                    # Track the item to reselect
+                    if selected_vm_id is not None and vm['id'] == selected_vm_id:
+                        item_to_select = item
+                except Exception as e:
+                    logger.error(f"Failed to insert VM {vm.get('id')} into tree: {e}")
+        
+        logger.debug(f"Added {items_added} items to tree display")
         
         # Restore selection if found
         if item_to_select:
@@ -2134,6 +2143,8 @@ class ProxmoxDashboard:
             )
         else:
             self.status_label.config(text=f"Ready - {len(self.vm_data)} VMs/CTs across {self.node_count} node(s)")
+        
+        logger.debug(f"filter_vms completed - displayed {items_added} items")
     
     def format_bytes(self, bytes_val):
         """Format bytes to human readable (binary units: GiB, MiB, etc)"""
@@ -2155,8 +2166,14 @@ class ProxmoxDashboard:
             endpoint = 'qemu' if vm_type == 'VM' else 'lxc'
             vmid = vm['vmid']
             
+            logger.debug(f"Fetching data for {vm_type} {vmid} on node {n}")
+            
             # Get config only
-            cfg = self.api.get(f'/nodes/{n}/{endpoint}/{vmid}/config')
+            try:
+                cfg = self.api.get(f'/nodes/{n}/{endpoint}/{vmid}/config')
+            except Exception as e:
+                logger.error(f"Failed to get config for {vm_type} {vmid}: {e}")
+                raise
             
             # Basic info
             cores = cfg.get('cores', 'N/A')
@@ -2327,13 +2344,32 @@ class ProxmoxDashboard:
         def update_ui(result, error):
             self.hide_loading()
             if error:
+                logger.error(f"Refresh failed with error: {str(error)}")
+                logger.error(f"Error type: {type(error).__name__}")
+                import traceback
+                logger.error(f"Traceback: {traceback.format_exc()}")
+                
                 self.status_label.config(text=f"Error: {str(error)}")
                 self.connection_label.config(text="Disconnected", fg="#e74c3c")
                 self.update_led_color(self.connection_led, "#e74c3c")
-                messagebox.showerror("Error", f"Failed to refresh:\n{str(error)}")
+                messagebox.showerror("Error", f"Failed to refresh:\n{str(error)}\n\nCheck log file:\n{LOG_FILE}")
             else:
+                logger.info(f"Refresh successful - received {len(result) if result else 0} VMs/CTs")
+                
+                if result is None:
+                    logger.error("Result is None - no data returned")
+                    self.status_label.config(text="Error: No data returned from API")
+                    return
+                
+                if len(result) == 0:
+                    logger.warning("No VMs/CTs found - empty result")
+                
                 self.vm_data = result
+                logger.debug(f"vm_data set to {len(self.vm_data)} items")
+                
                 self.filter_vms()
+                logger.debug(f"filter_vms completed - filtered_vm_data has {len(self.filtered_vm_data)} items")
+                
                 now = datetime.now().strftime("%H:%M:%S")
                 
                 if self.auto_refresh:
@@ -2345,6 +2381,8 @@ class ProxmoxDashboard:
                 self.connection_label.config(text="Connected", fg="#27ae60")
                 self.update_led_color(self.connection_led, "#27ae60")
                 
+                logger.info(f"Dashboard updated successfully at {now}")
+                
                 # Update node temperatures (NEW)
                 self.update_node_temperatures()
         
@@ -2352,12 +2390,19 @@ class ProxmoxDashboard:
     
     def _fetch_vm_data_parallel(self):
         """Fetch VM data using simple serial processing"""
+        logger.info("Starting VM data fetch")
         vm_data = []
-        nodes = self.api.get('/nodes')
-        self.node_count = len(nodes)
         
-        # Update node count in UI
-        self.root.after(0, lambda: self.node_label.config(text=f"Nodes: {self.node_count}"))
+        try:
+            nodes = self.api.get('/nodes')
+            self.node_count = len(nodes)
+            logger.info(f"Found {self.node_count} node(s)")
+            
+            # Update node count in UI
+            self.root.after(0, lambda: self.node_label.config(text=f"Nodes: {self.node_count}"))
+        except Exception as e:
+            logger.error(f"Failed to get nodes list: {str(e)}")
+            raise Exception(f"Cannot get Proxmox nodes: {str(e)}")
         
         # Count total VMs/CTs first for progress
         total_count = 0
@@ -2366,14 +2411,18 @@ class ProxmoxDashboard:
             try:
                 vms = self.api.get(f'/nodes/{n}/qemu')
                 total_count += len(vms)
+                logger.debug(f"Node {n}: {len(vms)} VMs")
             except Exception as e:
                 logger.error(f"Error counting VMs from node {n}: {e}")
             
             try:
                 cts = self.api.get(f'/nodes/{n}/lxc')
                 total_count += len(cts)
+                logger.debug(f"Node {n}: {len(cts)} CTs")
             except Exception as e:
                 logger.error(f"Error counting CTs from node {n}: {e}")
+        
+        logger.info(f"Total VMs/CTs to fetch: {total_count}")
         
         # Process each VM/CT sequentially
         current = 0
@@ -2383,6 +2432,8 @@ class ProxmoxDashboard:
             # Get and process VMs
             try:
                 vms = self.api.get(f'/nodes/{n}/qemu')
+                logger.debug(f"Processing {len(vms)} VMs from node {n}")
+                
                 for vm in vms:
                     current += 1
                     
@@ -2390,6 +2441,9 @@ class ProxmoxDashboard:
                         vm_info = self.fetch_single_vm_data(node, vm, 'VM')
                         if vm_info:
                             vm_data.append(vm_info)
+                            logger.debug(f"  Added VM {vm['vmid']}: {vm['name']}")
+                        else:
+                            logger.warning(f"  VM {vm['vmid']} returned None")
                     except Exception as e:
                         logger.error(f"Error getting VM {vm['vmid']}: {e}")
             except Exception as e:
@@ -2398,6 +2452,8 @@ class ProxmoxDashboard:
             # Get and process Containers
             try:
                 cts = self.api.get(f'/nodes/{n}/lxc')
+                logger.debug(f"Processing {len(cts)} CTs from node {n}")
+                
                 for ct in cts:
                     current += 1
                     
@@ -2405,12 +2461,16 @@ class ProxmoxDashboard:
                         ct_info = self.fetch_single_vm_data(node, ct, 'CT')
                         if ct_info:
                             vm_data.append(ct_info)
+                            logger.debug(f"  Added CT {ct['vmid']}: {ct['name']}")
+                        else:
+                            logger.warning(f"  CT {ct['vmid']} returned None")
                     except Exception as e:
                         logger.error(f"Error getting CT {ct['vmid']}: {e}")
             except Exception as e:
                 logger.error(f"Error getting CTs from node {n}: {e}")
         
         vm_data.sort(key=lambda x: x['id'])
+        logger.info(f"VM data fetch complete: {len(vm_data)} items collected")
         return vm_data
     
     def on_select(self, event):
