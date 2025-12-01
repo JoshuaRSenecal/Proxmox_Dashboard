@@ -68,6 +68,10 @@ Dashboard cannot start without the CA certificate.
 
 logger.info(f"SSL Verification: Enabled (using {PROXMOX_CA_CERT})")
 
+# Suppress InsecureRequestWarning for temperature API self-signed certificates
+# The temperature API uses self-signed certs via stunnel, which is intentional
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+
 
 class AuditLogger:
     """Audit logger for tracking all critical operations"""
@@ -805,8 +809,6 @@ class ProxmoxDashboard:
             
             # HTTPS only with self-signed certificate acceptance
             response = requests.get(url, timeout=timeout, verify=False)
-            # Suppress only the single InsecureRequestWarning from urllib3
-            urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
         
             if response.status_code == 200:
                 data = response.json()
