@@ -773,7 +773,7 @@ sleep 2
 # Verify stunnel started correctly
 if ! systemctl is-active --quiet stunnel4; then
     echo ""
-    echo "  ⚠️  WARNING: stunnel4 failed to start"
+    echo "  WARNING: stunnel4 failed to start"
     echo "  Checking logs..."
     systemctl status stunnel4.service --no-pager | tail -20
     echo ""
@@ -783,15 +783,15 @@ if ! systemctl is-active --quiet stunnel4; then
     echo "  You may need to manually fix stunnel configuration"
     echo "  Check: journalctl -u stunnel4 -n 50"
 else
-    echo "  ✓ stunnel4 started successfully"
+    echo "  stunnel4 started successfully"
 fi
 
 # Verify temperature API started correctly
 if ! systemctl is-active --quiet proxmox-temp-api; then
-    echo "  ⚠️  WARNING: proxmox-temp-api failed to start"
+    echo "  WARNING: proxmox-temp-api failed to start"
     echo "  Check: journalctl -u proxmox-temp-api -n 50"
 else
-    echo "  ✓ proxmox-temp-api started successfully"
+    echo "  proxmox-temp-api started successfully"
 fi
 
 echo ""
@@ -804,22 +804,22 @@ sleep 3
 echo ""
 echo "  Testing HTTP service (localhost only)..."
 if curl -s http://127.0.0.1:8899/health > /dev/null 2>&1; then
-    echo "    ✓ HTTP service: OK"
+    echo "    HTTP service: OK"
 else
-    echo "    ✗ HTTP service: FAILED"
+    echo "    HTTP service: FAILED"
     systemctl status proxmox-temp-api.service --no-pager | tail -10
 fi
 
 echo ""
 echo "  Testing HTTPS service (stunnel)..."
 if curl -sk https://127.0.0.1:8898/health > /dev/null 2>&1; then
-    echo "    ✓ HTTPS service (stunnel): OK"
+    echo "    HTTPS service (stunnel): OK"
     echo ""
     echo "  Temperature data (via HTTPS):"
     TEMP_RESULT=$(curl -sk https://127.0.0.1:8898/temperature)
     echo "$TEMP_RESULT" | python3 -m json.tool 2>/dev/null || echo "$TEMP_RESULT"
 else
-    echo "    ✗ HTTPS service: FAILED"
+    echo "    HTTPS service: FAILED"
     systemctl status stunnel4.service --no-pager | tail -10
     echo ""
     echo "  Checking stunnel logs:"
@@ -839,10 +839,10 @@ echo "  HTTPS (TLS):   https://${NODE_IP}:8898/temperature  ← USE THIS"
 echo "  HTTP (local):  http://127.0.0.1:8899/temperature   (localhost only)"
 echo ""
 echo "IMPORTANT - Security Configuration:"
-echo "  ✓ HTTPS port 8898 is TLS encrypted and accessible from your network"
-echo "  ✓ HTTP port 8899 is bound to localhost (127.0.0.1) ONLY"
-echo "  ✓ External clients MUST use HTTPS endpoint for security"
-echo "  ✓ Dashboard automatically uses HTTPS - no fallback to HTTP"
+echo "  * HTTPS port 8898 is TLS encrypted and accessible from your network"
+echo "  * HTTP port 8899 is bound to localhost (127.0.0.1) ONLY"
+echo "  * External clients MUST use HTTPS endpoint for security"
+echo "  * Dashboard automatically uses HTTPS - no fallback to HTTP"
 echo ""
 echo "Certificate:"
 echo "  • Self-signed certificate: ${CERT_FILE}"
