@@ -1,27 +1,4 @@
 #!/usr/bin/env python3
-"""
-Proxmox Dashboard - Live Data Feed Edition with Node Temperature Monitoring
-Near-constant live updates for real-time VM/Container monitoring
-SUPPORTS MULTIPLE PROXMOX NODES
-
-FEATURES:
-- Live data feed with 3-second default refresh (configurable 2s-30s)
-- Pause/Resume live feed
-- Proxmox NODE temperature monitoring via DIRECT PORT 8899 CONNECTION
-- API Token authentication only (more secure than passwords)
-- Master password protects locally stored credentials
-- All passwords obscured during entry (anti-shoulder surfing)
-- Mandatory SSL/TLS certificate verification for secure connections
-- Graphical status indicators (LED indicators and colored rows)
-
-Version: 2.4 - With Node Temperature Monitoring
-
-INSTALLATION:
-1. Install temperature API on each Proxmox node:
-   bash install-proxmox-temp-api-NO-FIREWALL.sh
-   
-2. Run this dashboard on your laptop/PC
-"""
 
 import tkinter as tk
 from tkinter import ttk, messagebox, simpledialog
@@ -41,10 +18,6 @@ from datetime import datetime, timedelta
 from cryptography.fernet import Fernet
 from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
-import psutil
-
-# Disable hostname verification warnings (we verify certificate but allow IP addresses)
-urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 # Configure logging
 logging.basicConfig(
@@ -130,13 +103,13 @@ class AuditLogger:
 
 
 class SSLAdapter(HTTPAdapter):
-    """Custom HTTPAdapter that verifies CA cert but allows any hostname (including IPs)"""
+    """Custom HTTPAdapter that verifies both CA cert AND hostname"""
     
     def init_poolmanager(self, *args, **kwargs):
-        # Create SSL context that verifies certificate but not hostname
+        # Create SSL context that verifies BOTH certificate AND hostname
         context = ssl.create_default_context(cafile=PROXMOX_CA_CERT)
-        context.check_hostname = False  # Allow IP addresses
-        context.verify_mode = ssl.CERT_REQUIRED  # Still verify certificate
+        context.check_hostname = True   # FIXED: Enable hostname verification
+        context.verify_mode = ssl.CERT_REQUIRED  # Verify certificate
         
         kwargs['ssl_context'] = context
         return super().init_poolmanager(*args, **kwargs)
@@ -149,7 +122,7 @@ class ProxmoxAPI:
         self.base = f"https://{host}:8006/api2/json"
         self.host = host
         
-        # SSL verification with CA cert but hostname checking disabled (allows IP addresses)
+        # SSL verification with CA cert AND hostname checking enabled
         self.verify = PROXMOX_CA_CERT
         self.ssl_status = "Verified"
         
@@ -165,10 +138,16 @@ class ProxmoxAPI:
             self._api_request('get', '/version')
             AuditLogger.log_authentication(host, token_id, True)
             logger.info(f"Successfully authenticated with token: {token_id}")
-        except Exception as e:
+        except requests.exceptions.HTTPError as e:
+            # Authentication or HTTP error - preserve original error message
             AuditLogger.log_authentication(host, token_id, False)
-            logger.error(f"API token authentication failed: {str(e)}")
-            raise Exception(f"API token authentication failed: {str(e)}")
+            logger.error(f"API authentication failed: {str(e)}")
+            raise
+        except Exception as e:
+            # Other errors (connection, timeout, etc.)
+            AuditLogger.log_authentication(host, token_id, False)
+            logger.error(f"API connection failed: {str(e)}")
+            raise
     
     def _api_request(self, method, path, retries=MAX_RETRIES, **kwargs):
         """Make API request with retry logic - Token authentication only"""
@@ -193,25 +172,32 @@ class ProxmoxAPI:
                 
                 if r.status_code in [200, 201]:
                     return r
+                elif r.status_code == 401:
+                    # Authentication failure - don't retry, fail immediately
+                    r.raise_for_status()
                 elif r.status_code >= 500 and attempt < retries - 1:
+                    # Server error - retry with backoff
                     delay = RETRY_DELAY * (2 ** attempt)
                     time.sleep(delay)
                     continue
                 else:
+                    # Other errors - fail immediately
                     r.raise_for_status()
-                    
-            except requests.ConnectionError:
-                if attempt == retries - 1:
-                    raise Exception(f"Connection failed after {retries} attempts")
-                time.sleep(RETRY_DELAY * (2 ** attempt))
-            except requests.Timeout:
-                if attempt == retries - 1:
-                    raise Exception(f"Request timeout after {retries} attempts")
-                time.sleep(RETRY_DELAY * (2 ** attempt))
-            except Exception as e:
+            
+            except requests.exceptions.HTTPError:
+                # HTTP errors (401, 403, 404, etc.) - never retry, re-raise immediately
+                raise
+            except requests.exceptions.ConnectionError as e:
                 if attempt == retries - 1:
                     raise
                 time.sleep(RETRY_DELAY * (2 ** attempt))
+            except requests.exceptions.Timeout as e:
+                if attempt == retries - 1:
+                    raise
+                time.sleep(RETRY_DELAY * (2 ** attempt))
+            except Exception as e:
+                # Unknown error - fail immediately
+                raise
         
         raise Exception(f"API request failed after {retries} attempts")
     
@@ -368,7 +354,7 @@ class TokenCreationGuide(tk.Toplevel):
             ("   Go to: https://YOUR_PROXMOX_IP:8006\n", "normal", "#7f8c8d"),
             
             ("2. Navigate to API Tokens", "bold", "#27ae60"),
-            ("   Click: Datacenter → Permissions → API Tokens\n", "normal", "#7f8c8d"),
+            ("   Click: Datacenter -> Permissions -> API Tokens\n", "normal", "#7f8c8d"),
             
             ("3. Click 'Add' button", "bold", "#27ae60"),
             ("   (Top of the API Tokens page)\n", "normal", "#7f8c8d"),
@@ -493,7 +479,7 @@ class CredentialsDialog(tk.Toplevel):
         tk.Label(form_frame, text="Proxmox Host:", font=("Arial", 10), bg="white").grid(row=0, column=0, sticky="w", pady=5)
         self.host_entry = tk.Entry(form_frame, font=("Arial", 10), width=35)
         self.host_entry.grid(row=0, column=1, pady=5, columnspan=2)
-        self.host_entry.insert(0, "192.168.1.100")
+        self.host_entry.insert(0, "pve")
         
         # Auth type label
         tk.Label(form_frame, text="Authentication: API Token", font=("Arial", 10, "bold"), bg="white", fg="#27ae60").grid(row=1, column=0, sticky="w", pady=10, columnspan=3)
@@ -510,7 +496,7 @@ class CredentialsDialog(tk.Toplevel):
         
         tk.Label(
             form_frame,
-            text="Create token: Datacenter → Permissions → API Tokens → Add",
+            text="Create token: Datacenter -> Permissions -> API Tokens -> Add",
             font=("Arial", 8),
             bg="white",
             fg="#7f8c8d"
@@ -565,20 +551,20 @@ class CredentialsDialog(tk.Toplevel):
         master = self.master_entry.get()
         
         if not host or not master:
-            messagebox.showerror("Error", "Host and master password are required!")
+            messagebox.showerror("Error", "Host and master password are required!", parent=self)
             return
         
         if self.is_setup:
             confirm = self.master_confirm.get()
             if master != confirm:
-                messagebox.showerror("Error", "Master passwords don't match!")
+                messagebox.showerror("Error", "Master passwords don't match!", parent=self)
                 return
         
         token_id = self.token_id_entry.get().strip()
         token_secret = self.token_secret_entry.get()
         
         if not token_id or not token_secret:
-            messagebox.showerror("Error", "Token ID and Token Secret are required!")
+            messagebox.showerror("Error", "Token ID and Token Secret are required!", parent=self)
             return
         
         # Always return token authentication
@@ -621,9 +607,18 @@ class ProxmoxDashboard:
         self.node_temp_labels = {}
         self.node_temp_api_available = {}
         self.node_addresses = {}  # Maps node names to IP addresses for temperature API
+        self.node_temps_full_data = {}  # Store full temperature data for details view
+        
+        # Safety flags
+        self.tooltips_enabled = False  # DISABLED by default - set to True if tooltips work on your system
+        self.window_ready = False  # Flag to indicate window is fully created
         
         self.setup_styles()
         self.create_widgets()
+        
+        # Mark window as ready
+        self.window_ready = True
+        logger.info("Dashboard window created successfully")
         
         # Add cleanup handler for window close
         self.root.protocol("WM_DELETE_WINDOW", self.on_closing)
@@ -635,8 +630,8 @@ class ProxmoxDashboard:
         # Start task processor FIRST (before any async operations)
         self.start_task_processor()
         
-        # Check temperature API availability on nodes (runs async, non-blocking)
-        self.check_temperature_api_status()
+        # Delay temperature check to ensure window is fully initialized
+        self.root.after(2000, self.check_temperature_api_status)
         
         # Start auto-refresh and health check
         self.start_auto_refresh()
@@ -704,129 +699,6 @@ class ProxmoxDashboard:
         )
         return label
     
-    def get_host_temperature(self):
-        """Get host laptop/PC temperature with improved detection"""
-        try:
-            # Method 1: Try psutil sensors_temperatures
-            try:
-                temps = psutil.sensors_temperatures()
-                
-                if temps:
-                    logger.debug(f"Found temperature sensors: {list(temps.keys())}")
-                    # Priority order for temperature zones
-                    priority_zones = [
-                        'coretemp',      # Intel CPU
-                        'k10temp',       # AMD CPU
-                        'zenpower',      # AMD Zen
-                        'cpu_thermal',   # ARM/Raspberry Pi
-                        'acpitz',        # ACPI thermal zone
-                    ]
-                    
-                    # Try priority zones first
-                    for zone in priority_zones:
-                        if zone in temps and temps[zone]:
-                            # Get average of all sensors in this zone
-                            readings = [s.current for s in temps[zone] if s.current]
-                            if readings:
-                                avg_temp = sum(readings) / len(readings)
-                                logger.info(f"Temperature detected via psutil ({zone}): {avg_temp:.1f}°C")
-                                return round(avg_temp, 1), zone
-                    
-                    # Fallback: use first available zone
-                    for zone_name, sensors in temps.items():
-                        if sensors:
-                            readings = [s.current for s in sensors if s.current]
-                            if readings:
-                                avg_temp = sum(readings) / len(readings)
-                                logger.info(f"Temperature detected via psutil ({zone_name}): {avg_temp:.1f}°C")
-                                return round(avg_temp, 1), zone_name
-                else:
-                    logger.debug("psutil.sensors_temperatures() returned empty dict")
-            except (AttributeError, Exception) as e:
-                logger.debug(f"psutil sensors not available: {e}")
-            
-            # Method 2: Try reading from /sys/class/thermal (Linux)
-            thermal_zones = [
-                '/sys/class/thermal/thermal_zone0/temp',
-                '/sys/class/thermal/thermal_zone1/temp',
-                '/sys/class/thermal/thermal_zone2/temp',
-                '/sys/class/thermal/thermal_zone3/temp',
-            ]
-            
-            for zone_path in thermal_zones:
-                try:
-                    if os.path.exists(zone_path):
-                        with open(zone_path, 'r') as f:
-                            temp_raw = int(f.read().strip())
-                            # Convert from millidegrees to degrees
-                            temp = temp_raw / 1000.0
-                            if 0 < temp < 150:  # Sanity check
-                                logger.info(f"Temperature detected via {zone_path}: {temp:.1f}°C")
-                                return round(temp, 1), "thermal_zone"
-                except (ValueError, IOError, PermissionError) as e:
-                    logger.debug(f"Could not read {zone_path}: {e}")
-                    continue
-            
-            # Method 3: Try hwmon sensors
-            hwmon_paths = []
-            hwmon_base = '/sys/class/hwmon'
-            if os.path.exists(hwmon_base):
-                try:
-                    for hwmon_dir in os.listdir(hwmon_base):
-                        hwmon_path = os.path.join(hwmon_base, hwmon_dir)
-                        # Check for temp1_input, temp2_input, etc.
-                        for i in range(1, 10):
-                            temp_file = os.path.join(hwmon_path, f'temp{i}_input')
-                            if os.path.exists(temp_file):
-                                hwmon_paths.append(temp_file)
-                except (OSError, PermissionError) as e:
-                    logger.debug(f"Could not list hwmon: {e}")
-            
-            for hwmon_path in hwmon_paths:
-                try:
-                    with open(hwmon_path, 'r') as f:
-                        temp_raw = int(f.read().strip())
-                        temp = temp_raw / 1000.0
-                        if 0 < temp < 150:  # Sanity check
-                            logger.info(f"Temperature detected via {hwmon_path}: {temp:.1f}°C")
-                            return round(temp, 1), "hwmon"
-                except (ValueError, IOError, PermissionError) as e:
-                    logger.debug(f"Could not read {hwmon_path}: {e}")
-                    continue
-            
-            # Method 4: Try sensors command (if installed)
-            try:
-                import subprocess
-                result = subprocess.run(['sensors', '-u'], capture_output=True, text=True, timeout=2)
-                if result.returncode == 0:
-                    lines = result.stdout.split('\n')
-                    for line in lines:
-                        if 'temp' in line.lower() and 'input' in line.lower():
-                            parts = line.split(':')
-                            if len(parts) == 2:
-                                try:
-                                    temp = float(parts[1].strip())
-                                    if 0 < temp < 150:
-                                        logger.info(f"Temperature detected via sensors command: {temp:.1f}°C")
-                                        return round(temp, 1), "sensors"
-                                except ValueError:
-                                    continue
-            except (FileNotFoundError, subprocess.TimeoutExpired, Exception) as e:
-                logger.debug(f"sensors command not available: {e}")
-            
-            logger.warning("No temperature sensors detected on this system")
-            return None, "No sensors detected"
-            
-        except Exception as e:
-            logger.error(f"Temperature read error: {e}")
-            return None, "Error"
-    
-    def format_temperature(self, temp, zone):
-        """Format temperature for display"""
-        if temp is None:
-            return "N/A"
-        return f"{temp}°C"
-    
     def get_temp_color(self, temp):
         """Get color for temperature"""
         if temp is None:
@@ -846,9 +718,9 @@ class ProxmoxDashboard:
     
     def check_temperature_api_status(self):
         """
-        Check which nodes have temperature API available.
+        Check which nodes have temperature API available via HTTPS.
         This runs in a background thread to avoid blocking the UI.
-        Connects directly to port 8899 on each node.
+        Connects to port 8898 (HTTPS via stunnel) ONLY - no HTTP fallback.
         """
         if not self.api:
             return
@@ -856,6 +728,7 @@ class ProxmoxDashboard:
         def check_async():
             try:
                 nodes = self.api.get('/nodes')
+                logger.info(f"Checking temperature API on {len(nodes)} node(s)")
                 
                 # For single-node setups, use the API host
                 # For clusters, try to get node IPs from /cluster/status
@@ -864,14 +737,17 @@ class ProxmoxDashboard:
                     for item in cluster_status:
                         if item.get('type') == 'node' and item.get('ip'):
                             self.node_addresses[item['name']] = item['ip']
-                except Exception as e:
-                    pass
+                            logger.debug(f"Node {item['name']} IP from cluster: {item['ip']}")
+                except Exception:
+                    logger.debug("Single-node setup or cluster API unavailable")
+                    pass  # Single-node setup or cluster API unavailable
                 
                 # Default any missing nodes to API host
                 for node in nodes:
                     node_name = node['node']
                     if node_name not in self.node_addresses:
                         self.node_addresses[node_name] = self.api.host
+                        logger.debug(f"Node {node_name} using default host: {self.api.host}")
                 
                 # Check all nodes in parallel using ThreadPoolExecutor
                 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -879,34 +755,36 @@ class ProxmoxDashboard:
                 def check_node(node_name):
                     try:
                         result = self._get_node_temperature_direct(node_name, timeout=1.5)
-                        if result and result.get('status') == 'ok':
-                            return node_name, True
-                        else:
-                            return node_name, False
+                        available = result and result.get('status') == 'ok'
+                        sensor_count = len(result.get('sensors', [])) if result else 0
+                        return node_name, available, sensor_count
                     except Exception as e:
-                        return node_name, False
+                        logger.debug(f"Exception checking {node_name}: {e}")
+                        return node_name, False, 0
                 
                 with ThreadPoolExecutor(max_workers=min(len(nodes), 5)) as executor:
                     futures = {executor.submit(check_node, node['node']): node['node'] for node in nodes}
                     
                     for future in as_completed(futures, timeout=5):
                         try:
-                            node_name, available = future.result()
+                            node_name, available, sensor_count = future.result()
                             self.node_temp_api_available[node_name] = available
                             if available:
-                                logger.info(f"Temperature API available on {node_name} ({self.node_addresses.get(node_name)}:8899)")
+                                logger.info(f"[OK] Temperature API available on {node_name} ({self.node_addresses.get(node_name)}:8898 HTTPS) - {sensor_count} sensors")
                             else:
-                                logger.debug(f"Temperature API not available on {node_name}")
+                                logger.info(f"[FAILED] Temperature API not available on {node_name} (HTTPS required)")
                         except Exception as e:
                             node_name = futures[future]
                             self.node_temp_api_available[node_name] = False
+                            logger.warning(f"Error checking {node_name}: {e}")
                 
                 available_count = sum(1 for v in self.node_temp_api_available.values() if v)
                 
                 if available_count == 0:
-                    logger.info("Temperature API not installed on any nodes (this is optional)")
+                    logger.warning("Temperature API not installed on any nodes (this is optional)")
+                    logger.info("To install: Run install-temp-api-stunnel.sh on each node")
                 else:
-                    logger.info(f"Temperature API available on {available_count}/{len(nodes)} nodes")
+                    logger.info(f"[OK] Temperature API available on {available_count}/{len(nodes)} nodes")
             
             except Exception as e:
                 logger.error(f"Failed to check temperature API status: {e}")
@@ -917,41 +795,53 @@ class ProxmoxDashboard:
     
     def _get_node_temperature_direct(self, node_name, timeout=2):
         """
-        Get temperature directly from node's port 8899.
+        Get all temperature sensors directly from node's port 8898 (HTTPS via stunnel).
+        HTTPS ONLY - No HTTP fallback for security.
         Returns None if service not available or timeout.
         """
         try:
             node_ip = self.node_addresses.get(node_name, self.api.host)
-            url = f"http://{node_ip}:8899/temperature"
+            url = f"https://{node_ip}:8898/temperature"
             
-            response = requests.get(url, timeout=timeout)
-            
+            # HTTPS only with self-signed certificate acceptance
+            response = requests.get(url, timeout=timeout, verify=False)
+            # Suppress only the single InsecureRequestWarning from urllib3
+            urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+        
             if response.status_code == 200:
                 data = response.json()
                 return data.get('data', {})
             else:
+                logger.debug(f"Temperature API returned status {response.status_code} for {node_name}")
                 return None
+        
         except requests.Timeout:
+            logger.debug(f"Timeout connecting to temperature API on {node_name} (https://{node_ip}:8898)")
             return None
         except requests.ConnectionError as e:
+            logger.debug(f"Connection error to temperature API on {node_name}: {e}")
+            return None
+        except requests.RequestException as e:
+            logger.debug(f"Request error to temperature API on {node_name}: {e}")
             return None
         except Exception as e:
+            logger.debug(f"Unexpected error getting temperature from {node_name}: {e}")
             return None
-    
+
     def get_all_node_temperatures(self):
         """
-        Get temperature from all nodes via Proxmox API.
-        Uses short timeout, skips unavailable nodes, runs checks in parallel.
-        
-        Returns dict of {node_name: {temp, source, status}}
+        Get temperature from all nodes via their temperature API.
+        Returns dict of {node_name: {sensors: [...], primary_temp: X, status: ...}}
         """
         if not self.api:
+            logger.debug("get_all_node_temperatures: No API connection")
             return {}
         
         node_temps = {}
         
         try:
             nodes = self.api.get('/nodes')
+            logger.debug(f"get_all_node_temperatures: Fetching temps for {len(nodes)} nodes")
         except Exception as e:
             logger.error(f"Failed to get node list: {e}")
             return {}
@@ -962,10 +852,10 @@ class ProxmoxDashboard:
             node_name = node['node']
             if node_name in self.node_temp_api_available and not self.node_temp_api_available[node_name]:
                 node_temps[node_name] = {
-                    'temp': None,
-                    'source': 'unavailable',
-                    'status': 'not_installed'
+                    'status': 'not_installed',
+                    'sensors': []
                 }
+                logger.debug(f"  {node_name}: Skipping (API not installed)")
             else:
                 nodes_to_check.append(node_name)
         
@@ -977,24 +867,14 @@ class ProxmoxDashboard:
                 try:
                     result = self._get_node_temperature_direct(node_name, timeout=1.5)
                     if result and result.get('status') == 'ok':
-                        return node_name, {
-                            'temp': result.get('temperature'),
-                            'source': result.get('source', 'unknown'),
-                            'hwmon': result.get('hwmon', 'unknown'),
-                            'status': 'ok'
-                        }, True
-                    else:
-                        return node_name, {
-                            'temp': None,
-                            'source': 'error',
-                            'status': result.get('status', 'unknown_error') if result else 'no_response'
-                        }, False
-                except Exception:
-                    return node_name, {
-                        'temp': None,
-                        'source': 'unavailable',
-                        'status': 'no_api_endpoint'
-                    }, False
+                        sensor_count = len(result.get('sensors', []))
+                        logger.debug(f"  {node_name}: Got {sensor_count} sensors")
+                        return node_name, result, True
+                    logger.debug(f"  {node_name}: Status={result.get('status') if result else 'None'}")
+                    return node_name, result or {'status': 'error', 'sensors': []}, False
+                except Exception as e:
+                    logger.debug(f"  {node_name}: Exception: {e}")
+                    return node_name, {'status': 'exception', 'sensors': []}, False
             
             with ThreadPoolExecutor(max_workers=min(len(nodes_to_check), 5)) as executor:
                 futures = {executor.submit(fetch_temp, n): n for n in nodes_to_check}
@@ -1004,17 +884,15 @@ class ProxmoxDashboard:
                         node_name, temp_data, available = future.result()
                         node_temps[node_name] = temp_data
                         self.node_temp_api_available[node_name] = available
-                    except Exception:
+                    except Exception as e:
                         node_name = futures[future]
-                        node_temps[node_name] = {
-                            'temp': None,
-                            'source': 'unavailable',
-                            'status': 'timeout'
-                        }
+                        logger.warning(f"  {node_name}: Timeout/error: {e}")
+                        node_temps[node_name] = {'status': 'timeout', 'sensors': []}
                         self.node_temp_api_available[node_name] = False
         
+        logger.debug(f"get_all_node_temperatures: Returning data for {len(node_temps)} nodes")
         return node_temps
-    
+
     def update_node_temperatures(self):
         """Update all node temperature displays in background thread"""
         if not self.api:
@@ -1028,80 +906,516 @@ class ProxmoxDashboard:
         # Run in background to not block UI
         thread = threading.Thread(target=update_async, daemon=True)
         thread.start()
-    
+
     def _update_temp_ui(self, node_temps):
-        """Update temperature UI elements (must run on main thread)"""
+        """Update temperature UI elements - COMPACT VIEW showing only CPU package"""
+        logger.debug(f"_update_temp_ui called with {len(node_temps)} nodes")
+        
+        # Store full temp data for details view
+        self.node_temps_full_data = node_temps
+        
+        # Clear existing temperature labels
+        cleared_count = 0
+        for widget in self.node_temp_frame.winfo_children():
+            if hasattr(widget, 'is_temp_label'):
+                widget.destroy()
+                cleared_count += 1
+        logger.debug(f"  Cleared {cleared_count} old temperature labels")
+        
         for node_name, temp_info in node_temps.items():
-            # Create label if doesn't exist
-            if node_name not in self.node_temp_labels:
+            status = temp_info.get('status')
+            logger.debug(f"  {node_name}: status={status}, sensors={len(temp_info.get('sensors', []))}")
+            
+            if status != 'ok':
+                # Show node with error status
                 label = tk.Label(
                     self.node_temp_frame,
+                    text=f"{node_name}: N/A",
                     font=("Arial", 9, "bold"),
-                    bg="#2c3e50"
+                    bg="#34495e",
+                    fg="#95a5a6"
                 )
+                label.is_temp_label = True
                 label.pack(side=tk.LEFT, padx=8)
-                self.node_temp_labels[node_name] = label
-            
-            # Update display
-            label = self.node_temp_labels[node_name]
-            temp = temp_info.get('temp')
-            
-            if temp is not None:
-                display_text = f"{node_name}: {temp}°C"
-                temp_color = self.get_temp_color(temp)
-                label.config(text=display_text, fg=temp_color)
                 
-                # Add tooltip
-                source = temp_info.get('source', 'unknown')
-                hwmon = temp_info.get('hwmon', 'unknown')
                 node_ip = self.node_addresses.get(node_name, 'unknown')
-                tooltip = f"IP: {node_ip}:8899\nSource: {source}\nHwmon: {hwmon}"
+                tooltip = f"IP: {node_ip}:8898 (HTTPS)\nStatus: {status}"
+                if status == 'not_installed':
+                    tooltip += "\nTemperature API not installed\nRun install script on this node"
                 self._bind_tooltip(label, tooltip)
+                logger.debug(f"    Created N/A label for {node_name}")
+                continue
+            
+            # Get all sensors for this node
+            sensors = temp_info.get('sensors', [])
+            if not sensors:
+                logger.debug(f"    No sensors for {node_name}")
+                continue
+            
+            # COMPACT VIEW: Show only CPU Package (or highest CPU core if no package)
+            cpu_package = None
+            cpu_cores = []
+            
+            for sensor in sensors:
+                sensor_type = sensor.get('type')
+                if sensor_type == 'cpu_package':
+                    cpu_package = sensor
+                    break
+                elif sensor_type == 'cpu_core':
+                    cpu_cores.append(sensor)
+            
+            # Use package temp, or highest core temp as fallback
+            display_sensor = cpu_package
+            if not display_sensor and cpu_cores:
+                display_sensor = max(cpu_cores, key=lambda s: s.get('temperature', 0))
+            
+            if display_sensor:
+                temp = display_sensor.get('temperature')
+                label_text = display_sensor.get('label', 'CPU')
+                
+                # Truncate long label text to prevent X11 errors
+                if len(label_text) > 20:
+                    label_text = label_text[:17] + "..."
+                
+                temp_color = self.get_temp_color(temp)
+                
+                # Create compact display: "node: temp°C"
+                sensor_label = tk.Label(
+                    self.node_temp_frame,
+                    text=f"{node_name}: {temp}°C",
+                    font=("Arial", 10, "bold"),
+                    bg="#34495e",
+                    fg=temp_color,
+                    cursor="hand2"
+                )
+                sensor_label.is_temp_label = True
+                sensor_label.pack(side=tk.LEFT, padx=10)
+                
+                # Tooltip shows it's clickable
+                tooltip = f"CPU Temperature: {temp}°C\nClick for detailed sensor view"
+                self._bind_tooltip(sensor_label, tooltip)
+                
+                # Click to show details
+                sensor_label.bind("<Button-1>", lambda e, nn=node_name: self.show_temperature_details(nn))
+                
+                logger.debug(f"    Displayed compact temp for {node_name}: {temp}°C")
             else:
-                label.config(text=f"{node_name}: N/A", fg="#95a5a6")
-                status = temp_info.get('status', 'unknown')
-                node_ip = self.node_addresses.get(node_name, 'unknown')
-                if status in ('no_api_endpoint', 'not_installed'):
-                    tooltip = f"IP: {node_ip}:8899\nTemperature API not installed\nRun install-proxmox-temp-api.sh on this node"
-                else:
-                    tooltip = f"IP: {node_ip}:8899\nTemperature unavailable\nStatus: {status}"
-                self._bind_tooltip(label, tooltip)
+                # No CPU temp found, show sensor count
+                label = tk.Label(
+                    self.node_temp_frame,
+                    text=f"{node_name}: {len(sensors)} sensors",
+                    font=("Arial", 9),
+                    bg="#34495e",
+                    fg="#bdc3c7",
+                    cursor="hand2"
+                )
+                label.is_temp_label = True
+                label.pack(side=tk.LEFT, padx=8)
+                label.bind("<Button-1>", lambda e, nn=node_name: self.show_temperature_details(nn))
+                self._bind_tooltip(label, "Click for detailed sensor view")
+        
+        logger.debug(f"_update_temp_ui completed")
     
-    def _bind_tooltip(self, widget, text):
-        """Bind tooltip to widget"""
-        def on_enter(event):
-            tooltip = tk.Toplevel()
-            tooltip.wm_overrideredirect(True)
-            tooltip.wm_geometry(f"+{event.x_root+10}+{event.y_root+10}")
+    def show_temperature_details(self, node_name=None):
+        """Show detailed temperature window for all sensors"""
+        if not hasattr(self, 'node_temps_full_data'):
+            messagebox.showinfo("Temperature Details", "No temperature data available yet.\nPlease wait for data refresh.")
+            return
+        
+        try:
+            # Create details window
+            details_window = tk.Toplevel(self.root)
+            details_window.title(f"Temperature Details - {node_name if node_name else 'All Nodes'}")
+            details_window.geometry("800x600")
             
-            label = tk.Label(
-                tooltip,
-                text=text,
-                background="#34495e",
-                foreground="#ecf0f1",
-                relief=tk.SOLID,
-                borderwidth=1,
-                font=("Arial", 8),
-                justify=tk.LEFT,
-                padx=5,
-                pady=3
+            # Center window
+            details_window.update_idletasks()
+            x = (details_window.winfo_screenwidth() // 2) - 400
+            y = (details_window.winfo_screenheight() // 2) - 300
+            details_window.geometry(f"800x600+{x}+{y}")
+            
+            # Title
+            title_frame = tk.Frame(details_window, bg="#2c3e50", height=50)
+            title_frame.pack(fill=tk.X)
+            title_frame.pack_propagate(False)
+            
+            tk.Label(
+                title_frame,
+                text=f"Temperature Sensors - {node_name if node_name else 'All Nodes'}",
+                font=("Arial", 14, "bold"),
+                bg="#2c3e50",
+                fg="white"
+            ).pack(pady=12)
+            
+            # Color Legend Frame
+            legend_frame = tk.Frame(details_window, bg="#ecf0f1", relief=tk.RIDGE, borderwidth=1)
+            legend_frame.pack(fill=tk.X, padx=10, pady=5)
+            
+            tk.Label(
+                legend_frame,
+                text="Temperature Key:",
+                font=("Arial", 9, "bold"),
+                bg="#ecf0f1",
+                fg="#2c3e50"
+            ).pack(side=tk.LEFT, padx=10, pady=5)
+            
+            # Color indicators
+            color_key = [
+                ("< 50°C Cool", "#27ae60"),
+                ("50-70°C Normal", "#3498db"),
+                ("70-85°C Warm", "#e67e22"),
+                ("≥ 85°C Hot", "#e74c3c")
+            ]
+            
+            for label_text, color in color_key:
+                key_frame = tk.Frame(legend_frame, bg="#ecf0f1")
+                key_frame.pack(side=tk.LEFT, padx=5, pady=5)
+                
+                # Color box
+                color_box = tk.Frame(key_frame, bg=color, width=15, height=15, relief=tk.SOLID, borderwidth=1)
+                color_box.pack(side=tk.LEFT, padx=(0, 3))
+                color_box.pack_propagate(False)
+                
+                # Label
+                tk.Label(
+                    key_frame,
+                    text=label_text,
+                    font=("Arial", 8),
+                    bg="#ecf0f1",
+                    fg="#2c3e50"
+                ).pack(side=tk.LEFT)
+            
+            # Scrollable content
+            canvas = tk.Canvas(details_window, bg="white")
+            scrollbar = tk.Scrollbar(details_window, orient="vertical", command=canvas.yview)
+            scrollable_frame = tk.Frame(canvas, bg="white")
+            
+            scrollable_frame.bind(
+                "<Configure>",
+                lambda e: canvas.configure(scrollregion=canvas.bbox("all"))
             )
-            label.pack()
             
-            widget._tooltip = tooltip
+            canvas.create_window((0, 0), window=scrollable_frame, anchor="nw")
+            canvas.configure(yscrollcommand=scrollbar.set)
+            
+            # Filter nodes to display
+            nodes_to_show = {}
+            if node_name:
+                if node_name in self.node_temps_full_data:
+                    nodes_to_show[node_name] = self.node_temps_full_data[node_name]
+            else:
+                nodes_to_show = self.node_temps_full_data
+            
+            # Safety limit: max 5 nodes at once to prevent X11 errors
+            if len(nodes_to_show) > 5:
+                nodes_to_show = dict(list(nodes_to_show.items())[:5])
+                # Add warning
+                warning_frame = tk.Frame(scrollable_frame, bg="#f39c12")
+                warning_frame.pack(fill=tk.X, padx=10, pady=5)
+                tk.Label(
+                    warning_frame,
+                    text="[WARNING] Showing first 5 nodes only (too many to display)",
+                    font=("Arial", 9, "bold"),
+                    bg="#f39c12",
+                    fg="white",
+                    padx=10,
+                    pady=5
+                ).pack()
+            
+            self._populate_temperature_details(scrollable_frame, nodes_to_show)
+            
+            # Pack scrollbar and canvas
+            canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+            scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+            
+            # Close button
+            btn_frame = tk.Frame(details_window, bg="white")
+            btn_frame.pack(fill=tk.X, pady=10)
+            
+            tk.Button(
+                btn_frame,
+                text="Close",
+                command=details_window.destroy,
+                bg="#95a5a6",
+                fg="white",
+                font=("Arial", 10, "bold"),
+                width=15,
+                cursor="hand2"
+            ).pack()
+            
+        except Exception as e:
+            logger.error(f"Error creating temperature details window: {e}")
+            messagebox.showerror(
+                "Display Error",
+                f"Failed to show temperature details.\n\n"
+                f"Error: {str(e)}\n\n"
+                f"This may be due to too many sensors.\n"
+                f"Try viewing individual nodes instead of all nodes."
+            )
+    
+    def _populate_temperature_details(self, parent, nodes_to_show):
+        """Populate temperature details in the scrollable frame"""
+        for nn, temp_info in nodes_to_show.items():
+            try:
+                # Node header
+                node_frame = tk.Frame(parent, bg="#ecf0f1", relief=tk.RAISED, borderwidth=2)
+                node_frame.pack(fill=tk.X, padx=10, pady=10)
+                
+                header_frame = tk.Frame(node_frame, bg="#34495e")
+                header_frame.pack(fill=tk.X)
+                
+                # Truncate node name if too long
+                display_node_name = nn if len(nn) <= 30 else nn[:27] + "..."
+                
+                tk.Label(
+                    header_frame,
+                    text=f"Node: {display_node_name}",
+                    font=("Arial", 12, "bold"),
+                    bg="#34495e",
+                    fg="white",
+                    anchor="w"
+                ).pack(side=tk.LEFT, padx=10, pady=8)
+                
+                node_ip = self.node_addresses.get(nn, 'unknown')
+                tk.Label(
+                    header_frame,
+                    text=f"IP: {node_ip}:8898 (HTTPS)",
+                    font=("Arial", 9),
+                    bg="#34495e",
+                    fg="#bdc3c7",
+                    anchor="e"
+                ).pack(side=tk.RIGHT, padx=10, pady=8)
+                
+                # Sensor data
+                sensors = temp_info.get('sensors', [])
+                status = temp_info.get('status')
+                
+                if status != 'ok' or not sensors:
+                    tk.Label(
+                        node_frame,
+                        text=f"Status: {status}" if status != 'ok' else "No sensors found",
+                        font=("Arial", 10),
+                        bg="#ecf0f1",
+                        fg="#e74c3c"
+                    ).pack(padx=10, pady=10)
+                    continue
+                
+                # Group sensors by type
+                sensor_groups = {
+                    'cpu_package': [],
+                    'cpu_core': [],
+                    'thermal_zone': [],
+                    'motherboard': [],
+                    'nvme': [],
+                    'other': []
+                }
+                
+                for sensor in sensors:
+                    sensor_type = sensor.get('type', 'other')
+                    sensor_groups[sensor_type].append(sensor)
+                
+                # Display sensors grouped by type
+                display_order = ['cpu_package', 'cpu_core', 'thermal_zone', 'motherboard', 'nvme', 'other']
+                type_names = {
+                    'cpu_package': 'CPU Package',
+                    'cpu_core': 'CPU Cores',
+                    'thermal_zone': 'Thermal Zones',
+                    'motherboard': 'Motherboard',
+                    'nvme': 'NVMe Drives',
+                    'other': 'Other Sensors'
+                }
+                
+                # Limit sensors per type to prevent X11 rendering errors
+                max_sensors_per_type = 20
+                
+                total_displayed = 0
+                for sensor_type in display_order:
+                    group_sensors = sensor_groups[sensor_type]
+                    if not group_sensors:
+                        continue
+                    
+                    # Type header
+                    type_frame = tk.Frame(node_frame, bg="#ecf0f1")
+                    type_frame.pack(fill=tk.X, padx=10, pady=(10, 5))
+                    
+                    tk.Label(
+                        type_frame,
+                        text=type_names[sensor_type],
+                        font=("Arial", 10, "bold"),
+                        bg="#ecf0f1",
+                        fg="#2c3e50"
+                    ).pack(anchor="w")
+                    
+                    # Limit number of sensors displayed
+                    sensors_to_show = group_sensors[:max_sensors_per_type]
+                    remaining = len(group_sensors) - len(sensors_to_show)
+                    
+                    # Sensors in this group
+                    for sensor in sensors_to_show:
+                        temp = sensor.get('temperature')
+                        label_text = sensor.get('label', 'Unknown')
+                        chip = sensor.get('chip', 'N/A')
+                        
+                        # Truncate long text to prevent X11 errors
+                        if len(label_text) > 40:
+                            label_text = label_text[:37] + "..."
+                        if len(chip) > 30:
+                            chip = chip[:27] + "..."
+                        
+                        sensor_frame = tk.Frame(node_frame, bg="white")
+                        sensor_frame.pack(fill=tk.X, padx=20, pady=2)
+                        
+                        # Temperature with color
+                        temp_color = self.get_temp_color(temp)
+                        tk.Label(
+                            sensor_frame,
+                            text=f"{label_text}:",
+                            font=("Arial", 9),
+                            bg="white",
+                            anchor="w",
+                            width=30
+                        ).pack(side=tk.LEFT)
+                        
+                        tk.Label(
+                            sensor_frame,
+                            text=f"{temp}°C",
+                            font=("Arial", 9, "bold"),
+                            bg="white",
+                            fg=temp_color,
+                            width=10
+                        ).pack(side=tk.LEFT)
+                        
+                        tk.Label(
+                            sensor_frame,
+                            text=f"({chip})",
+                            font=("Arial", 8),
+                            bg="white",
+                            fg="#7f8c8d"
+                        ).pack(side=tk.LEFT, padx=5)
+                        
+                        total_displayed += 1
+                    
+                    # Show "and X more" if we hit the limit
+                    if remaining > 0:
+                        more_frame = tk.Frame(node_frame, bg="white")
+                        more_frame.pack(fill=tk.X, padx=20, pady=2)
+                        
+                        tk.Label(
+                            more_frame,
+                            text=f"... and {remaining} more {type_names[sensor_type].lower()}",
+                            font=("Arial", 8, "italic"),
+                            bg="white",
+                            fg="#7f8c8d"
+                        ).pack(anchor="w")
+                
+                # Add total count at bottom
+                if total_displayed > 0:
+                    summary_frame = tk.Frame(node_frame, bg="#ecf0f1")
+                    summary_frame.pack(fill=tk.X, padx=10, pady=10)
+                    
+                    tk.Label(
+                        summary_frame,
+                        text=f"Showing {total_displayed} of {len(sensors)} total sensors",
+                        font=("Arial", 8),
+                        bg="#ecf0f1",
+                        fg="#7f8c8d"
+                    ).pack()
+                    
+            except Exception as e:
+                # Log error but continue with other nodes
+                logger.error(f"Error displaying sensors for node {nn}: {e}")
+                error_frame = tk.Frame(parent, bg="#fadbd8", relief=tk.RAISED, borderwidth=2)
+                error_frame.pack(fill=tk.X, padx=10, pady=5)
+                tk.Label(
+                    error_frame,
+                    text=f"Error displaying {nn}: {str(e)[:100]}",
+                    font=("Arial", 9),
+                    bg="#fadbd8",
+                    fg="#e74c3c",
+                    padx=10,
+                    pady=5
+                ).pack()
+
+    def _bind_tooltip(self, widget, text):
+        """Bind tooltip to widget - SAFE VERSION without closures"""
+        # Skip if tooltips are disabled
+        if not self.tooltips_enabled:
+            return
+        
+        # Truncate very long text to prevent X11 errors
+        max_chars = 150
+        if len(text) > max_chars:
+            text = text[:max_chars] + "..."
+        
+        # Store text on widget
+        widget._tooltip_text = text
+        
+        def on_enter(event):
+            w = event.widget
+            if not hasattr(w, '_tooltip_text'):
+                return
+            
+            # Destroy old tooltip if it exists
+            if hasattr(w, '_tooltip_window'):
+                try:
+                    w._tooltip_window.destroy()
+                except Exception:
+                    pass
+            
+            # Create new tooltip
+            try:
+                tooltip = tk.Toplevel()
+                tooltip.wm_overrideredirect(True)
+                
+                # Position slightly offset from cursor
+                x = event.x_root + 10
+                y = event.y_root + 10
+                tooltip.wm_geometry(f"+{x}+{y}")
+                
+                # Simple label with word wrap
+                label = tk.Label(
+                    tooltip,
+                    text=w._tooltip_text,
+                    background="#2c3e50",
+                    foreground="white",
+                    relief=tk.SOLID,
+                    borderwidth=1,
+                    font=("Arial", 8),
+                    justify=tk.LEFT,
+                    wraplength=250,
+                    padx=5,
+                    pady=3
+                )
+                label.pack()
+                
+                # Store reference on widget
+                w._tooltip_window = tooltip
+            except Exception as e:
+                # Silently fail if tooltip can't be created
+                logger.debug(f"Failed to create tooltip: {e}")
         
         def on_leave(event):
-            if hasattr(widget, '_tooltip'):
-                widget._tooltip.destroy()
-                del widget._tooltip
+            w = event.widget
+            if hasattr(w, '_tooltip_window'):
+                try:
+                    w._tooltip_window.destroy()
+                    delattr(w, '_tooltip_window')
+                except Exception:
+                    pass
         
-        # Remove old bindings
-        widget.unbind("<Enter>")
-        widget.unbind("<Leave>")
+        # Unbind any existing handlers
+        try:
+            widget.unbind("<Enter>")
+            widget.unbind("<Leave>")
+        except Exception:
+            pass
         
-        # Add new bindings
-        widget.bind("<Enter>", on_enter)
-        widget.bind("<Leave>", on_leave)
+        # Bind new handlers
+        try:
+            widget.bind("<Enter>", on_enter, add=False)
+            widget.bind("<Leave>", on_leave, add=False)
+        except Exception as e:
+            logger.debug(f"Failed to bind tooltip: {e}")
     
     # ========================================================================
     # END NODE TEMPERATURE API MONITORING
@@ -1112,6 +1426,38 @@ class ProxmoxDashboard:
         top_frame = tk.Frame(self.root, bg="#2c3e50", height=140)
         top_frame.pack(fill=tk.X)
         top_frame.pack_propagate(False)
+
+        # NEW: Node Temperature Frame (below the top bar)
+        self.node_temp_container = tk.Frame(self.root, bg="#34495e", height=40)  # Increased height
+        self.node_temp_container.pack(fill=tk.X)
+        self.node_temp_container.pack_propagate(False)
+    
+        self.node_temp_frame = tk.Frame(self.node_temp_container, bg="#34495e")
+        self.node_temp_frame.pack(side=tk.LEFT, padx=10, pady=5, fill=tk.BOTH, expand=True)
+    
+        tk.Label(
+            self.node_temp_frame,
+            text="Node Temperatures:",
+            font=("Arial", 9, "bold"),
+            bg="#34495e",
+            fg="#bdc3c7"
+        ).pack(side=tk.LEFT, padx=(0, 10))
+        
+        # Add Details button on the right side
+        details_btn = tk.Button(
+            self.node_temp_container,
+            text="[Details]",  # Removed emoji - can cause X11 errors
+            command=lambda: self.show_temperature_details(None),
+            bg="#3498db",
+            fg="white",
+            font=("Arial", 9, "bold"),
+            cursor="hand2",
+            relief=tk.FLAT,
+            padx=10,
+            pady=5
+        )
+        details_btn.pack(side=tk.RIGHT, padx=10, pady=5)
+        # Don't bind tooltip here - do it later after window is created
         
         # Left section: Title
         title_label = tk.Label(
@@ -1246,22 +1592,6 @@ class ProxmoxDashboard:
         )
         self.last_update_label.pack()
         
-        # NEW: Node Temperature Frame (below the top bar)
-        self.node_temp_container = tk.Frame(self.root, bg="#34495e", height=35)
-        self.node_temp_container.pack(fill=tk.X)
-        self.node_temp_container.pack_propagate(False)
-        
-        self.node_temp_frame = tk.Frame(self.node_temp_container, bg="#34495e")
-        self.node_temp_frame.pack(side=tk.LEFT, padx=10, pady=5)
-        
-        tk.Label(
-            self.node_temp_frame,
-            text="Node Temps:",
-            font=("Arial", 9, "bold"),
-            bg="#34495e",
-            fg="#bdc3c7"
-        ).pack(side=tk.LEFT, padx=(0, 10))
-        
         # Control panel
         control_frame = tk.Frame(self.root, bg="#ecf0f1", height=80)
         control_frame.pack(fill=tk.X)
@@ -1322,6 +1652,20 @@ class ProxmoxDashboard:
             fg="white",
             font=("Arial", 11, "bold"),
             width=12,
+            height=2,
+            cursor="hand2",
+            relief=tk.RAISED,
+            bd=2
+        ).pack(side=tk.LEFT, padx=5)
+        
+        tk.Button(
+            btn_container,
+            text="Change Credentials",
+            command=self.change_credentials,
+            bg="#9b59b6",
+            fg="white",
+            font=("Arial", 10, "bold"),
+            width=15,
             height=2,
             cursor="hand2",
             relief=tk.RAISED,
@@ -1409,7 +1753,7 @@ class ProxmoxDashboard:
         # Basic columns
         columns = (
             "ID", "Type", "Status", "Name", "Node", 
-            "Cores", "Sockets", "CPU", "Memory", "Disk", "Free Disk", "Free%"
+            "Cores", "Sockets", "CPU", "Memory", "Disk", "Total FS", "Free Disk", "Free%"
         )
         
         self.tree = ttk.Treeview(
@@ -1432,7 +1776,7 @@ class ProxmoxDashboard:
         column_widths = {
             "ID": 80, "Type": 80, "Status": 110, "Name": 300, "Node": 150,
             "Cores": 100, "Sockets": 110, "CPU": 180, "Memory": 250,
-            "Disk": 150, "Free Disk": 150, "Free%": 110
+            "Disk": 150, "Total FS": 150, "Free Disk": 150, "Free%": 110
         }
         
         for col in columns:
@@ -1487,27 +1831,74 @@ class ProxmoxDashboard:
                 if master_password is None:
                     return False
                 
+                # Try to decrypt credentials
                 try:
                     creds = CredentialManager.load_credentials(master_password)
-                    if creds:
-                        # Only token authentication supported
-                        self.api = ProxmoxAPI(
-                            creds['host'],
-                            token_id=creds['token_id'],
-                            token_secret=creds['token_secret']
-                        )
+                except Exception as decrypt_error:
+                    logger.error(f"Failed to decrypt credentials: {str(decrypt_error)}")
+                    messagebox.showerror(
+                        "Decryption Error", 
+                        f"Failed to decrypt credentials:\n{str(decrypt_error)}\n\n"
+                        "Please check your master password."
+                    )
+                    continue  # Ask for password again
+                
+                if not creds:
+                    messagebox.showerror("Error", "No credentials found in file.")
+                    continue
+                
+                # Credentials decrypted successfully, now try to authenticate
+                try:
+                    self.api = ProxmoxAPI(
+                        creds['host'],
+                        token_id=creds['token_id'],
+                        token_secret=creds['token_secret']
+                    )
+                    
+                    self.status_label.config(text=f"Connected to {creds['host']}")
+                    self.ssl_label.config(text=f"SSL: {self.api.ssl_status}")
+                    self.connection_healthy = True
+                    logger.info(f"Successfully authenticated to {creds['host']}")
+                    return True
+                
+                except Exception as auth_error:
+                    # Authentication failed - token might be revoked or invalid
+                    logger.error(f"Authentication failed with stored credentials: {str(auth_error)}")
+                    
+                    # Ask user what to do
+                    response = messagebox.askyesno(
+                        "Authentication Failed",
+                        f"Failed to authenticate with stored credentials:\n\n{str(auth_error)}\n\n"
+                        "The API token may have been revoked or is invalid.\n\n"
+                        "Would you like to delete the old credentials and set up new ones?",
+                        icon='warning'
+                    )
+                    
+                    if response:
+                        # Delete old credentials and go to setup
+                        try:
+                            os.remove(CREDENTIALS_FILE)
+                            logger.info("Deleted invalid credentials file")
+                        except Exception as e:
+                            logger.error(f"Failed to delete credentials file: {e}")
                         
-                        self.status_label.config(text=f"Connected to {creds['host']}")
-                        self.ssl_label.config(text=f"SSL: {self.api.ssl_status}")
-                        self.connection_healthy = True
-                        logger.info(f"Successfully authenticated to {creds['host']}")
-                        return True
-                except Exception as e:
-                    logger.error(f"Authentication failed: {str(e)}")
-                    messagebox.showerror("Error", f"Failed to decrypt or connect:\n{str(e)}")
+                        messagebox.showinfo(
+                            "Credentials Deleted",
+                            "Old credentials have been deleted.\n\n"
+                            "You will now be guided through setting up new credentials."
+                        )
+                        break  # Exit the while loop and go to setup flow
+                    else:
+                        # User chose not to delete, ask for password again
+                        continue
         
-        # Show token creation guide first
-        messagebox.showinfo("Setup Required", "No credentials found.\n\nYou'll need to create an API token in Proxmox first.\n\nThe next screen will show you how.")
+        # No credentials file exists OR user deleted it - show setup flow
+        messagebox.showinfo(
+            "Setup Required", 
+            "No credentials found.\n\n"
+            "You'll need to create an API token in Proxmox first.\n\n"
+            "The next screen will show you how."
+        )
         guide = TokenCreationGuide(self.root)
         self.root.wait_window(guide)
         
@@ -1518,7 +1909,7 @@ class ProxmoxDashboard:
         if dialog.result:
             auth_type, host, user, password, token_id, token_secret, master = dialog.result
             try:
-                # Only token authentication
+                # Try to authenticate with new credentials
                 self.api = ProxmoxAPI(host, token_id=token_id, token_secret=token_secret)
                 CredentialManager.save_credentials(host, master, token_id, token_secret)
                 
@@ -1677,7 +2068,7 @@ class ProxmoxDashboard:
                 item = self.tree.insert('', 'end', values=(
                     vm['id'], vm['type'], vm['status'], vm['name'], vm['node'],
                     vm.get('cores', 'N/A'), vm.get('sockets', 'N/A'), vm.get('cpu', 'N/A'),
-                    vm.get('memory', 'N/A'), vm.get('disk', 'N/A'),
+                    vm.get('memory', 'N/A'), vm.get('disk', 'N/A'), vm.get('total_fs', 'N/A'),
                     vm.get('free_disk', 'N/A'), vm.get('free_pct', 'N/A')
                 ), tags=tags)
                 
@@ -1707,12 +2098,11 @@ class ProxmoxDashboard:
             return 'N/A'
         try:
             bytes_val = float(bytes_val)
-            for unit in ['B', 'KiB', 'MiB', 'GiB', 'TiB']:
-                if bytes_val < 1024:
+            for unit in ['B', 'KiB', 'MiB', 'GiB', 'TiB', 'PiB']:
+                if bytes_val < 1024 or unit == 'PiB':
                     return f"{bytes_val:.1f}{unit}"
                 bytes_val /= 1024
-            return f"{bytes_val:.1f}PiB"
-        except Exception:
+        except (ValueError, TypeError):
             return 'N/A'
     
     def fetch_single_vm_data(self, node, vm, vm_type):
@@ -1777,6 +2167,7 @@ class ProxmoxDashboard:
             # Free disk and Free% - REAL-TIME DISK VALUES (only if running)
             free_disk = 'N/A'
             free_pct = 'N/A'
+            total_fs = 'N/A'
             if vm['status'] == 'running':
                 try:
                     if vm_type == 'VM':
@@ -1811,6 +2202,7 @@ class ProxmoxDashboard:
                                             used_bytes_sum += fs_used
                                 
                                 if total_bytes_sum > 0:
+                                    total_fs = self.format_bytes(total_bytes_sum)
                                     free_bytes = total_bytes_sum - used_bytes_sum
                                     if free_bytes >= 0:
                                         free_disk = self.format_bytes(free_bytes)
@@ -1823,6 +2215,7 @@ class ProxmoxDashboard:
                             disk_max = stat.get('maxdisk', 0)
                             
                             if disk_max > 0 and disk_used >= 0:
+                                total_fs = self.format_bytes(disk_max)
                                 free_bytes = disk_max - disk_used
                                 if free_bytes >= 0:
                                     free_disk = self.format_bytes(free_bytes)
@@ -1834,6 +2227,7 @@ class ProxmoxDashboard:
                         disk_max = stat.get('maxdisk', 0)
                         
                         if disk_max > 0 and disk_used >= 0:
+                            total_fs = self.format_bytes(disk_max)
                             free_bytes = disk_max - disk_used
                             if free_bytes >= 0:
                                 free_disk = self.format_bytes(free_bytes)
@@ -1858,6 +2252,7 @@ class ProxmoxDashboard:
                 'cpu': cpu_type,
                 'memory': memory,
                 'disk': total_disk,
+                'total_fs': total_fs,
                 'free_disk': free_disk,
                 'free_pct': free_pct
             }
@@ -1871,6 +2266,14 @@ class ProxmoxDashboard:
     def refresh_data_async(self):
         """Refresh data asynchronously with parallel processing"""
         if self.is_loading:
+            return
+        
+        # Check if API is available
+        if not self.api:
+            logger.warning("Refresh called but API not available - skipping")
+            self.status_label.config(text="Not connected - waiting for credentials")
+            self.connection_label.config(text="Disconnected", fg="#e74c3c")
+            self.update_led_color(self.connection_led, "#e74c3c")
             return
         
         self.show_loading("Fetching data from Proxmox...")
@@ -2068,6 +2471,88 @@ class ProxmoxDashboard:
         
         self.run_async(stop_vm, callback=stop_callback)
     
+    def change_credentials(self):
+        """Allow user to change stored credentials"""
+        response = messagebox.askyesno(
+            "Change Credentials",
+            "This will delete your current credentials and guide you through setting up new ones.\n\n"
+            "Continue?",
+            icon='warning'
+        )
+        
+        if not response:
+            return
+        
+        # Stop auto-refresh to prevent errors during credential change
+        logger.info("Stopping auto-refresh for credential change")
+        self.auto_refresh = False
+        
+        # Delete old credentials
+        try:
+            if os.path.exists(CREDENTIALS_FILE):
+                os.remove(CREDENTIALS_FILE)
+                logger.info("User requested credential change - deleted old credentials")
+        except Exception as e:
+            logger.error(f"Failed to delete credentials file: {e}")
+            messagebox.showerror("Error", f"Failed to delete credentials:\n{str(e)}")
+            # Re-enable auto-refresh since we're not changing credentials
+            self.auto_refresh = True
+            return
+        
+        # Close current API connection
+        self.api = None
+        self.connection_healthy = False
+        self.status_label.config(text="Not connected - setting up new credentials")
+        self.connection_label.config(text="Disconnected", fg="#e74c3c")
+        self.update_led_color(self.connection_led, "#e74c3c")
+        
+        # Show setup flow
+        messagebox.showinfo(
+            "Setup New Credentials",
+            "You'll need to create a new API token in Proxmox.\n\n"
+            "The next screen will show you how."
+        )
+        
+        guide = TokenCreationGuide(self.root)
+        self.root.wait_window(guide)
+        
+        # Show credentials entry
+        dialog = CredentialsDialog(self.root, is_setup=True)
+        self.root.wait_window(dialog)
+        
+        if dialog.result:
+            auth_type, host, user, password, token_id, token_secret, master = dialog.result
+            try:
+                # Try to authenticate with new credentials
+                self.api = ProxmoxAPI(host, token_id=token_id, token_secret=token_secret)
+                CredentialManager.save_credentials(host, master, token_id, token_secret)
+                
+                messagebox.showinfo("Success", "New credentials saved successfully!\n\nThe dashboard will now refresh.")
+                self.status_label.config(text=f"Connected to {host}")
+                self.ssl_label.config(text=f"SSL: {self.api.ssl_status}")
+                self.connection_healthy = True
+                logger.info(f"Successfully changed credentials to {host}")
+                
+                # Re-enable auto-refresh
+                self.auto_refresh = True
+                
+                # Refresh dashboard
+                self.refresh_data_async()
+            except Exception as e:
+                logger.error(f"Connection setup failed: {str(e)}")
+                messagebox.showerror("Error", f"Connection failed:\n{str(e)}\n\nPlease restart the dashboard and try again.")
+                self.connection_healthy = False
+                # Don't re-enable auto-refresh since connection failed
+                self.root.quit()
+        else:
+            messagebox.showwarning(
+                "Cancelled",
+                "Credential change cancelled.\n\n"
+                "Your old credentials were already deleted.\n"
+                "You'll need to restart the dashboard and set up credentials to continue."
+            )
+            self.root.quit()
+
     def start_all_stopped(self):
         """Start all stopped VMs/CTs"""
         stopped = [vm for vm in self.vm_data if vm['status'] != 'running']
@@ -2176,39 +2661,6 @@ class ProxmoxDashboard:
 
 
 def main():
-    """
-    ═══════════════════════════════════════════════════════════════════════
-    PROXMOX DASHBOARD - WITH NODE TEMPERATURE MONITORING
-    ═══════════════════════════════════════════════════════════════════════
-    
-    FEATURES:
-    * View all VMs and Containers across all nodes
-    * Start/Stop VMs and Containers
-    * Basic VM information:
-      - ID, Type, Status, Name, Node
-      - CPU cores, sockets, type
-      - Configured memory
-      - Disk size
-      - Free disk space (for running VMs)
-    * Auto-refresh every 3 seconds (configurable 2s-30s)
-    * Search and filter VMs/CTs
-    * Multi-node cluster support
-    * NODE temperature monitoring via port 8899
-    
-    NODE TEMPERATURE API:
-    * Monitors temperatures from each Proxmox node
-    * Endpoint: http://{node-ip}:8899/temperature
-    * Displays color-coded temperatures (green/blue/orange/red)
-    * Hover tooltips show temperature source and hwmon info
-    * Requires temperature API installed on Proxmox nodes
-    * Install on each node: bash install-proxmox-temp-api-NO-FIREWALL.sh
-    * Falls back gracefully if API not available
-    
-    ═══════════════════════════════════════════════════════════════════════
-    """
-    
-    print(__doc__)
-    
     root = tk.Tk()
     app = ProxmoxDashboard(root)
     root.mainloop()
