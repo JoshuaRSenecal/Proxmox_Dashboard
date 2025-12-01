@@ -1,1 +1,824 @@
+#!/bin/bash
+# install-temp-api-stunnel.sh
+# Proxmox Temperature API Installation with stunnel TLS encryption
+# Run this on EACH Proxmox node
+#
+# This installs a temperature service with TWO endpoints:
+#   HTTP:  http://{node-ip}:8899/temperature  (local/trusted only)
+#   HTTPS: https://{node-ip}:8898/temperature (TLS encrypted via stunnel)
+#
+# stunnel provides TLS encryption for the temperature API
 
+set -e
+
+echo "========================================================"
+echo "Proxmox Temperature API Installation (with stunnel TLS)"
+echo "========================================================"
+echo ""
+echo "This script will install a temperature service with:"
+echo "  - HTTPS endpoint on port 8898 (TLS encrypted via stunnel)"
+echo "  - HTTP service on port 8899 (LOCALHOST ONLY - not accessible remotely)"
+echo ""
+echo "SECURITY: Only HTTPS (port 8898) is accessible from the network."
+echo "          HTTP (port 8899) is bound to 127.0.0.1 for local use only."
+echo ""
+echo "Components installed:"
+echo "  1. lm-sensors for standardized sensor detection"
+echo "  2. Temperature reader (Python script)"
+echo "  3. HTTP service (port 8899 - localhost binding)"
+echo "  4. stunnel4 for TLS encryption (port 8898 - network accessible)"
+echo "  5. Systemd services (auto-start)"
+echo ""
+read -p "Continue installation? [y/N] " -n 1 -r
+echo
+if [[ ! $REPLY =~ ^[Yy]$ ]]; then
+    echo "Installation cancelled."
+    exit 0
+fi
+
+# Check if running as root
+if [ "$EUID" -ne 0 ]; then
+    echo "ERROR: Please run as root"
+    exit 1
+fi
+
+# Check if this is a Proxmox system
+if [ ! -f /etc/pve/.version ]; then
+    echo "ERROR: This doesn't appear to be a Proxmox VE system"
+    exit 1
+fi
+
+echo ""
+echo "========================================================"
+echo "Step 1/7: Installing lm-sensors"
+echo "========================================================"
+
+# Install lm-sensors if not present
+if ! command -v sensors &> /dev/null; then
+    echo "  Installing lm-sensors package..."
+    apt-get update -qq
+    apt-get install -y lm-sensors > /dev/null 2>&1
+    echo "  lm-sensors installed"
+else
+    echo "  lm-sensors already installed"
+fi
+
+# Detect sensors (non-interactive)
+echo "  Detecting hardware sensors..."
+sensors-detect --auto > /dev/null 2>&1 || true
+echo "  Sensor detection complete"
+
+# Test sensors command
+echo ""
+echo "  Testing sensor detection..."
+if sensors > /dev/null 2>&1; then
+    echo "  Sensors detected successfully"
+    sensors | head -20
+else
+    echo "  WARNING: No sensors detected"
+    echo "  Temperature monitoring may not work on this system"
+fi
+
+echo ""
+echo "========================================================"
+echo "Step 2/7: Installing stunnel4"
+echo "========================================================"
+
+if ! command -v stunnel4 &> /dev/null; then
+    echo "  Installing stunnel4 package..."
+    apt-get install -y stunnel4 > /dev/null 2>&1
+    echo "  stunnel4 installed"
+else
+    echo "  stunnel4 already installed"
+fi
+
+echo ""
+echo "========================================================"
+echo "Step 3/7: Generating TLS Certificate"
+echo "========================================================"
+
+CERT_DIR="/etc/stunnel"
+CERT_FILE="${CERT_DIR}/proxmox-temp-api.pem"
+CERT_KEY="${CERT_DIR}/proxmox-temp-api-key.pem"
+
+mkdir -p ${CERT_DIR}
+
+if [ ! -f "${CERT_FILE}" ]; then
+    echo "  Generating self-signed certificate..."
+    
+    # Get hostname and IP
+    NODE_HOSTNAME=$(hostname -f)
+    NODE_IP=$(hostname -I | awk '{print $1}')
+    
+    # Generate private key
+    openssl genrsa -out "${CERT_KEY}" 2048 2>/dev/null
+    
+    # Generate certificate
+    openssl req -new -x509 -key "${CERT_KEY}" -out "${CERT_FILE}" -days 3650 -subj "/CN=${NODE_HOSTNAME}/O=Proxmox Temperature API/C=US" 2>/dev/null
+    
+    # Combine key and cert for stunnel
+    cat "${CERT_KEY}" >> "${CERT_FILE}"
+    
+    # Secure permissions
+    chmod 600 "${CERT_FILE}"
+    chmod 600 "${CERT_KEY}"
+    
+    echo "  Certificate generated: ${CERT_FILE}"
+    echo "  Certificate valid for 10 years"
+    echo ""
+    echo "  Certificate details:"
+    echo "    Hostname: ${NODE_HOSTNAME}"
+    echo "    IP: ${NODE_IP}"
+else
+    echo "  Certificate already exists: ${CERT_FILE}"
+fi
+
+echo ""
+echo "========================================================"
+echo "Step 4/7: Installing Temperature Reader"
+echo "========================================================"
+
+cat > /usr/local/bin/proxmox-temp-reader.py << 'PYTHON_READER_EOF'
+#!/usr/bin/env python3
+"""
+Proxmox Temperature Reader using lm-sensors
+Collects all available temperature sensors with proper labels
+"""
+import subprocess
+import json
+import re
+import sys
+
+class TemperatureReader:
+    def __init__(self):
+        self.sensors_cmd = '/usr/bin/sensors'
+    
+    def read_all_temperatures(self):
+        """Read all temperature sensors using lm-sensors"""
+        try:
+            result = subprocess.run(
+                [self.sensors_cmd, '-A', '-u'],
+                capture_output=True,
+                text=True,
+                timeout=5
+            )
+            
+            if result.returncode != 0:
+                return {
+                    'status': 'error',
+                    'error': 'sensors command failed',
+                    'sensors': []
+                }
+            
+            sensors = self._parse_sensors_output(result.stdout)
+            
+            return {
+                'status': 'ok',
+                'sensors': sensors,
+                'count': len(sensors)
+            }
+        
+        except FileNotFoundError:
+            return {
+                'status': 'error',
+                'error': 'lm-sensors not installed',
+                'sensors': []
+            }
+        except subprocess.TimeoutExpired:
+            return {
+                'status': 'error',
+                'error': 'sensors command timeout',
+                'sensors': []
+            }
+        except Exception as e:
+            return {
+                'status': 'error',
+                'error': str(e),
+                'sensors': []
+            }
+    
+    def _parse_sensors_output(self, output):
+        """Parse sensors -A -u output to extract all temperature data"""
+        sensors = []
+        current_chip = None
+        current_sensor = None
+        current_label = None
+        current_input = None
+        
+        for line in output.split('\n'):
+            line = line.strip()
+            
+            # New chip/adapter
+            if line and not line.startswith(' ') and ':' not in line:
+                current_chip = line
+                continue
+            
+            # Adapter line
+            if line.startswith('Adapter:'):
+                continue
+            
+            # Temperature sensor label
+            if line and not line.startswith(' '):
+                # This is a sensor name (e.g., "Core 0:", "Package id 0:")
+                current_sensor = line.rstrip(':')
+                current_label = None
+                current_input = None
+                continue
+            
+            # Indented lines contain the actual values
+            if line.startswith(' ') and current_sensor:
+                # Parse key-value pairs
+                if ':' in line:
+                    key, value = line.split(':', 1)
+                    key = key.strip()
+                    value = value.strip()
+                    
+                    # Look for temperature input values
+                    if '_input' in key and 'temp' in key:
+                        try:
+                            temp_value = float(value)
+                            current_input = temp_value
+                        except ValueError:
+                            continue
+                    
+                    # Look for labels
+                    elif '_label' in key and 'temp' in key:
+                        current_label = value
+                    
+                    # When we have both label and input, create sensor entry
+                    if current_input is not None:
+                        # Determine sensor type and create meaningful label
+                        sensor_type, display_label = self._categorize_sensor(
+                            current_chip, current_sensor, current_label
+                        )
+                        
+                        sensors.append({
+                            'chip': current_chip,
+                            'sensor': current_sensor,
+                            'label': display_label,
+                            'type': sensor_type,
+                            'temperature': round(current_input, 1),
+                            'unit': 'C'
+                        })
+                        
+                        # Reset for next sensor
+                        current_sensor = None
+                        current_label = None
+                        current_input = None
+        
+        return sensors
+    
+    def _categorize_sensor(self, chip, sensor, label):
+        """Categorize sensor and create display label"""
+        chip_lower = chip.lower() if chip else ''
+        sensor_lower = sensor.lower() if sensor else ''
+        label_lower = label.lower() if label else ''
+        
+        # CPU Package Temperature (highest priority)
+        if any(x in chip_lower for x in ['coretemp', 'k10temp', 'zenpower']):
+            if 'package' in sensor_lower or 'tctl' in sensor_lower or 'tdie' in sensor_lower:
+                return 'cpu_package', 'CPU Package'
+            elif 'core' in sensor_lower:
+                core_num = re.search(r'core\s*(\d+)', sensor_lower)
+                if core_num:
+                    return 'cpu_core', f'CPU Core {core_num.group(1)}'
+                return 'cpu_core', 'CPU Core'
+        
+        # x86_pkg_temp (CPU package)
+        if 'x86_pkg_temp' in chip_lower:
+            return 'cpu_package', 'CPU Package'
+        
+        # ACPI Thermal Zone
+        if 'acpitz' in chip_lower or 'thermal' in chip_lower:
+            if label:
+                return 'thermal_zone', f'Thermal Zone ({label})'
+            return 'thermal_zone', 'ACPI Thermal Zone'
+        
+        # Motherboard sensors
+        if any(x in chip_lower for x in ['nct', 'it87', 'w83', 'f71', 'asus', 'gigabyte']):
+            if label:
+                return 'motherboard', f'Motherboard ({label})'
+            return 'motherboard', f'Motherboard ({sensor})'
+        
+        # NVMe drives
+        if 'nvme' in chip_lower:
+            return 'nvme', f'NVMe ({chip})'
+        
+        # Generic fallback
+        if label:
+            return 'other', label
+        return 'other', f'{chip} - {sensor}'
+    
+    def get_summary(self):
+        """Get summary with primary CPU temperature"""
+        data = self.read_all_temperatures()
+        
+        if data['status'] != 'ok' or not data['sensors']:
+            return data
+        
+        # Find CPU package temperature (preferred)
+        cpu_package = None
+        for sensor in data['sensors']:
+            if sensor['type'] == 'cpu_package':
+                cpu_package = sensor
+                break
+        
+        # If no package temp, use first CPU core
+        if not cpu_package:
+            for sensor in data['sensors']:
+                if sensor['type'] == 'cpu_core':
+                    cpu_package = sensor
+                    break
+        
+        # Add summary fields
+        if cpu_package:
+            data['primary_temp'] = cpu_package['temperature']
+            data['primary_label'] = cpu_package['label']
+            data['primary_type'] = cpu_package['type']
+        else:
+            # Use first available sensor as fallback
+            first_sensor = data['sensors'][0]
+            data['primary_temp'] = first_sensor['temperature']
+            data['primary_label'] = first_sensor['label']
+            data['primary_type'] = first_sensor['type']
+        
+        return data
+
+def main():
+    import argparse
+    parser = argparse.ArgumentParser(description='Read system temperatures')
+    parser.add_argument('--json', action='store_true', help='Output JSON')
+    parser.add_argument('--summary', action='store_true', help='Show summary only')
+    args = parser.parse_args()
+    
+    reader = TemperatureReader()
+    
+    if args.summary:
+        result = reader.get_summary()
+    else:
+        result = reader.read_all_temperatures()
+    
+    if args.json:
+        print(json.dumps(result, indent=2))
+    else:
+        if result['status'] == 'ok':
+            print(f"Found {result['count']} temperature sensors:\n")
+            for sensor in result['sensors']:
+                print(f"  {sensor['label']}: {sensor['temperature']}°C ({sensor['type']})")
+            if 'primary_temp' in result:
+                print(f"\nPrimary: {result['primary_label']} = {result['primary_temp']}°C")
+        else:
+            print(f"Error: {result.get('error', 'Unknown error')}")
+            sys.exit(1)
+
+if __name__ == '__main__':
+    main()
+PYTHON_READER_EOF
+
+chmod +x /usr/local/bin/proxmox-temp-reader.py
+echo "  Installed: /usr/local/bin/proxmox-temp-reader.py"
+
+# Test the reader
+echo ""
+echo "  Testing temperature reader..."
+if /usr/local/bin/proxmox-temp-reader.py; then
+    echo "  Status: OK"
+else
+    echo "  WARNING: No temperature sensors detected"
+    echo "  Temperature monitoring may not work on this system"
+fi
+
+echo ""
+echo "========================================================"
+echo "Step 5/7: Installing HTTP Service"
+echo "========================================================"
+
+cat > /usr/local/bin/proxmox-temp-service.py << 'PYTHON_SERVICE_EOF'
+#!/usr/bin/env python3
+"""
+Proxmox Temperature HTTP Service
+Provides temperature data via HTTP on port 8899 (localhost only for security)
+"""
+from http.server import HTTPServer, BaseHTTPRequestHandler
+from urllib.parse import urlparse, parse_qs
+import subprocess
+import json
+import re
+
+class TemperatureReader:
+    """Temperature reader using lm-sensors"""
+    
+    def __init__(self):
+        self.sensors_cmd = '/usr/bin/sensors'
+    
+    def read_all_temperatures(self):
+        """Read all temperature sensors"""
+        try:
+            result = subprocess.run(
+                [self.sensors_cmd, '-A', '-u'],
+                capture_output=True,
+                text=True,
+                timeout=5
+            )
+            
+            if result.returncode != 0:
+                return {
+                    'status': 'error',
+                    'error': 'sensors command failed',
+                    'sensors': []
+                }
+            
+            sensors = self._parse_sensors_output(result.stdout)
+            
+            return {
+                'status': 'ok',
+                'sensors': sensors,
+                'count': len(sensors)
+            }
+        
+        except Exception as e:
+            return {
+                'status': 'error',
+                'error': str(e),
+                'sensors': []
+            }
+    
+    def _parse_sensors_output(self, output):
+        """Parse sensors output"""
+        sensors = []
+        current_chip = None
+        current_sensor = None
+        current_label = None
+        current_input = None
+        
+        for original_line in output.split('\n'):
+            # Preserve original for indentation check
+            line = original_line.strip()
+            
+            if not line:  # Skip empty lines
+                continue
+            
+            # Check if original line is indented
+            is_indented = original_line and original_line[0] in (' ', '\t')
+            
+            # New chip/adapter (not indented, no colon)
+            if not is_indented and ':' not in line:
+                current_chip = line
+                continue
+            
+            # Adapter line
+            if line.startswith('Adapter:'):
+                continue
+            
+            # Sensor name (not indented, ends with colon)
+            if not is_indented and line.endswith(':'):
+                current_sensor = line.rstrip(':')
+                current_label = None
+                current_input = None
+                continue
+            
+            # Value lines (indented, has colon)
+            if is_indented and current_sensor and ':' in line:
+                key, value = line.split(':', 1)
+                key = key.strip()
+                value = value.strip()
+                
+                # Look for temperature input values
+                if '_input' in key and 'temp' in key:
+                    try:
+                        temp_value = float(value)
+                        current_input = temp_value
+                    except ValueError:
+                        continue
+                
+                # Look for labels
+                elif '_label' in key and 'temp' in key:
+                    current_label = value
+                
+                # When we have input, create sensor entry
+                if current_input is not None:
+                    sensor_type, display_label = self._categorize_sensor(
+                        current_chip, current_sensor, current_label
+                    )
+                    
+                    sensors.append({
+                        'chip': current_chip,
+                        'sensor': current_sensor,
+                        'label': display_label,
+                        'type': sensor_type,
+                        'temperature': round(current_input, 1),
+                        'unit': 'C'
+                    })
+                    
+                    # Reset for next temperature (don't reset current_sensor)
+                    current_label = None
+                    current_input = None
+        
+        return sensors
+    
+    def _categorize_sensor(self, chip, sensor, label):
+        """Categorize sensor type"""
+        chip_lower = chip.lower() if chip else ''
+        sensor_lower = sensor.lower() if sensor else ''
+        
+        if any(x in chip_lower for x in ['coretemp', 'k10temp', 'zenpower']):
+            if 'package' in sensor_lower or 'tctl' in sensor_lower or 'tdie' in sensor_lower:
+                return 'cpu_package', 'CPU Package'
+            elif 'core' in sensor_lower:
+                core_num = re.search(r'core\s*(\d+)', sensor_lower)
+                if core_num:
+                    return 'cpu_core', f'CPU Core {core_num.group(1)}'
+                return 'cpu_core', 'CPU Core'
+        
+        if 'x86_pkg_temp' in chip_lower:
+            return 'cpu_package', 'CPU Package'
+        
+        if 'acpitz' in chip_lower or 'thermal' in chip_lower:
+            return 'thermal_zone', 'ACPI Thermal Zone'
+        
+        if any(x in chip_lower for x in ['nct', 'it87', 'w83', 'f71', 'asus', 'gigabyte']):
+            return 'motherboard', f'Motherboard ({sensor})'
+        
+        if 'nvme' in chip_lower:
+            return 'nvme', f'NVMe ({chip})'
+        
+        return 'other', f'{chip} - {sensor}'
+    
+    def get_summary(self):
+        """Get temperature summary"""
+        data = self.read_all_temperatures()
+        
+        if data['status'] != 'ok' or not data['sensors']:
+            return data
+        
+        cpu_package = None
+        for sensor in data['sensors']:
+            if sensor['type'] == 'cpu_package':
+                cpu_package = sensor
+                break
+        
+        if not cpu_package:
+            for sensor in data['sensors']:
+                if sensor['type'] == 'cpu_core':
+                    cpu_package = sensor
+                    break
+        
+        if cpu_package:
+            data['primary_temp'] = cpu_package['temperature']
+            data['primary_label'] = cpu_package['label']
+            data['primary_type'] = cpu_package['type']
+        else:
+            first_sensor = data['sensors'][0]
+            data['primary_temp'] = first_sensor['temperature']
+            data['primary_label'] = first_sensor['label']
+            data['primary_type'] = first_sensor['type']
+        
+        return data
+
+class TemperatureHandler(BaseHTTPRequestHandler):
+    """HTTP Request Handler"""
+    
+    def do_GET(self):
+        parsed_url = urlparse(self.path)
+        
+        if parsed_url.path == '/temperature':
+            try:
+                reader = TemperatureReader()
+                result = reader.get_summary()
+                
+                response = {'data': result}
+                
+                self.send_response(200)
+                self.send_header('Content-Type', 'application/json')
+                self.send_header('Cache-Control', 'max-age=2')
+                self.end_headers()
+                self.wfile.write(json.dumps(response).encode())
+            
+            except Exception as e:
+                self.send_response(500)
+                self.send_header('Content-Type', 'application/json')
+                self.end_headers()
+                error_response = {
+                    'data': {
+                        'status': 'error',
+                        'error': str(e),
+                        'sensors': []
+                    }
+                }
+                self.wfile.write(json.dumps(error_response).encode())
+        
+        elif parsed_url.path == '/health':
+            self.send_response(200)
+            self.send_header('Content-Type', 'text/plain')
+            self.end_headers()
+            self.wfile.write(b'OK')
+        
+        else:
+            self.send_response(404)
+            self.end_headers()
+    
+    def log_message(self, format, *args):
+        pass
+
+def main():
+    # Listen on localhost only - stunnel will handle external access with TLS
+    server = HTTPServer(('127.0.0.1', 8899), TemperatureHandler)
+    print("Proxmox Temperature Service listening on 127.0.0.1:8899 (localhost only)")
+    print("External access via stunnel on port 8898 (HTTPS)")
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        server.shutdown()
+
+if __name__ == '__main__':
+    main()
+PYTHON_SERVICE_EOF
+
+chmod +x /usr/local/bin/proxmox-temp-service.py
+echo "  Created: /usr/local/bin/proxmox-temp-service.py"
+
+echo ""
+echo "========================================================"
+echo "Step 6/7: Configuring stunnel"
+echo "========================================================"
+
+cat > /etc/stunnel/proxmox-temp-api.conf << EOF
+; stunnel configuration for Proxmox Temperature API
+; Provides TLS encryption for temperature monitoring
+
+[proxmox-temp-api]
+accept = 0.0.0.0:8898
+connect = 127.0.0.1:8899
+cert = ${CERT_FILE}
+
+; TLS configuration
+sslVersion = TLSv1.2
+options = NO_SSLv2
+options = NO_SSLv3
+ciphers = HIGH:!aNULL:!MD5
+
+; Logging
+debug = 4
+output = /var/log/stunnel-temp-api.log
+
+; Security
+setuid = stunnel4
+setgid = stunnel4
+
+; Client verification (disabled for self-signed certs)
+verify = 0
+EOF
+
+echo "  Created: /etc/stunnel/proxmox-temp-api.conf"
+
+# Enable stunnel
+sed -i 's/ENABLED=0/ENABLED=1/' /etc/default/stunnel4 2>/dev/null || echo "ENABLED=1" >> /etc/default/stunnel4
+
+echo ""
+echo "========================================================"
+echo "Step 7/7: Creating and Starting Services"
+echo "========================================================"
+
+# Create unprivileged user for the temperature service
+if ! id "proxmox-temp" &>/dev/null; then
+    useradd --system --no-create-home --shell /usr/sbin/nologin proxmox-temp
+    echo "  Created user: proxmox-temp"
+else
+    echo "  User proxmox-temp already exists"
+fi
+
+# Temperature API service
+cat > /etc/systemd/system/proxmox-temp-api.service << 'SYSTEMD_EOF'
+[Unit]
+Description=Proxmox Temperature API Service
+After=network.target
+Before=stunnel4.service
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/python3 /usr/local/bin/proxmox-temp-service.py
+Restart=always
+RestartSec=10
+
+# Run as unprivileged user
+User=proxmox-temp
+Group=proxmox-temp
+
+# Logging
+StandardOutput=journal
+StandardError=journal
+
+# Security hardening
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+
+[Install]
+WantedBy=multi-user.target
+SYSTEMD_EOF
+
+echo "  Created: /etc/systemd/system/proxmox-temp-api.service"
+
+# Reload and start services
+systemctl daemon-reload
+
+# Start temperature API
+systemctl enable proxmox-temp-api.service
+systemctl restart proxmox-temp-api.service
+
+# Start stunnel
+systemctl enable stunnel4.service
+systemctl restart stunnel4.service
+
+echo "  Services enabled and started"
+
+echo ""
+echo "========================================================"
+echo "Testing Installation"
+echo "========================================================"
+
+sleep 3
+
+echo ""
+echo "  Testing HTTP service (localhost only)..."
+if curl -s http://127.0.0.1:8899/health > /dev/null 2>&1; then
+    echo "    ✓ HTTP service: OK"
+else
+    echo "    ✗ HTTP service: FAILED"
+    systemctl status proxmox-temp-api.service --no-pager | tail -10
+fi
+
+echo ""
+echo "  Testing HTTPS service (stunnel)..."
+if curl -sk https://127.0.0.1:8898/health > /dev/null 2>&1; then
+    echo "    ✓ HTTPS service (stunnel): OK"
+    echo ""
+    echo "  Temperature data (via HTTPS):"
+    TEMP_RESULT=$(curl -sk https://127.0.0.1:8898/temperature)
+    echo "$TEMP_RESULT" | python3 -m json.tool 2>/dev/null || echo "$TEMP_RESULT"
+else
+    echo "    ✗ HTTPS service: FAILED"
+    systemctl status stunnel4.service --no-pager | tail -10
+    echo ""
+    echo "  Checking stunnel logs:"
+    tail -20 /var/log/stunnel-temp-api.log 2>/dev/null || echo "    No logs found"
+fi
+
+echo ""
+echo "========================================================"
+echo "Installation Complete!"
+echo "========================================================"
+echo ""
+NODE_IP=$(hostname -I | awk '{print $1}')
+NODE_NAME=$(hostname)
+echo "The temperature service is now available:"
+echo ""
+echo "  HTTPS (TLS):   https://${NODE_IP}:8898/temperature  ← USE THIS"
+echo "  HTTP (local):  http://127.0.0.1:8899/temperature   (localhost only)"
+echo ""
+echo "IMPORTANT - Security Configuration:"
+echo "  ✓ HTTPS port 8898 is TLS encrypted and accessible from your network"
+echo "  ✓ HTTP port 8899 is bound to localhost (127.0.0.1) ONLY"
+echo "  ✓ External clients MUST use HTTPS endpoint for security"
+echo "  ✓ Dashboard automatically uses HTTPS - no fallback to HTTP"
+echo ""
+echo "Certificate:"
+echo "  • Self-signed certificate: ${CERT_FILE}"
+echo "  • Valid for 10 years"
+echo "  • Certificate warnings in browsers are normal for self-signed certs"
+echo ""
+echo "Test with curl:"
+echo "  curl -k https://${NODE_IP}:8898/temperature    # HTTPS (use this)"
+echo "  curl http://127.0.0.1:8899/temperature         # HTTP (local only)"
+echo ""
+echo "Service management:"
+echo "  systemctl status proxmox-temp-api    # Temperature service"
+echo "  systemctl status stunnel4            # TLS tunnel"
+echo "  systemctl restart proxmox-temp-api"
+echo "  systemctl restart stunnel4"
+echo "  journalctl -u proxmox-temp-api -f"
+echo "  tail -f /var/log/stunnel-temp-api.log"
+echo ""
+echo "Files installed:"
+echo "  /usr/local/bin/proxmox-temp-reader.py"
+echo "  /usr/local/bin/proxmox-temp-service.py"
+echo "  /etc/systemd/system/proxmox-temp-api.service"
+echo "  /etc/stunnel/proxmox-temp-api.conf"
+echo "  ${CERT_FILE}"
+echo ""
+echo "These files survive Proxmox updates!"
+echo ""
+echo "========================================================"
+echo "NEXT STEPS:"
+echo "========================================================"
+echo "1. Install this script on ALL other Proxmox nodes"
+echo "2. Use HTTPS endpoint in your dashboard: https://${NODE_IP}:8898/temperature"
+echo "3. Download certificate if needed:"
+echo "   scp root@${NODE_IP}:${CERT_FILE} ~/proxmox-temp-certs/${NODE_NAME}.pem"
+echo ""
