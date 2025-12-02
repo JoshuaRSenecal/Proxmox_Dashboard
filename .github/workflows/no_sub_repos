@@ -1,10 +1,7 @@
-# Option A: If they're in sources.list.d/ files
-# Disable PVE Enterprise
 if [ -f /etc/apt/sources.list.d/pve-enterprise.list ]; then
     mv /etc/apt/sources.list.d/pve-enterprise.list /etc/apt/sources.list.d/pve-enterprise.list.disabled
 fi;
 
-# Disable Ceph Enterprise
 if [ -f /etc/apt/sources.list.d/ceph.list ]; then
     mv /etc/apt/sources.list.d/ceph.list /etc/apt/sources.list.d/ceph.list.disabled
 fi
