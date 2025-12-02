@@ -1,21 +1,10 @@
-# SSH into the nested Proxmox
-ssh root@pve-nested
+# Option A: If they're in sources.list.d/ files
+# Disable PVE Enterprise
+if [ -f /etc/apt/sources.list.d/pve-enterprise.list ]; then
+    mv /etc/apt/sources.list.d/pve-enterprise.list /etc/apt/sources.list.d/pve-enterprise.list.disabled
+fi
 
-# Step 1: Disable the Enterprise repository
-# (These repos require a subscription)
-
-# Disable main Proxmox enterprise repo
-mv /etc/apt/sources.list.d/pve-enterprise.list /etc/apt/sources.list.d/pve-enterprise.list.disabled
-
-# Disable Ceph enterprise repo (if exists)
+# Disable Ceph Enterprise
 if [ -f /etc/apt/sources.list.d/ceph.list ]; then
     mv /etc/apt/sources.list.d/ceph.list /etc/apt/sources.list.d/ceph.list.disabled
 fi
-
-# Step 2: Add the no-subscription repository
-
-# Check Proxmox version first
-pveversion
-
-# The output will show something like:
-# pve-manager/8.x.x/xxxxxxxx (running kernel: x.x.x-x-pve)
