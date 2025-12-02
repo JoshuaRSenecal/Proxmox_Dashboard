@@ -1,0 +1,17 @@
+# On HOST, create startup script
+nano /etc/systemd/system/cluster-quorum-fix.service
+
+# Add this content:
+[Unit]
+Description=Fix cluster quorum on boot
+After=pve-cluster.service
+Before=pvedaemon.service
+
+[Service]
+Type=oneshot
+ExecStartPre=/bin/sleep 10
+ExecStart=/usr/bin/pvecm expected 1
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target
