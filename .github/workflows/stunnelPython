@@ -238,8 +238,6 @@ class CredentialManager:
     def save_credentials(host, master_password, token_id, token_secret):
         """Save API token credentials (token authentication only)"""
         try:
-            logger.info(f"Saving credentials for host: {host}, token: {token_id}")
-            
             credentials = {
                 'host': host,
                 'auth_type': 'token',
@@ -247,55 +245,33 @@ class CredentialManager:
                 'token_secret': token_secret
             }
             
-            logger.debug(f"Credential data structure created: host={host}, auth_type=token")
-            
             key = CredentialManager.get_key_from_password(master_password)
-            logger.debug("Encryption key derived from master password")
-            
             cipher = Fernet(key)
             encrypted_data = cipher.encrypt(json.dumps(credentials).encode())
-            logger.debug(f"Credentials encrypted, size: {len(encrypted_data)} bytes")
             
             # Write to temporary file first, then rename (atomic operation)
             temp_file = CREDENTIALS_FILE + '.tmp'
-            logger.debug(f"Writing to temporary file: {temp_file}")
             
             with open(temp_file, 'wb') as f:
                 f.write(encrypted_data)
             
-            # Verify temp file was written
-            if not os.path.exists(temp_file):
-                raise IOError(f"Temporary file was not created: {temp_file}")
-            
-            temp_size = os.path.getsize(temp_file)
-            logger.info(f"Temporary file written: {temp_size} bytes")
-            
             # Set permissions before rename
             os.chmod(temp_file, 0o600)
-            logger.debug("Temporary file permissions set to 0600")
             
             # Atomic rename
             os.rename(temp_file, CREDENTIALS_FILE)
-            logger.info(f"Credentials file created successfully: {CREDENTIALS_FILE}")
             
-            # Final verification
+            # Verify final file exists
             if not os.path.exists(CREDENTIALS_FILE):
-                raise IOError(f"Final credentials file does not exist after rename: {CREDENTIALS_FILE}")
+                raise IOError(f"Credentials file does not exist after save")
             
-            final_size = os.path.getsize(CREDENTIALS_FILE)
-            logger.info(f"Final credentials file size: {final_size} bytes")
-            
-            if final_size != temp_size:
-                raise IOError(f"File size mismatch: temp={temp_size}, final={final_size}")
+            logger.info(f"Credentials saved successfully for {host}")
             
         except IOError as e:
             logger.error(f"IO Error saving credentials: {str(e)}")
             raise Exception(f"Failed to save credentials file: {str(e)}")
         except Exception as e:
-            logger.error(f"Unexpected error saving credentials: {str(e)}")
-            logger.error(f"Error type: {type(e).__name__}")
-            import traceback
-            logger.error(f"Traceback: {traceback.format_exc()}")
+            logger.error(f"Error saving credentials: {str(e)}")
             raise Exception(f"Failed to encrypt credentials: {str(e)}")
     
     @staticmethod
@@ -810,26 +786,43 @@ class ProxmoxDashboard:
                 with ThreadPoolExecutor(max_workers=min(len(nodes), 5)) as executor:
                     futures = {executor.submit(check_node, node['node']): node['node'] for node in nodes}
                     
+                    # Track what we've logged to avoid spam
+                    if not hasattr(self, '_temp_api_logged'):
+                        self._temp_api_logged = {}  # {node: status}
+                    
                     for future in as_completed(futures, timeout=5):
                         try:
                             node_name, available, sensor_count = future.result()
                             self.node_temp_api_available[node_name] = available
-                            if available:
-                                logger.info(f"[OK] Temperature API available on {node_name} ({self.node_addresses.get(node_name)}:8898 HTTPS) - {sensor_count} sensors")
-                            else:
-                                logger.info(f"[FAILED] Temperature API not available on {node_name} (HTTPS required)")
+                            
+                            # Only log if status changed or first time
+                            prev_status = self._temp_api_logged.get(node_name)
+                            if prev_status != available:
+                                if available:
+                                    logger.info(f"[OK] Temperature API available on {node_name} ({self.node_addresses.get(node_name)}:8898 HTTPS) - {sensor_count} sensors")
+                                else:
+                                    logger.warning(f"Temperature API not available on {node_name} - install with install-temp-api-stunnel.sh")
+                                self._temp_api_logged[node_name] = available
                         except Exception as e:
                             node_name = futures[future]
                             self.node_temp_api_available[node_name] = False
-                            logger.warning(f"Error checking {node_name}: {e}")
+                            # Only log error if we haven't seen this error before
+                            if self._temp_api_logged.get(node_name) is not False:
+                                logger.warning(f"Error checking {node_name}: {e}")
+                                self._temp_api_logged[node_name] = False
                 
                 available_count = sum(1 for v in self.node_temp_api_available.values() if v)
                 
-                if available_count == 0:
-                    logger.warning("Temperature API not installed on any nodes (this is optional)")
-                    logger.info("To install: Run install-temp-api-stunnel.sh on each node")
-                else:
-                    logger.info(f"[OK] Temperature API available on {available_count}/{len(nodes)} nodes")
+                # Only log summary if it's the first check or count changed
+                if not hasattr(self, '_temp_api_summary_logged'):
+                    self._temp_api_summary_logged = -1
+                
+                if self._temp_api_summary_logged != available_count:
+                    if available_count == 0:
+                        logger.warning("Temperature API not installed on any nodes (optional)")
+                    else:
+                        logger.info(f"Temperature API available on {available_count}/{len(nodes)} nodes")
+                    self._temp_api_summary_logged = available_count
             
             except Exception as e:
                 logger.error(f"Failed to check temperature API status: {e}")
@@ -2066,8 +2059,6 @@ class ProxmoxDashboard:
         """Filter VMs based on search query"""
         query = self.search_entry.get().lower()
         
-        logger.debug(f"filter_vms called with query: '{query}', vm_data has {len(self.vm_data)} items")
-        
         # Save current selection (VM ID) before clearing
         selected_vm_id = None
         selected_items = self.tree.selection()
@@ -2089,7 +2080,6 @@ class ProxmoxDashboard:
         self.filtered_vm_data = []
         item_to_select = None
         
-        items_added = 0
         for vm in self.vm_data:
             if (query in str(vm.get('id', '')).lower() or
                 query in vm.get('name', '').lower() or
@@ -2111,22 +2101,16 @@ class ProxmoxDashboard:
                 else:
                     tags = ('unknown',)
                 
-                try:
-                    item = self.tree.insert('', 'end', values=(
-                        vm['id'], vm['type'], vm['status'], vm['name'], vm['node'],
-                        vm.get('cores', 'N/A'), vm.get('sockets', 'N/A'), vm.get('cpu', 'N/A'),
-                        vm.get('memory', 'N/A'), vm.get('disk', 'N/A'), vm.get('total_fs', 'N/A'),
-                        vm.get('free_disk', 'N/A'), vm.get('free_pct', 'N/A')
-                    ), tags=tags)
-                    items_added += 1
-                    
-                    # Track the item to reselect
-                    if selected_vm_id is not None and vm['id'] == selected_vm_id:
-                        item_to_select = item
-                except Exception as e:
-                    logger.error(f"Failed to insert VM {vm.get('id')} into tree: {e}")
-        
-        logger.debug(f"Added {items_added} items to tree display")
+                item = self.tree.insert('', 'end', values=(
+                    vm['id'], vm['type'], vm['status'], vm['name'], vm['node'],
+                    vm.get('cores', 'N/A'), vm.get('sockets', 'N/A'), vm.get('cpu', 'N/A'),
+                    vm.get('memory', 'N/A'), vm.get('disk', 'N/A'), vm.get('total_fs', 'N/A'),
+                    vm.get('free_disk', 'N/A'), vm.get('free_pct', 'N/A')
+                ), tags=tags)
+                
+                # Track the item to reselect
+                if selected_vm_id is not None and vm['id'] == selected_vm_id:
+                    item_to_select = item
         
         # Restore selection if found
         if item_to_select:
@@ -2143,8 +2127,6 @@ class ProxmoxDashboard:
             )
         else:
             self.status_label.config(text=f"Ready - {len(self.vm_data)} VMs/CTs across {self.node_count} node(s)")
-        
-        logger.debug(f"filter_vms completed - displayed {items_added} items")
     
     def format_bytes(self, bytes_val):
         """Format bytes to human readable (binary units: GiB, MiB, etc)"""
@@ -2152,11 +2134,14 @@ class ProxmoxDashboard:
             return 'N/A'
         try:
             bytes_val = float(bytes_val)
+            if bytes_val < 0:
+                return 'N/A'
             for unit in ['B', 'KiB', 'MiB', 'GiB', 'TiB', 'PiB']:
                 if bytes_val < 1024 or unit == 'PiB':
-                    return f"{bytes_val:.1f}{unit}"
+                    return f"{bytes_val:.1f} {unit}"  # Added space
                 bytes_val /= 1024
-        except (ValueError, TypeError):
+        except (ValueError, TypeError) as e:
+            logger.error(f"Error formatting bytes value '{bytes_val}': {e}")
             return 'N/A'
     
     def fetch_single_vm_data(self, node, vm, vm_type):
@@ -2166,14 +2151,8 @@ class ProxmoxDashboard:
             endpoint = 'qemu' if vm_type == 'VM' else 'lxc'
             vmid = vm['vmid']
             
-            logger.debug(f"Fetching data for {vm_type} {vmid} on node {n}")
-            
             # Get config only
-            try:
-                cfg = self.api.get(f'/nodes/{n}/{endpoint}/{vmid}/config')
-            except Exception as e:
-                logger.error(f"Failed to get config for {vm_type} {vmid}: {e}")
-                raise
+            cfg = self.api.get(f'/nodes/{n}/{endpoint}/{vmid}/config')
             
             # Basic info
             cores = cfg.get('cores', 'N/A')
@@ -2181,29 +2160,57 @@ class ProxmoxDashboard:
             # Memory - STATIC CONFIG VALUES ONLY (not real-time)
             if vm_type == 'VM':
                 # For VMs: Show minmem-maxmem (from balloon configuration)
-                memory_val = cfg.get('memory', 0)
-                if 'balloon' in cfg:
-                    minmem = int(cfg.get('balloon', memory_val))
-                    maxmem = int(cfg.get('memory', memory_val))
-                    if minmem > 0 and maxmem > 0:
-                        minmem_str = self.format_bytes(minmem * 1024 * 1024)
-                        maxmem_str = self.format_bytes(maxmem * 1024 * 1024)
-                        memory = f"{minmem_str}-{maxmem_str}"
+                try:
+                    memory_val = cfg.get('memory', 0)
+                    
+                    # Ensure memory_val is an integer
+                    if isinstance(memory_val, str):
+                        memory_val = int(memory_val)
+                    
+                    if 'balloon' in cfg:
+                        balloon_val = cfg.get('balloon', memory_val)
+                        if isinstance(balloon_val, str):
+                            balloon_val = int(balloon_val)
+                        
+                        minmem = int(balloon_val)
+                        maxmem = int(memory_val)
+                        
+                        if minmem > 0 and maxmem > 0:
+                            minmem_str = self.format_bytes(minmem * 1024 * 1024)
+                            maxmem_str = self.format_bytes(maxmem * 1024 * 1024)
+                            memory = f"{minmem_str}-{maxmem_str}"
+                        else:
+                            memory = self.format_bytes(memory_val * 1024 * 1024) if memory_val else 'N/A'
                     else:
                         memory = self.format_bytes(memory_val * 1024 * 1024) if memory_val else 'N/A'
-                else:
-                    memory = self.format_bytes(memory_val * 1024 * 1024) if memory_val else 'N/A'
+                except (ValueError, TypeError, KeyError) as e:
+                    logger.error(f"Error parsing memory for VM {vmid}: {e}, config: {cfg.get('memory')}, balloon: {cfg.get('balloon')}")
+                    memory = 'N/A'
             else:  # CT
-                memory_mb = int(cfg.get('memory', 0))
-                swap_mb = int(cfg.get('swap', 0))
-                if memory_mb > 0:
-                    mem_str = self.format_bytes(memory_mb * 1024 * 1024)
-                    if swap_mb > 0:
-                        swap_str = self.format_bytes(swap_mb * 1024 * 1024)
-                        memory = f"{mem_str}-{swap_str}"
+                try:
+                    memory_mb = cfg.get('memory', 0)
+                    swap_mb = cfg.get('swap', 0)
+                    
+                    # Ensure they are integers
+                    if isinstance(memory_mb, str):
+                        memory_mb = int(memory_mb)
+                    if isinstance(swap_mb, str):
+                        swap_mb = int(swap_mb)
+                    
+                    memory_mb = int(memory_mb)
+                    swap_mb = int(swap_mb)
+                    
+                    if memory_mb > 0:
+                        mem_str = self.format_bytes(memory_mb * 1024 * 1024)
+                        if swap_mb > 0:
+                            swap_str = self.format_bytes(swap_mb * 1024 * 1024)
+                            memory = f"{mem_str}+{swap_str}"
+                        else:
+                            memory = mem_str
                     else:
-                        memory = mem_str
-                else:
+                        memory = 'N/A'
+                except (ValueError, TypeError, KeyError) as e:
+                    logger.error(f"Error parsing memory for CT {vmid}: {e}, config: {cfg.get('memory')}, swap: {cfg.get('swap')}")
                     memory = 'N/A'
             
             # Disk size
@@ -2344,32 +2351,14 @@ class ProxmoxDashboard:
         def update_ui(result, error):
             self.hide_loading()
             if error:
-                logger.error(f"Refresh failed with error: {str(error)}")
-                logger.error(f"Error type: {type(error).__name__}")
-                import traceback
-                logger.error(f"Traceback: {traceback.format_exc()}")
-                
+                logger.error(f"Refresh failed: {str(error)}")
                 self.status_label.config(text=f"Error: {str(error)}")
                 self.connection_label.config(text="Disconnected", fg="#e74c3c")
                 self.update_led_color(self.connection_led, "#e74c3c")
-                messagebox.showerror("Error", f"Failed to refresh:\n{str(error)}\n\nCheck log file:\n{LOG_FILE}")
+                messagebox.showerror("Error", f"Failed to refresh:\n{str(error)}")
             else:
-                logger.info(f"Refresh successful - received {len(result) if result else 0} VMs/CTs")
-                
-                if result is None:
-                    logger.error("Result is None - no data returned")
-                    self.status_label.config(text="Error: No data returned from API")
-                    return
-                
-                if len(result) == 0:
-                    logger.warning("No VMs/CTs found - empty result")
-                
                 self.vm_data = result
-                logger.debug(f"vm_data set to {len(self.vm_data)} items")
-                
                 self.filter_vms()
-                logger.debug(f"filter_vms completed - filtered_vm_data has {len(self.filtered_vm_data)} items")
-                
                 now = datetime.now().strftime("%H:%M:%S")
                 
                 if self.auto_refresh:
@@ -2381,28 +2370,19 @@ class ProxmoxDashboard:
                 self.connection_label.config(text="Connected", fg="#27ae60")
                 self.update_led_color(self.connection_led, "#27ae60")
                 
-                logger.info(f"Dashboard updated successfully at {now}")
-                
-                # Update node temperatures (NEW)
+                # Update node temperatures
                 self.update_node_temperatures()
         
         self.run_async(fetch_data, callback=update_ui)
     
     def _fetch_vm_data_parallel(self):
         """Fetch VM data using simple serial processing"""
-        logger.info("Starting VM data fetch")
         vm_data = []
+        nodes = self.api.get('/nodes')
+        self.node_count = len(nodes)
         
-        try:
-            nodes = self.api.get('/nodes')
-            self.node_count = len(nodes)
-            logger.info(f"Found {self.node_count} node(s)")
-            
-            # Update node count in UI
-            self.root.after(0, lambda: self.node_label.config(text=f"Nodes: {self.node_count}"))
-        except Exception as e:
-            logger.error(f"Failed to get nodes list: {str(e)}")
-            raise Exception(f"Cannot get Proxmox nodes: {str(e)}")
+        # Update node count in UI
+        self.root.after(0, lambda: self.node_label.config(text=f"Nodes: {self.node_count}"))
         
         # Count total VMs/CTs first for progress
         total_count = 0
@@ -2411,18 +2391,14 @@ class ProxmoxDashboard:
             try:
                 vms = self.api.get(f'/nodes/{n}/qemu')
                 total_count += len(vms)
-                logger.debug(f"Node {n}: {len(vms)} VMs")
             except Exception as e:
                 logger.error(f"Error counting VMs from node {n}: {e}")
             
             try:
                 cts = self.api.get(f'/nodes/{n}/lxc')
                 total_count += len(cts)
-                logger.debug(f"Node {n}: {len(cts)} CTs")
             except Exception as e:
                 logger.error(f"Error counting CTs from node {n}: {e}")
-        
-        logger.info(f"Total VMs/CTs to fetch: {total_count}")
         
         # Process each VM/CT sequentially
         current = 0
@@ -2432,8 +2408,6 @@ class ProxmoxDashboard:
             # Get and process VMs
             try:
                 vms = self.api.get(f'/nodes/{n}/qemu')
-                logger.debug(f"Processing {len(vms)} VMs from node {n}")
-                
                 for vm in vms:
                     current += 1
                     
@@ -2441,9 +2415,6 @@ class ProxmoxDashboard:
                         vm_info = self.fetch_single_vm_data(node, vm, 'VM')
                         if vm_info:
                             vm_data.append(vm_info)
-                            logger.debug(f"  Added VM {vm['vmid']}: {vm['name']}")
-                        else:
-                            logger.warning(f"  VM {vm['vmid']} returned None")
                     except Exception as e:
                         logger.error(f"Error getting VM {vm['vmid']}: {e}")
             except Exception as e:
@@ -2452,8 +2423,6 @@ class ProxmoxDashboard:
             # Get and process Containers
             try:
                 cts = self.api.get(f'/nodes/{n}/lxc')
-                logger.debug(f"Processing {len(cts)} CTs from node {n}")
-                
                 for ct in cts:
                     current += 1
                     
@@ -2461,16 +2430,12 @@ class ProxmoxDashboard:
                         ct_info = self.fetch_single_vm_data(node, ct, 'CT')
                         if ct_info:
                             vm_data.append(ct_info)
-                            logger.debug(f"  Added CT {ct['vmid']}: {ct['name']}")
-                        else:
-                            logger.warning(f"  CT {ct['vmid']} returned None")
                     except Exception as e:
                         logger.error(f"Error getting CT {ct['vmid']}: {e}")
             except Exception as e:
                 logger.error(f"Error getting CTs from node {n}: {e}")
         
         vm_data.sort(key=lambda x: x['id'])
-        logger.info(f"VM data fetch complete: {len(vm_data)} items collected")
         return vm_data
     
     def on_select(self, event):
@@ -2587,26 +2552,16 @@ class ProxmoxDashboard:
             return
         
         # Stop auto-refresh to prevent errors during credential change
-        logger.info("Stopping auto-refresh for credential change")
         self.auto_refresh = False
-        
-        # Verify file exists before trying to delete
-        old_file_existed = os.path.exists(CREDENTIALS_FILE)
-        if old_file_existed:
-            logger.info(f"Old credentials file exists at: {CREDENTIALS_FILE}")
         
         # Delete old credentials
         try:
-            if old_file_existed:
+            if os.path.exists(CREDENTIALS_FILE):
                 os.remove(CREDENTIALS_FILE)
-                logger.info("Successfully deleted old credentials file")
-                # Verify deletion
-                if os.path.exists(CREDENTIALS_FILE):
-                    raise Exception("File still exists after deletion attempt")
+                logger.info("Old credentials file deleted")
         except Exception as e:
             logger.error(f"Failed to delete credentials file: {e}")
             messagebox.showerror("Error", f"Failed to delete credentials:\n{str(e)}")
-            # Re-enable auto-refresh since we're not changing credentials
             self.auto_refresh = True
             return
         
@@ -2640,23 +2595,13 @@ class ProxmoxDashboard:
             auth_type, host, user, password, token_id, token_secret, master = dialog.result
             try:
                 # Try to authenticate with new credentials
-                logger.info(f"Attempting to authenticate with new credentials to {host}")
                 self.api = ProxmoxAPI(host, token_id=token_id, token_secret=token_secret)
-                logger.info("Authentication successful, saving credentials")
                 
-                # CRITICAL: Save credentials and verify the file was written
+                # Save credentials and verify
                 CredentialManager.save_credentials(host, master, token_id, token_secret)
                 
-                # Verify the file was actually created
                 if not os.path.exists(CREDENTIALS_FILE):
-                    raise Exception(f"Credentials file was not created at {CREDENTIALS_FILE}")
-                
-                # Log file size to confirm it's not empty
-                file_size = os.path.getsize(CREDENTIALS_FILE)
-                logger.info(f"Credentials saved successfully - file size: {file_size} bytes")
-                
-                if file_size < 10:
-                    raise Exception(f"Credentials file is too small ({file_size} bytes) - save may have failed")
+                    raise Exception(f"Credentials file was not created")
                 
                 messagebox.showinfo("Success", "New credentials saved successfully!\n\nThe dashboard will now refresh.")
                 self.status_label.config(text=f"Connected to {host}")
@@ -2667,31 +2612,23 @@ class ProxmoxDashboard:
                 # Re-enable auto-refresh
                 self.auto_refresh = True
                 
-                # Re-check temperature API status with new connection
-                logger.info("Re-checking temperature API status with new credentials")
+                # Re-check temperature API status
                 self.root.after(1000, self.check_temperature_api_status)
                 
-                # Refresh dashboard immediately
-                logger.info("Refreshing dashboard with new credentials")
+                # Refresh dashboard
                 self.refresh_data_async()
                 
             except Exception as e:
                 logger.error(f"Credential change failed: {str(e)}")
-                logger.error(f"Error type: {type(e).__name__}")
-                import traceback
-                logger.error(f"Traceback: {traceback.format_exc()}")
-                
                 messagebox.showerror(
                     "Error", 
                     f"Failed to set up new credentials:\n\n{str(e)}\n\n"
-                    f"Please restart the dashboard and try again.\n\n"
-                    f"Check the log file at:\n{LOG_FILE}"
+                    f"Please restart the dashboard and try again."
                 )
                 self.connection_healthy = False
-                # Don't re-enable auto-refresh since connection failed
                 self.root.quit()
         else:
-            logger.warning("User cancelled credential change dialog")
+            logger.warning("User cancelled credential change")
             messagebox.showwarning(
                 "Cancelled",
                 "Credential change cancelled.\n\n"
