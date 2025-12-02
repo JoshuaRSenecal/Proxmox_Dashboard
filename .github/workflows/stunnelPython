@@ -222,7 +222,7 @@ class ProxmoxAPI:
 
 
 class CredentialManager:
-    """Manages encrypted credential storage - supports both passwords and API tokens"""
+    """Manages encrypted credential storage - supports API tokens"""
     
     @staticmethod
     def get_key_from_password(password):
@@ -624,14 +624,14 @@ class ProxmoxDashboard:
         self.connection_healthy = False
         self.node_count = 0
         
-        # Node temperature storage (NEW - from smaller script)
+        # Node temperature storage
         self.node_temp_labels = {}
         self.node_temp_api_available = {}
         self.node_addresses = {}  # Maps node names to IP addresses for temperature API
         self.node_temps_full_data = {}  # Store full temperature data for details view
         
         # Safety flags
-        self.tooltips_enabled = False  # DISABLED by default - set to True if tooltips work on your system
+        self.tooltips_enabled = False 
         self.window_ready = False  # Flag to indicate window is fully created
         
         self.setup_styles()
@@ -733,15 +733,11 @@ class ProxmoxDashboard:
         else:
             return "#e74c3c"  # Red - Hot
     
-    # ========================================================================
-    # NODE TEMPERATURE API MONITORING (NEW - MODIFIED WITH DEBUG LOGGING)
-    # ========================================================================
-    
     def check_temperature_api_status(self):
         """
         Check which nodes have temperature API available via HTTPS.
         This runs in a background thread to avoid blocking the UI.
-        Connects to port 8898 (HTTPS via stunnel) ONLY - no HTTP fallback.
+        Connects to port 8898 (HTTPS via stunnel).
         """
         if not self.api:
             return
@@ -834,7 +830,6 @@ class ProxmoxDashboard:
     def _get_node_temperature_direct(self, node_name, timeout=2):
         """
         Get all temperature sensors directly from node's port 8898 (HTTPS via stunnel).
-        HTTPS ONLY - No HTTP fallback for security.
         Returns None if service not available or timeout.
         """
         try:
