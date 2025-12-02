@@ -1223,8 +1223,7 @@ sub create_widgets {
     for my $i (0..$#columns) {
         $self->{tree}->header('create', $i, 
             -text => $columns[$i],
-            -headerbackground => '#34495e',
-            -foreground => 'white'
+            -headerbackground => '#34495e'
         );
     }
     
