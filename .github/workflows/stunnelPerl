@@ -26,6 +26,9 @@ use threads::shared;
 use Thread::Queue;
 use Time::HiRes qw(sleep usleep);
 
+# Proxmox Dashboard - Full-Featured Perl/Tk Version
+# Complete port of Python version with all features
+
 our $VERSION = '2.0.0';
 
 # Configuration
@@ -2090,7 +2093,7 @@ sub on_closing {
 
 sub run {
     my ($self) = @_;
-    MainLoop;
+    Tk::MainLoop();
 }
 
 ################################################################################
@@ -2100,7 +2103,7 @@ package main;
 
 # Check for required modules
 my @required_modules = qw(
-    Tk LWP::UserAgent JSON MIME::Base64 
+    Tk LWP::UserAgent LWP::Protocol::https JSON MIME::Base64 
     Digest::SHA Crypt::CBC Crypt::OpenSSL::AES
     threads Thread::Queue Time::HiRes
 );
