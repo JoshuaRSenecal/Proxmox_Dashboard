@@ -1,0 +1,1180 @@
+#!/usr/bin/perl
+use strict;
+use warnings;
+use Tk;
+use Tk::Dialog;
+use Tk::DialogBox;
+use Tk::Entry;
+use Tk::HList;
+use Tk::ROText;
+use LWP::UserAgent;
+use HTTP::Request;
+use JSON;
+use MIME::Base64;
+use Digest::SHA qw(sha256);
+use Crypt::CBC;
+use Crypt::OpenSSL::AES;
+use File::Path qw(make_path);
+use POSIX qw(strftime);
+use threads;
+use threads::shared;
+use Thread::Queue;
+use Time::HiRes qw(sleep);
+
+# Proxmox Dashboard - Perl/Tk Version
+# Live monitoring and management of Proxmox VMs and Containers
+
+our $VERSION = '1.0.0';
+
+# Configuration
+my $SALT = 'proxmox_dashboard_salt_v1';
+my $HOME = $ENV{HOME} || '/root';
+my $CREDENTIALS_FILE = "$HOME/.proxmox_credentials_perl.enc";
+my $PROXMOX_CA_CERT = "$HOME/proxmox-ca.pem";
+my $AUDIT_LOG_FILE = "$HOME/.proxmox_dashboard_audit_perl.log";
+my $LOG_FILE = "$HOME/.proxmox_dashboard_perl.log";
+my $REFRESH_INTERVAL = 3;
+my $MAX_RETRIES = 3;
+my $RETRY_DELAY = 2;
+
+# Check for CA certificate
+unless (-f $PROXMOX_CA_CERT) {
+    print STDERR <<"EOF";
+
+SSL CERTIFICATE REQUIRED
+
+The Proxmox CA certificate is required for secure connections.
+
+Certificate not found at: $PROXMOX_CA_CERT
+
+To obtain the certificate:
+  1. SSH into your Proxmox server
+  2. Run: scp root\@YOUR_PROXMOX_IP:/etc/pve/pve-root-ca.pem $PROXMOX_CA_CERT
+
+SSL verification is MANDATORY for security.
+Dashboard cannot start without the CA certificate.
+EOF
+    exit 1;
+}
+
+# Secure log file permissions
+if (-f $LOG_FILE) {
+    chmod 0600, $LOG_FILE;
+}
+
+# Logger
+sub log_message {
+    my ($level, $message) = @_;
+    my $timestamp = strftime("%Y-%m-%d %H:%M:%S", localtime);
+    open my $fh, '>>', $LOG_FILE or return;
+    print $fh "$timestamp - $level - $message\n";
+    close $fh;
+}
+
+log_message('INFO', 'Dashboard starting - Perl version');
+
+################################################################################
+# Audit Logger
+################################################################################
+package AuditLogger;
+
+sub log_entry {
+    my ($action, $target, $result, $details) = @_;
+    my $timestamp = POSIX::strftime("%Y-%m-%d %H:%M:%S", localtime);
+    my $log_entry = sprintf("%s | %-20s | %-20s | %-10s", 
+        $timestamp, $action, $target, $result);
+    $log_entry .= " | $details" if $details;
+    
+    open my $fh, '>>', $AUDIT_LOG_FILE or return;
+    print $fh "$log_entry\n";
+    close $fh;
+    
+    chmod 0600, $AUDIT_LOG_FILE if -f $AUDIT_LOG_FILE;
+}
+
+sub log_authentication {
+    my ($host, $user, $success) = @_;
+    my $result = $success ? "SUCCESS" : "FAILED";
+    log_entry("AUTH", "$user\@$host", $result);
+}
+
+sub log_vm_action {
+    my ($action, $vmid, $vm_type, $vm_name, $success, $error) = @_;
+    my $result = $success ? "SUCCESS" : "FAILED";
+    my $target = "$vm_type $vmid ($vm_name)";
+    my $details = $error ? "Error: $error" : undef;
+    log_entry($action, $target, $result, $details);
+}
+
+################################################################################
+# Credential Manager
+################################################################################
+package CredentialManager;
+
+sub derive_key {
+    my ($password) = @_;
+    # Use PBKDF2 to derive key from password
+    my $key = sha256($password . $SALT);
+    return $key;
+}
+
+sub save_credentials {
+    my ($host, $master_password, $token_id, $token_secret) = @_;
+    
+    my $credentials = {
+        host => $host,
+        auth_type => 'token',
+        token_id => $token_id,
+        token_secret => $token_secret
+    };
+    
+    my $json = JSON->new->encode($credentials);
+    my $key = derive_key($master_password);
+    
+    my $cipher = Crypt::CBC->new(
+        -key => $key,
+        -cipher => 'Crypt::OpenSSL::AES',
+        -header => 'randomiv',
+        -padding => 'standard'
+    );
+    
+    my $encrypted = $cipher->encrypt($json);
+    my $encoded = MIME::Base64::encode_base64($encrypted, '');
+    
+    # Atomic write
+    my $temp_file = "$CREDENTIALS_FILE.tmp";
+    open my $fh, '>', $temp_file or die "Cannot write to $temp_file: $!";
+    print $fh $encoded;
+    close $fh;
+    
+    chmod 0600, $temp_file;
+    rename $temp_file, $CREDENTIALS_FILE or die "Cannot rename: $!";
+    
+    main::log_message('INFO', "Credentials saved for $host");
+    return 1;
+}
+
+sub load_credentials {
+    my ($master_password) = @_;
+    
+    return undef unless -f $CREDENTIALS_FILE;
+    
+    open my $fh, '<', $CREDENTIALS_FILE or die "Cannot read $CREDENTIALS_FILE: $!";
+    my $encoded = do { local $/; <$fh> };
+    close $fh;
+    
+    my $encrypted = MIME::Base64::decode_base64($encoded);
+    my $key = derive_key($master_password);
+    
+    my $cipher = Crypt::CBC->new(
+        -key => $key,
+        -cipher => 'Crypt::OpenSSL::AES',
+        -header => 'randomiv',
+        -padding => 'standard'
+    );
+    
+    eval {
+        my $json = $cipher->decrypt($encrypted);
+        my $credentials = JSON->new->decode($json);
+        return $credentials;
+    };
+    
+    if ($@) {
+        die "Invalid master password or corrupted credentials file";
+    }
+}
+
+################################################################################
+# Proxmox API Client
+################################################################################
+package ProxmoxAPI;
+
+sub new {
+    my ($class, $host, $token_id, $token_secret) = @_;
+    
+    my $self = {
+        host => $host,
+        base_url => "https://$host:8006/api2/json",
+        token_id => $token_id,
+        token_secret => $token_secret,
+        ssl_status => 'Verified',
+    };
+    
+    # Create user agent with SSL verification
+    $self->{ua} = LWP::UserAgent->new(
+        ssl_opts => {
+            verify_hostname => 1,
+            SSL_ca_file => $PROXMOX_CA_CERT,
+        },
+        timeout => 10,
+    );
+    
+    bless $self, $class;
+    
+    # Test authentication
+    eval {
+        $self->get('/version');
+        AuditLogger::log_authentication($host, $token_id, 1);
+        main::log_message('INFO', "Successfully authenticated with token: $token_id");
+    };
+    
+    if ($@) {
+        AuditLogger::log_authentication($host, $token_id, 0);
+        main::log_message('ERROR', "API authentication failed: $@");
+        die $@;
+    }
+    
+    return $self;
+}
+
+sub api_request {
+    my ($self, $method, $path, $data, $retries) = @_;
+    $retries //= $MAX_RETRIES;
+    
+    my $url = $self->{base_url} . $path;
+    my $auth_header = "PVEAPIToken=$self->{token_id}=$self->{token_secret}";
+    
+    for my $attempt (1..$retries) {
+        my $request;
+        
+        if ($method eq 'GET') {
+            $request = HTTP::Request->new(GET => $url);
+        } elsif ($method eq 'POST') {
+            $request = HTTP::Request->new(POST => $url);
+            if ($data) {
+                $request->content_type('application/x-www-form-urlencoded');
+                my @pairs;
+                while (my ($k, $v) = each %$data) {
+                    push @pairs, "$k=$v";
+                }
+                $request->content(join('&', @pairs));
+            }
+        }
+        
+        $request->header('Authorization' => $auth_header);
+        
+        my $response = $self->{ua}->request($request);
+        
+        if ($response->is_success) {
+            return $response;
+        } elsif ($response->code == 401) {
+            die "Authentication failed: " . $response->status_line;
+        } elsif ($response->code >= 500 && $attempt < $retries) {
+            sleep($RETRY_DELAY * (2 ** ($attempt - 1)));
+            next;
+        } else {
+            die "API request failed: " . $response->status_line;
+        }
+    }
+    
+    die "API request failed after $retries attempts";
+}
+
+sub get {
+    my ($self, $path) = @_;
+    my $response = $self->api_request('GET', $path);
+    my $json = $response->decoded_content;
+    my $data = JSON->new->decode($json);
+    return $data->{data} // $data;
+}
+
+sub post {
+    my ($self, $path, $data) = @_;
+    return $self->api_request('POST', $path, $data);
+}
+
+################################################################################
+# Main Dashboard Application
+################################################################################
+package ProxmoxDashboard;
+
+sub new {
+    my ($class) = @_;
+    
+    my $self = {
+        api => undef,
+        auto_refresh => 1,
+        vm_data => [],
+        filtered_vm_data => [],
+        is_loading => 0,
+        connection_healthy => 0,
+        node_count => 0,
+        refresh_interval => $REFRESH_INTERVAL,
+        node_temp_api_available => {},
+        node_addresses => {},
+        node_temps_full_data => {},
+    };
+    
+    bless $self, $class;
+    
+    # Create main window
+    $self->{mw} = MainWindow->new;
+    $self->{mw}->title("Proxmox Dashboard - Live Feed (Perl)");
+    $self->{mw}->geometry("1600x900");
+    
+    # Center window
+    $self->{mw}->update;
+    my $screen_width = $self->{mw}->screenwidth;
+    my $screen_height = $self->{mw}->screenheight;
+    my $x = int(($screen_width - 1600) / 2);
+    my $y = int(($screen_height - 900) / 2);
+    $self->{mw}->geometry("1600x900+$x+$y");
+    
+    $self->create_widgets();
+    
+    # Handle window close
+    $self->{mw}->protocol('WM_DELETE_WINDOW', sub { $self->on_closing() });
+    
+    # Authenticate
+    unless ($self->authenticate()) {
+        $self->{mw}->destroy();
+        return;
+    }
+    
+    # Start auto-refresh
+    $self->start_auto_refresh();
+    
+    # Check temperature API status
+    $self->{mw}->after(2000, sub { $self->check_temperature_api_status() });
+    
+    return $self;
+}
+
+sub create_widgets {
+    my ($self) = @_;
+    
+    # Top frame
+    my $top_frame = $self->{mw}->Frame(
+        -background => '#2c3e50',
+        -height => 140
+    )->pack(-fill => 'x');
+    
+    # Title
+    $top_frame->Label(
+        -text => "Proxmox VM/Container Dashboard (Perl)",
+        -font => ['Arial', 18, 'bold'],
+        -background => '#2c3e50',
+        -foreground => 'white'
+    )->pack(-side => 'left', -padx => 20, -pady => 50);
+    
+    # Status frame (right side)
+    my $status_frame = $top_frame->Frame(-background => '#2c3e50')
+        ->pack(-side => 'right', -padx => 20, -pady => 10);
+    
+    # Connection status
+    my $conn_frame = $status_frame->Frame(-background => '#2c3e50')
+        ->grid(-row => 0, -column => 0, -sticky => 'w', -padx => 5);
+    
+    $self->{connection_label} = $conn_frame->Label(
+        -text => "Connected",
+        -font => ['Arial', 10, 'bold'],
+        -background => '#2c3e50',
+        -foreground => '#27ae60'
+    )->pack(-side => 'left');
+    
+    # Live indicator
+    my $live_frame = $status_frame->Frame(-background => '#2c3e50')
+        ->grid(-row => 0, -column => 1, -sticky => 'w', -padx => 15);
+    
+    $self->{live_indicator} = $live_frame->Label(
+        -text => "LIVE",
+        -font => ['Arial', 10, 'bold'],
+        -background => '#2c3e50',
+        -foreground => '#27ae60'
+    )->pack(-side => 'left');
+    
+    # SSL status
+    my $ssl_frame = $status_frame->Frame(-background => '#2c3e50')
+        ->grid(-row => 1, -column => 0, -sticky => 'w', -padx => 5);
+    
+    $self->{ssl_label} = $ssl_frame->Label(
+        -text => "SSL: Checking...",
+        -font => ['Arial', 10],
+        -background => '#2c3e50',
+        -foreground => 'white'
+    )->pack();
+    
+    # Node count
+    my $nodes_frame = $status_frame->Frame(-background => '#2c3e50')
+        ->grid(-row => 1, -column => 1, -sticky => 'w', -padx => 15);
+    
+    $self->{node_label} = $nodes_frame->Label(
+        -text => "Nodes: 0",
+        -font => ['Arial', 10],
+        -background => '#2c3e50',
+        -foreground => 'white'
+    )->pack();
+    
+    # Last update
+    my $update_frame = $status_frame->Frame(-background => '#2c3e50')
+        ->grid(-row => 2, -column => 0, -columnspan => 2, -sticky => 'w', -padx => 5);
+    
+    $self->{last_update_label} = $update_frame->Label(
+        -text => "Updated: --",
+        -font => ['Arial', 9],
+        -background => '#2c3e50',
+        -foreground => '#bdc3c7'
+    )->pack();
+    
+    # VM Summary (center)
+    my $summary_container = $top_frame->Frame(-background => '#2c3e50')
+        ->pack(-side => 'left', -fill => 'both', -expand => 1);
+    
+    my $summary_frame = $summary_container->Frame(-background => '#2c3e50')
+        ->place(-relx => 0.5, -rely => 0.5, -anchor => 'center');
+    
+    $summary_frame->Label(
+        -text => "VMs/CTs:",
+        -font => ['Arial', 12, 'bold'],
+        -background => '#2c3e50',
+        -foreground => '#ecf0f1'
+    )->pack(-pady => [0, 5]);
+    
+    my $running_frame = $summary_frame->Frame(-background => '#2c3e50')->pack();
+    $self->{running_count_label} = $running_frame->Label(
+        -text => "Running: 0",
+        -font => ['Arial', 10],
+        -background => '#2c3e50',
+        -foreground => '#27ae60'
+    )->pack();
+    
+    my $stopped_frame = $summary_frame->Frame(-background => '#2c3e50')->pack();
+    $self->{stopped_count_label} = $stopped_frame->Label(
+        -text => "Stopped: 0",
+        -font => ['Arial', 10],
+        -background => '#2c3e50',
+        -foreground => '#e74c3c'
+    )->pack();
+    
+    # Temperature frame
+    my $temp_container = $self->{mw}->Frame(
+        -background => '#34495e',
+        -height => 40
+    )->pack(-fill => 'x');
+    
+    $self->{node_temp_frame} = $temp_container->Frame(-background => '#34495e')
+        ->pack(-side => 'left', -padx => 10, -pady => 5, -fill => 'both', -expand => 1);
+    
+    $self->{node_temp_frame}->Label(
+        -text => "Node Temperatures:",
+        -font => ['Arial', 9, 'bold'],
+        -background => '#34495e',
+        -foreground => '#bdc3c7'
+    )->pack(-side => 'left', -padx => [0, 10]);
+    
+    # Control panel
+    my $control_frame = $self->{mw}->Frame(
+        -background => '#ecf0f1',
+        -height => 80
+    )->pack(-fill => 'x');
+    
+    my $btn_container = $control_frame->Frame(-background => '#ecf0f1')
+        ->pack(-pady => 15);
+    
+    $self->{start_btn} = $btn_container->Button(
+        -text => "Start",
+        -command => sub { $self->start_selected() },
+        -background => '#27ae60',
+        -foreground => 'white',
+        -font => ['Arial', 11, 'bold'],
+        -width => 12,
+        -height => 2,
+        -cursor => 'hand2'
+    )->pack(-side => 'left', -padx => 5);
+    
+    $self->{stop_btn} = $btn_container->Button(
+        -text => "Stop",
+        -command => sub { $self->stop_selected() },
+        -background => '#e74c3c',
+        -foreground => 'white',
+        -font => ['Arial', 11, 'bold'],
+        -width => 12,
+        -height => 2,
+        -cursor => 'hand2'
+    )->pack(-side => 'left', -padx => 5);
+    
+    $btn_container->Button(
+        -text => "Refresh",
+        -command => sub { $self->refresh_data_async() },
+        -background => '#3498db',
+        -foreground => 'white',
+        -font => ['Arial', 11, 'bold'],
+        -width => 12,
+        -height => 2,
+        -cursor => 'hand2'
+    )->pack(-side => 'left', -padx => 5);
+    
+    $btn_container->Button(
+        -text => "Start All",
+        -command => sub { $self->start_all_stopped() },
+        -background => '#16a085',
+        -foreground => 'white',
+        -font => ['Arial', 11, 'bold'],
+        -width => 12,
+        -height => 2,
+        -cursor => 'hand2'
+    )->pack(-side => 'left', -padx => 5);
+    
+    # Pause/Resume button
+    my $live_controls = $btn_container->Frame(-background => '#ecf0f1')
+        ->pack(-side => 'left', -padx => 15);
+    
+    $self->{pause_resume_btn} = $live_controls->Button(
+        -text => "Pause Live",
+        -command => sub { $self->toggle_auto_refresh() },
+        -background => '#e67e22',
+        -foreground => 'white',
+        -font => ['Arial', 10, 'bold'],
+        -width => 12,
+        -cursor => 'hand2'
+    )->pack(-side => 'left', -padx => 5);
+    
+    # Search bar
+    my $search_frame = $self->{mw}->Frame(
+        -background => '#ecf0f1',
+        -height => 40
+    )->pack(-fill => 'x');
+    
+    $search_frame->Label(
+        -text => "Search:",
+        -font => ['Arial', 10],
+        -background => '#ecf0f1'
+    )->pack(-side => 'left', -padx => 10);
+    
+    $self->{search_entry} = $search_frame->Entry(
+        -font => ['Arial', 10],
+        -width => 30
+    )->pack(-side => 'left', -padx => 5);
+    
+    $self->{search_entry}->bind('<KeyRelease>', sub { $self->filter_vms() });
+    
+    $search_frame->Label(
+        -text => "Filter by ID, Name, Type, Status, Node",
+        -font => ['Arial', 9],
+        -background => '#ecf0f1',
+        -foreground => '#7f8c8d'
+    )->pack(-side => 'left', -padx => 10);
+    
+    # Table
+    my $table_frame = $self->{mw}->Frame()->pack(-fill => 'both', -expand => 1, -padx => 10, -pady => 10);
+    
+    my @columns = qw(ID Type Status Name Node Cores CPU Memory Disk FreeDisk Free%);
+    
+    $self->{tree} = $table_frame->Scrolled('HList',
+        -scrollbars => 'se',
+        -columns => scalar(@columns),
+        -header => 1,
+        -selectmode => 'single',
+        -background => '#ecf0f1',
+        -font => ['Arial', 9]
+    )->pack(-fill => 'both', -expand => 1);
+    
+    for my $i (0..$#columns) {
+        $self->{tree}->header('create', $i, 
+            -text => $columns[$i],
+            -headerbackground => '#34495e',
+            -foreground => 'white'
+        );
+    }
+    
+    # Status bar
+    my $status_bar = $self->{mw}->Frame(
+        -background => '#34495e',
+        -height => 30
+    )->pack(-fill => 'x');
+    
+    $self->{status_label} = $status_bar->Label(
+        -text => "Ready",
+        -font => ['Arial', 9],
+        -background => '#34495e',
+        -foreground => 'white',
+        -anchor => 'w'
+    )->pack(-side => 'left', -padx => 10, -fill => 'x', -expand => 1);
+}
+
+sub authenticate {
+    my ($self) = @_;
+    
+    if (-f $CREDENTIALS_FILE) {
+        # Prompt for master password
+        my $dialog = $self->{mw}->DialogBox(
+            -title => "Master Password",
+            -buttons => ["OK", "Cancel"]
+        );
+        
+        $dialog->add('Label', -text => "Enter your master password:")->pack();
+        my $password_entry = $dialog->add('Entry', -show => '*', -width => 30)->pack();
+        $password_entry->focus();
+        
+        my $answer = $dialog->Show();
+        
+        return 0 if $answer eq "Cancel";
+        
+        my $master_password = $password_entry->get();
+        
+        eval {
+            my $creds = CredentialManager::load_credentials($master_password);
+            
+            $self->{api} = ProxmoxAPI->new(
+                $creds->{host},
+                $creds->{token_id},
+                $creds->{token_secret}
+            );
+            
+            $self->{status_label}->configure(-text => "Connected to $creds->{host}");
+            $self->{ssl_label}->configure(-text => "SSL: " . $self->{api}{ssl_status});
+            $self->{connection_healthy} = 1;
+            
+            main::log_message('INFO', "Successfully authenticated to $creds->{host}");
+        };
+        
+        if ($@) {
+            $self->{mw}->messageBox(
+                -title => "Authentication Error",
+                -message => "Failed to authenticate:\n$@",
+                -type => 'OK',
+                -icon => 'error'
+            );
+            return 0;
+        }
+        
+        return 1;
+    }
+    
+    # No credentials - show setup
+    $self->{mw}->messageBox(
+        -title => "Setup Required",
+        -message => "No credentials found.\n\nYou'll need to create an API token in Proxmox first.",
+        -type => 'OK',
+        -icon => 'info'
+    );
+    
+    return $self->setup_credentials();
+}
+
+sub setup_credentials {
+    my ($self) = @_;
+    
+    my $dialog = $self->{mw}->DialogBox(
+        -title => "Setup Credentials",
+        -buttons => ["Save & Connect", "Cancel"]
+    );
+    
+    my $frame = $dialog->Frame()->pack(-padx => 20, -pady => 20);
+    
+    $frame->Label(-text => "Proxmox Host:", -font => ['Arial', 10])->grid(-row => 0, -column => 0, -sticky => 'w', -pady => 5);
+    my $host_entry = $frame->Entry(-font => ['Arial', 10], -width => 35)->grid(-row => 0, -column => 1, -pady => 5);
+    $host_entry->insert(0, 'pve');
+    
+    $frame->Label(-text => "Token ID:", -font => ['Arial', 10])->grid(-row => 1, -column => 0, -sticky => 'w', -pady => 5);
+    my $token_id_entry = $frame->Entry(-font => ['Arial', 10], -width => 35)->grid(-row => 1, -column => 1, -pady => 5);
+    $token_id_entry->insert(0, 'root@pam!');
+    
+    $frame->Label(-text => "Token Secret:", -font => ['Arial', 10])->grid(-row => 2, -column => 0, -sticky => 'w', -pady => 5);
+    my $token_secret_entry = $frame->Entry(-font => ['Arial', 10], -width => 35, -show => '*')->grid(-row => 2, -column => 1, -pady => 5);
+    
+    $frame->Label(-text => "Master Password:", -font => ['Arial', 10, 'bold'])->grid(-row => 3, -column => 0, -sticky => 'w', -pady => 5);
+    my $master_entry = $frame->Entry(-font => ['Arial', 10], -width => 35, -show => '*')->grid(-row => 3, -column => 1, -pady => 5);
+    
+    $frame->Label(-text => "Confirm Master:", -font => ['Arial', 10])->grid(-row => 4, -column => 0, -sticky => 'w', -pady => 5);
+    my $master_confirm = $frame->Entry(-font => ['Arial', 10], -width => 35, -show => '*')->grid(-row => 4, -column => 1, -pady => 5);
+    
+    my $answer = $dialog->Show();
+    
+    return 0 if $answer eq "Cancel";
+    
+    my $host = $host_entry->get();
+    my $token_id = $token_id_entry->get();
+    my $token_secret = $token_secret_entry->get();
+    my $master = $master_entry->get();
+    my $confirm = $master_confirm->get();
+    
+    if (!$host || !$token_id || !$token_secret || !$master) {
+        $self->{mw}->messageBox(
+            -title => "Error",
+            -message => "All fields are required!",
+            -type => 'OK',
+            -icon => 'error'
+        );
+        return 0;
+    }
+    
+    if ($master ne $confirm) {
+        $self->{mw}->messageBox(
+            -title => "Error",
+            -message => "Master passwords don't match!",
+            -type => 'OK',
+            -icon => 'error'
+        );
+        return 0;
+    }
+    
+    eval {
+        $self->{api} = ProxmoxAPI->new($host, $token_id, $token_secret);
+        CredentialManager::save_credentials($host, $master, $token_id, $token_secret);
+        
+        $self->{mw}->messageBox(
+            -title => "Success",
+            -message => "Credentials saved successfully!",
+            -type => 'OK',
+            -icon => 'info'
+        );
+        
+        $self->{status_label}->configure(-text => "Connected to $host");
+        $self->{ssl_label}->configure(-text => "SSL: " . $self->{api}{ssl_status});
+        $self->{connection_healthy} = 1;
+        
+        main::log_message('INFO', "Successfully set up connection to $host");
+    };
+    
+    if ($@) {
+        $self->{mw}->messageBox(
+            -title => "Error",
+            -message => "Connection failed:\n$@",
+            -type => 'OK',
+            -icon => 'error'
+        );
+        return 0;
+    }
+    
+    return 1;
+}
+
+sub check_temperature_api_status {
+    my ($self) = @_;
+    
+    return unless $self->{api};
+    
+    # Run in background thread
+    my $thread = threads->create(sub {
+        my $nodes = eval { $self->{api}->get('/nodes') };
+        return unless $nodes;
+        
+        foreach my $node (@$nodes) {
+            my $node_name = $node->{node};
+            my $node_ip = $self->{api}{host};  # Simplified - use API host
+            
+            eval {
+                my $ua = LWP::UserAgent->new(timeout => 2, ssl_opts => { verify_hostname => 0 });
+                my $response = $ua->get("https://$node_ip:8898/health");
+                
+                if ($response->is_success) {
+                    $self->{node_temp_api_available}{$node_name} = 1;
+                    $self->{node_addresses}{$node_name} = $node_ip;
+                } else {
+                    $self->{node_temp_api_available}{$node_name} = 0;
+                }
+            };
+            
+            if ($@) {
+                $self->{node_temp_api_available}{$node_name} = 0;
+            }
+        }
+    });
+    
+    $thread->detach();
+}
+
+sub refresh_data_async {
+    my ($self) = @_;
+    
+    return if $self->{is_loading};
+    return unless $self->{api};
+    
+    $self->{is_loading} = 1;
+    $self->{status_label}->configure(-text => "[Loading] Fetching data from Proxmox...");
+    
+    # Fetch data in background
+    my $thread = threads->create(sub {
+        my @vm_data;
+        
+        eval {
+            my $nodes = $self->{api}->get('/nodes');
+            $self->{node_count} = scalar(@$nodes);
+            
+            foreach my $node (@$nodes) {
+                my $n = $node->{node};
+                
+                # Get VMs
+                my $vms = eval { $self->{api}->get("/nodes/$n/qemu") } || [];
+                foreach my $vm (@$vms) {
+                    my $cfg = eval { $self->{api}->get("/nodes/$n/qemu/$vm->{vmid}/config") } || {};
+                    
+                    push @vm_data, {
+                        id => $vm->{vmid},
+                        type => 'VM',
+                        status => $vm->{status},
+                        name => $vm->{name},
+                        node => $n,
+                        cores => $cfg->{cores} || 'N/A',
+                        cpu => $cfg->{cpu} || 'N/A',
+                        memory => $self->format_memory($cfg, 'VM'),
+                        disk => 'N/A',
+                        free_disk => 'N/A',
+                        free_pct => 'N/A'
+                    };
+                }
+                
+                # Get Containers
+                my $cts = eval { $self->{api}->get("/nodes/$n/lxc") } || [];
+                foreach my $ct (@$cts) {
+                    my $cfg = eval { $self->{api}->get("/nodes/$n/lxc/$ct->{vmid}/config") } || {};
+                    
+                    push @vm_data, {
+                        id => $ct->{vmid},
+                        type => 'CT',
+                        status => $ct->{status},
+                        name => $ct->{name},
+                        node => $n,
+                        cores => $cfg->{cores} || 'N/A',
+                        cpu => 'N/A',
+                        memory => $self->format_memory($cfg, 'CT'),
+                        disk => 'N/A',
+                        free_disk => 'N/A',
+                        free_pct => 'N/A'
+                    };
+                }
+            }
+        };
+        
+        @vm_data = sort { $a->{id} <=> $b->{id} } @vm_data;
+        return \@vm_data;
+    });
+    
+    # Wait for thread and update UI
+    $self->{mw}->after(100, sub {
+        if ($thread->is_joinable()) {
+            my $vm_data = $thread->join();
+            $self->{vm_data} = $vm_data;
+            $self->{is_loading} = 0;
+            
+            $self->filter_vms();
+            
+            my $now = strftime("%H:%M:%S", localtime);
+            my $interval = $self->{refresh_interval};
+            $self->{last_update_label}->configure(
+                -text => "LIVE - Updated: $now (every ${interval}s)"
+            );
+            
+            $self->{connection_label}->configure(-foreground => '#27ae60');
+            $self->{node_label}->configure(-text => "Nodes: $self->{node_count}");
+        } else {
+            $self->{mw}->after(100, sub { $self->refresh_data_async() });
+        }
+    });
+}
+
+sub format_memory {
+    my ($self, $cfg, $type) = @_;
+    
+    if ($type eq 'VM') {
+        my $memory = $cfg->{memory} || 0;
+        return "N/A" unless $memory;
+        return $self->format_bytes($memory * 1024 * 1024);
+    } else {
+        my $memory = $cfg->{memory} || 0;
+        return "N/A" unless $memory;
+        return $self->format_bytes($memory * 1024 * 1024);
+    }
+}
+
+sub format_bytes {
+    my ($self, $bytes) = @_;
+    return 'N/A' unless $bytes;
+    
+    my @units = qw(B KiB MiB GiB TiB);
+    my $unit_idx = 0;
+    
+    while ($bytes >= 1024 && $unit_idx < $#units) {
+        $bytes /= 1024;
+        $unit_idx++;
+    }
+    
+    return sprintf("%.1f %s", $bytes, $units[$unit_idx]);
+}
+
+sub filter_vms {
+    my ($self) = @_;
+    my $query = lc($self->{search_entry}->get() || '');
+    
+    $self->{tree}->delete('all');
+    
+    my $running_count = 0;
+    my $stopped_count = 0;
+    
+    foreach my $vm (@{$self->{vm_data}}) {
+        next if $query && index(lc($vm->{id}), $query) == -1
+                       && index(lc($vm->{name}), $query) == -1
+                       && index(lc($vm->{type}), $query) == -1
+                       && index(lc($vm->{status}), $query) == -1
+                       && index(lc($vm->{node}), $query) == -1;
+        
+        $running_count++ if lc($vm->{status}) eq 'running';
+        $stopped_count++ if lc($vm->{status}) ne 'running';
+        
+        my $entry = $self->{tree}->add($vm->{id});
+        
+        $self->{tree}->itemCreate($entry, 0, -text => $vm->{id});
+        $self->{tree}->itemCreate($entry, 1, -text => $vm->{type});
+        $self->{tree}->itemCreate($entry, 2, -text => $vm->{status});
+        $self->{tree}->itemCreate($entry, 3, -text => $vm->{name});
+        $self->{tree}->itemCreate($entry, 4, -text => $vm->{node});
+        $self->{tree}->itemCreate($entry, 5, -text => $vm->{cores});
+        $self->{tree}->itemCreate($entry, 6, -text => $vm->{cpu});
+        $self->{tree}->itemCreate($entry, 7, -text => $vm->{memory});
+        $self->{tree}->itemCreate($entry, 8, -text => $vm->{disk});
+        $self->{tree}->itemCreate($entry, 9, -text => $vm->{free_disk});
+        $self->{tree}->itemCreate($entry, 10, -text => $vm->{free_pct});
+    }
+    
+    $self->{running_count_label}->configure(-text => "Running: $running_count");
+    $self->{stopped_count_label}->configure(-text => "Stopped: $stopped_count");
+}
+
+sub start_selected {
+    my ($self) = @_;
+    
+    my @selection = $self->{tree}->info('selection');
+    return unless @selection;
+    
+    my $vmid = $selection[0];
+    my ($vm) = grep { $_->{id} eq $vmid } @{$self->{vm_data}};
+    return unless $vm;
+    
+    $self->{status_label}->configure(-text => "Starting $vm->{type} $vm->{id}...");
+    
+    my $thread = threads->create(sub {
+        eval {
+            my $endpoint = $vm->{type} eq 'VM' ? 'qemu' : 'lxc';
+            $self->{api}->post("/nodes/$vm->{node}/$endpoint/$vm->{id}/status/start");
+            AuditLogger::log_vm_action("START", $vm->{id}, $vm->{type}, $vm->{name}, 1);
+        };
+        
+        if ($@) {
+            AuditLogger::log_vm_action("START", $vm->{id}, $vm->{type}, $vm->{name}, 0, "$@");
+            return "Error: $@";
+        }
+        
+        return "SUCCESS";
+    });
+    
+    $self->{mw}->after(100, sub {
+        if ($thread->is_joinable()) {
+            my $result = $thread->join();
+            
+            if ($result eq "SUCCESS") {
+                $self->{status_label}->configure(-text => "Started $vm->{type} $vm->{id} ($vm->{name})");
+                $self->{mw}->after(2000, sub { $self->refresh_data_async() });
+            } else {
+                $self->{mw}->messageBox(
+                    -title => "Error",
+                    -message => "Failed to start:\n$result",
+                    -type => 'OK',
+                    -icon => 'error'
+                );
+            }
+        } else {
+            $self->{mw}->after(100, sub { $self->start_selected() });
+        }
+    });
+}
+
+sub stop_selected {
+    my ($self) = @_;
+    
+    my @selection = $self->{tree}->info('selection');
+    return unless @selection;
+    
+    my $vmid = $selection[0];
+    my ($vm) = grep { $_->{id} eq $vmid } @{$self->{vm_data}};
+    return unless $vm;
+    
+    my $answer = $self->{mw}->messageBox(
+        -title => "Confirm",
+        -message => "Stop $vm->{type} $vm->{id} ($vm->{name})?",
+        -type => 'YesNo',
+        -icon => 'question'
+    );
+    
+    return unless $answer eq 'Yes';
+    
+    $self->{status_label}->configure(-text => "Stopping $vm->{type} $vm->{id}...");
+    
+    my $thread = threads->create(sub {
+        eval {
+            my $endpoint = $vm->{type} eq 'VM' ? 'qemu' : 'lxc';
+            $self->{api}->post("/nodes/$vm->{node}/$endpoint/$vm->{id}/status/stop");
+            AuditLogger::log_vm_action("STOP", $vm->{id}, $vm->{type}, $vm->{name}, 1);
+        };
+        
+        if ($@) {
+            AuditLogger::log_vm_action("STOP", $vm->{id}, $vm->{type}, $vm->{name}, 0, "$@");
+            return "Error: $@";
+        }
+        
+        return "SUCCESS";
+    });
+    
+    $self->{mw}->after(100, sub {
+        if ($thread->is_joinable()) {
+            my $result = $thread->join();
+            
+            if ($result eq "SUCCESS") {
+                $self->{status_label}->configure(-text => "Stopped $vm->{type} $vm->{id} ($vm->{name})");
+                $self->{mw}->after(2000, sub { $self->refresh_data_async() });
+            } else {
+                $self->{mw}->messageBox(
+                    -title => "Error",
+                    -message => "Failed to stop:\n$result",
+                    -type => 'OK',
+                    -icon => 'error'
+                );
+            }
+        } else {
+            $self->{mw}->after(100, sub { $self->stop_selected() });
+        }
+    });
+}
+
+sub start_all_stopped {
+    my ($self) = @_;
+    
+    my @stopped = grep { lc($_->{status}) ne 'running' } @{$self->{vm_data}};
+    
+    unless (@stopped) {
+        $self->{mw}->messageBox(
+            -title => "Info",
+            -message => "All VMs/CTs are already running",
+            -type => 'OK',
+            -icon => 'info'
+        );
+        return;
+    }
+    
+    my $answer = $self->{mw}->messageBox(
+        -title => "Confirm",
+        -message => "Start " . scalar(@stopped) . " stopped VMs/CTs?",
+        -type => 'YesNo',
+        -icon => 'question'
+    );
+    
+    return unless $answer eq 'Yes';
+    
+    $self->{status_label}->configure(-text => "Starting " . scalar(@stopped) . " VMs/CTs...");
+    
+    # Start all in background
+    my $thread = threads->create(sub {
+        my $success_count = 0;
+        
+        foreach my $vm (@stopped) {
+            eval {
+                my $endpoint = $vm->{type} eq 'VM' ? 'qemu' : 'lxc';
+                $self->{api}->post("/nodes/$vm->{node}/$endpoint/$vm->{id}/status/start");
+                AuditLogger::log_vm_action("START_ALL", $vm->{id}, $vm->{type}, $vm->{name}, 1);
+                $success_count++;
+            };
+            
+            if ($@) {
+                AuditLogger::log_vm_action("START_ALL", $vm->{id}, $vm->{type}, $vm->{name}, 0, "$@");
+            }
+        }
+        
+        return $success_count;
+    });
+    
+    $self->{mw}->after(100, sub {
+        if ($thread->is_joinable()) {
+            my $success_count = $thread->join();
+            $self->{status_label}->configure(
+                -text => "Started $success_count/" . scalar(@stopped) . " VMs/CTs"
+            );
+            $self->{mw}->after(3000, sub { $self->refresh_data_async() });
+        } else {
+            $self->{mw}->after(100, sub { $self->start_all_stopped() });
+        }
+    });
+}
+
+sub toggle_auto_refresh {
+    my ($self) = @_;
+    
+    $self->{auto_refresh} = !$self->{auto_refresh};
+    
+    if ($self->{auto_refresh}) {
+        $self->{pause_resume_btn}->configure(
+            -text => "Pause Live",
+            -background => '#e67e22'
+        );
+        $self->{live_indicator}->configure(
+            -text => "LIVE",
+            -foreground => '#27ae60'
+        );
+        $self->{status_label}->configure(-text => "Live feed enabled");
+        main::log_message('INFO', "Live feed enabled");
+    } else {
+        $self->{pause_resume_btn}->configure(
+            -text => "Resume Live",
+            -background => '#27ae60'
+        );
+        $self->{live_indicator}->configure(
+            -text => "PAUSED",
+            -foreground => '#95a5a6'
+        );
+        $self->{status_label}->configure(-text => "Live feed paused");
+        main::log_message('INFO', "Live feed paused");
+    }
+}
+
+sub start_auto_refresh {
+    my ($self) = @_;
+    
+    $self->refresh_data_async();
+    
+    # Set up periodic refresh
+    $self->{mw}->repeat($self->{refresh_interval} * 1000, sub {
+        $self->refresh_data_async() if $self->{auto_refresh};
+    });
+    
+    main::log_message('INFO', "Live feed started with ${REFRESH_INTERVAL}s refresh rate");
+}
+
+sub on_closing {
+    my ($self) = @_;
+    $self->{auto_refresh} = 0;
+    sleep(0.5);
+    $self->{mw}->destroy();
+}
+
+sub run {
+    my ($self) = @_;
+    MainLoop;
+}
+
+################################################################################
+# Main Entry Point
+################################################################################
+package main;
+
+# Check for required modules
+my @required_modules = qw(
+    Tk LWP::UserAgent JSON MIME::Base64 
+    Digest::SHA Crypt::CBC Crypt::OpenSSL::AES
+);
+
+foreach my $module (@required_modules) {
+    eval "use $module";
+    if ($@) {
+        print STDERR "ERROR: Required Perl module '$module' not installed.\n";
+        print STDERR "Install with: cpan $module\n";
+        print STDERR "Or: apt-get install lib" . lc($module) . "-perl\n\n";
+        exit 1;
+    }
+}
+
+log_message('INFO', 'All required modules loaded');
+
+# Create and run dashboard
+my $dashboard = ProxmoxDashboard->new();
+$dashboard->run() if $dashboard;
+
+log_message('INFO', 'Dashboard exiting');
