@@ -1,0 +1,913 @@
+#!/bin/bash
+# install-temp-api-perl.sh
+# Proxmox Temperature API Installation with stunnel TLS encryption (PERL VERSION)
+# Run this on EACH Proxmox node
+# HTTPS: https://{node-ip}:8898/temperature (TLS encrypted via stunnel)
+# stunnel provides TLS encryption for the temperature API
+
+set -e
+
+echo "========================================================"
+echo "Proxmox Temperature API Installation (PERL VERSION)"
+echo "========================================================"
+echo ""
+echo "This script will install a temperature service with:"
+echo "  - HTTPS endpoint on port 8898 (TLS encrypted via stunnel)"
+echo ""
+echo "SECURITY: Only HTTPS (port 8898) is accessible from the network."
+echo ""
+echo "Components installed:"
+echo "  1. lm-sensors for standardized sensor detection"
+echo "  2. Temperature reader (Perl script)"
+echo "  3. HTTP service (port 8899 - localhost binding)"
+echo "  4. stunnel4 for TLS encryption (port 8898 - network accessible)"
+echo "  5. Systemd services (auto-start)"
+echo ""
+read -p "Continue installation? [y/N] " -n 1 -r
+echo
+if [[ ! $REPLY =~ ^[Yy]$ ]]; then
+    echo "Installation cancelled."
+    exit 0
+fi
+
+# Check if running as root
+if [ "$EUID" -ne 0 ]; then
+    echo "ERROR: Please run as root"
+    exit 1
+fi
+
+# Check if this is a Proxmox system
+if [ ! -f /etc/pve/.version ]; then
+    echo "ERROR: This doesn't appear to be a Proxmox VE system"
+    exit 1
+fi
+
+echo ""
+echo "========================================================"
+echo "Step 1/8: Installing Perl dependencies"
+echo "========================================================"
+
+# Install required Perl modules
+if ! perl -MJSON -e 1 2>/dev/null; then
+    echo "  Installing Perl JSON module..."
+    apt-get update -qq
+    apt-get install -y libjson-perl > /dev/null 2>&1
+    echo "  libjson-perl installed"
+else
+    echo "  Perl JSON module already installed"
+fi
+
+if ! perl -MHTTP::Daemon -e 1 2>/dev/null; then
+    echo "  Installing Perl HTTP::Daemon module..."
+    apt-get install -y libhttp-daemon-perl > /dev/null 2>&1
+    echo "  libhttp-daemon-perl installed"
+else
+    echo "  Perl HTTP::Daemon module already installed"
+fi
+
+echo ""
+echo "========================================================"
+echo "Step 2/8: Installing lm-sensors"
+echo "========================================================"
+
+# Install lm-sensors if not present
+if ! command -v sensors &> /dev/null; then
+    echo "  Installing lm-sensors package..."
+    apt-get update -qq
+    apt-get install -y lm-sensors > /dev/null 2>&1
+    echo "  lm-sensors installed"
+else
+    echo "  lm-sensors already installed"
+fi
+
+# Detect sensors (non-interactive)
+echo "  Detecting hardware sensors..."
+sensors-detect --auto > /dev/null 2>&1 || true
+echo "  Sensor detection complete"
+
+# Test sensors command
+echo ""
+echo "  Testing sensor detection..."
+if sensors > /dev/null 2>&1; then
+    echo "  Sensors detected successfully"
+    sensors | head -20
+else
+    echo "  WARNING: No sensors detected"
+    echo "  Temperature monitoring may not work on this system"
+fi
+
+echo ""
+echo "========================================================"
+echo "Step 3/8: Installing stunnel4"
+echo "========================================================"
+
+if ! command -v stunnel4 &> /dev/null; then
+    echo "  Installing stunnel4 package..."
+    apt-get install -y stunnel4 > /dev/null 2>&1
+    echo "  stunnel4 installed"
+else
+    echo "  stunnel4 already installed"
+fi
+
+echo ""
+echo "========================================================"
+echo "Step 4/8: Generating TLS Certificate"
+echo "========================================================"
+
+CERT_DIR="/etc/stunnel"
+CERT_FILE="${CERT_DIR}/proxmox-temp-api.pem"
+CERT_KEY="${CERT_DIR}/proxmox-temp-api-key.pem"
+
+mkdir -p ${CERT_DIR}
+
+if [ ! -f "${CERT_FILE}" ]; then
+    echo "  Generating self-signed certificate..."
+    
+    # Get hostname and IP
+    NODE_HOSTNAME=$(hostname -f)
+    NODE_IP=$(hostname -I | awk '{print $1}')
+    
+    # Generate private key
+    openssl genrsa -out "${CERT_KEY}" 2048 2>/dev/null
+    
+    # Generate certificate
+    openssl req -new -x509 -key "${CERT_KEY}" -out "${CERT_FILE}" -days 3650 -subj "/CN=${NODE_HOSTNAME}/O=Proxmox Temperature API/C=US" 2>/dev/null
+    
+    # Combine key and cert for stunnel
+    cat "${CERT_KEY}" >> "${CERT_FILE}"
+    
+    # Secure permissions
+    chmod 600 "${CERT_FILE}"
+    chmod 600 "${CERT_KEY}"
+    
+    echo "  Certificate generated: ${CERT_FILE}"
+    echo "  Certificate valid for 10 years"
+    echo ""
+    echo "  Certificate details:"
+    echo "    Hostname: ${NODE_HOSTNAME}"
+    echo "    IP: ${NODE_IP}"
+else
+    echo "  Certificate already exists: ${CERT_FILE}"
+fi
+
+echo ""
+echo "========================================================"
+echo "Step 5/8: Installing Temperature Reader (Perl)"
+echo "========================================================"
+
+cat > /usr/local/bin/proxmox-temp-reader.pl << 'PERL_READER_EOF'
+#!/usr/bin/perl
+use strict;
+use warnings;
+use JSON;
+use Getopt::Long;
+
+# Proxmox Temperature Reader using lm-sensors (Perl version)
+# Collects all available temperature sensors with proper labels
+
+package TemperatureReader;
+
+sub new {
+    my $class = shift;
+    my $self = {
+        sensors_cmd => '/usr/bin/sensors'
+    };
+    return bless $self, $class;
+}
+
+sub read_all_temperatures {
+    my $self = shift;
+    
+    unless (-x $self->{sensors_cmd}) {
+        return {
+            status => 'error',
+            error => 'lm-sensors not installed',
+            sensors => []
+        };
+    }
+    
+    my $output = `$self->{sensors_cmd} -A -u 2>&1`;
+    if ($? != 0) {
+        return {
+            status => 'error',
+            error => 'sensors command failed',
+            sensors => []
+        };
+    }
+    
+    my $sensors = $self->parse_sensors_output($output);
+    
+    return {
+        status => 'ok',
+        sensors => $sensors,
+        count => scalar(@$sensors)
+    };
+}
+
+sub parse_sensors_output {
+    my ($self, $output) = @_;
+    my @sensors;
+    
+    my $current_chip = '';
+    my $current_sensor = '';
+    my $current_label = undef;
+    my $current_input = undef;
+    
+    foreach my $original_line (split /\n/, $output) {
+        my $line = $original_line;
+        $line =~ s/^\s+|\s+$//g;  # trim
+        
+        next if $line eq '';
+        
+        # Check if line is indented
+        my $is_indented = ($original_line =~ /^[\s\t]/);
+        
+        # New chip/adapter (not indented, no colon)
+        if (!$is_indented && $line !~ /:/) {
+            $current_chip = $line;
+            next;
+        }
+        
+        # Adapter line
+        if ($line =~ /^Adapter:/) {
+            next;
+        }
+        
+        # Sensor name (not indented, ends with colon)
+        if (!$is_indented && $line =~ /:\s*$/) {
+            $current_sensor = $line;
+            $current_sensor =~ s/:\s*$//;
+            $current_label = undef;
+            $current_input = undef;
+            next;
+        }
+        
+        # Value lines (indented, has colon)
+        if ($is_indented && $current_sensor && $line =~ /:/) {
+            my ($key, $value) = split /:/, $line, 2;
+            $key =~ s/^\s+|\s+$//g;
+            $value =~ s/^\s+|\s+$//g;
+            
+            # Look for temperature input values
+            if ($key =~ /_input/ && $key =~ /temp/) {
+                if ($value =~ /^[\d.]+$/) {
+                    $current_input = $value + 0.0;
+                }
+            }
+            # Look for labels
+            elsif ($key =~ /_label/ && $key =~ /temp/) {
+                $current_label = $value;
+            }
+            
+            # When we have input, create sensor entry
+            if (defined $current_input) {
+                my ($sensor_type, $display_label) = $self->categorize_sensor(
+                    $current_chip, $current_sensor, $current_label
+                );
+                
+                push @sensors, {
+                    chip => $current_chip,
+                    sensor => $current_sensor,
+                    label => $display_label,
+                    type => $sensor_type,
+                    temperature => sprintf("%.1f", $current_input),
+                    unit => 'C'
+                };
+                
+                # Reset for next temperature
+                $current_label = undef;
+                $current_input = undef;
+            }
+        }
+    }
+    
+    return \@sensors;
+}
+
+sub categorize_sensor {
+    my ($self, $chip, $sensor, $label) = @_;
+    
+    my $chip_lower = lc($chip // '');
+    my $sensor_lower = lc($sensor // '');
+    
+    # CPU Package Temperature
+    if ($chip_lower =~ /coretemp|k10temp|zenpower/) {
+        if ($sensor_lower =~ /package|tctl|tdie/) {
+            return ('cpu_package', 'CPU Package');
+        }
+        elsif ($sensor_lower =~ /core/) {
+            if ($sensor_lower =~ /core\s*(\d+)/) {
+                return ('cpu_core', "CPU Core $1");
+            }
+            return ('cpu_core', 'CPU Core');
+        }
+    }
+    
+    # x86_pkg_temp
+    if ($chip_lower =~ /x86_pkg_temp/) {
+        return ('cpu_package', 'CPU Package');
+    }
+    
+    # ACPI Thermal Zone
+    if ($chip_lower =~ /acpitz|thermal/) {
+        if ($label) {
+            return ('thermal_zone', "Thermal Zone ($label)");
+        }
+        return ('thermal_zone', 'ACPI Thermal Zone');
+    }
+    
+    # Motherboard sensors
+    if ($chip_lower =~ /nct|it87|w83|f71|asus|gigabyte/) {
+        if ($label) {
+            return ('motherboard', "Motherboard ($label)");
+        }
+        return ('motherboard', "Motherboard ($sensor)");
+    }
+    
+    # NVMe drives
+    if ($chip_lower =~ /nvme/) {
+        return ('nvme', "NVMe ($chip)");
+    }
+    
+    # Generic fallback
+    if ($label) {
+        return ('other', $label);
+    }
+    return ('other', "$chip - $sensor");
+}
+
+sub get_summary {
+    my $self = shift;
+    my $data = $self->read_all_temperatures();
+    
+    if ($data->{status} ne 'ok' || !@{$data->{sensors}}) {
+        return $data;
+    }
+    
+    # Find CPU package temperature (preferred)
+    my $cpu_package;
+    foreach my $sensor (@{$data->{sensors}}) {
+        if ($sensor->{type} eq 'cpu_package') {
+            $cpu_package = $sensor;
+            last;
+        }
+    }
+    
+    # If no package temp, use first CPU core
+    if (!$cpu_package) {
+        foreach my $sensor (@{$data->{sensors}}) {
+            if ($sensor->{type} eq 'cpu_core') {
+                $cpu_package = $sensor;
+                last;
+            }
+        }
+    }
+    
+    # Add summary fields
+    if ($cpu_package) {
+        $data->{primary_temp} = $cpu_package->{temperature};
+        $data->{primary_label} = $cpu_package->{label};
+        $data->{primary_type} = $cpu_package->{type};
+    } else {
+        my $first_sensor = $data->{sensors}[0];
+        $data->{primary_temp} = $first_sensor->{temperature};
+        $data->{primary_label} = $first_sensor->{label};
+        $data->{primary_type} = $first_sensor->{type};
+    }
+    
+    return $data;
+}
+
+package main;
+
+my $json_output = 0;
+my $summary = 0;
+
+GetOptions(
+    'json' => \$json_output,
+    'summary' => \$summary
+) or die "Usage: $0 [--json] [--summary]\n";
+
+my $reader = TemperatureReader->new();
+my $result;
+
+if ($summary) {
+    $result = $reader->get_summary();
+} else {
+    $result = $reader->read_all_temperatures();
+}
+
+if ($json_output) {
+    print JSON->new->pretty->encode($result);
+} else {
+    if ($result->{status} eq 'ok') {
+        print "Found $result->{count} temperature sensors:\n\n";
+        foreach my $sensor (@{$result->{sensors}}) {
+            print "  $sensor->{label}: $sensor->{temperature}°C ($sensor->{type})\n";
+        }
+        if ($result->{primary_temp}) {
+            print "\nPrimary: $result->{primary_label} = $result->{primary_temp}°C\n";
+        }
+    } else {
+        print "Error: " . ($result->{error} // 'Unknown error') . "\n";
+        exit 1;
+    }
+}
+PERL_READER_EOF
+
+chmod +x /usr/local/bin/proxmox-temp-reader.pl
+echo "  Installed: /usr/local/bin/proxmox-temp-reader.pl"
+
+# Test the reader
+echo ""
+echo "  Testing temperature reader..."
+if /usr/local/bin/proxmox-temp-reader.pl; then
+    echo "  Status: OK"
+else
+    echo "  WARNING: No temperature sensors detected"
+    echo "  Temperature monitoring may not work on this system"
+fi
+
+echo ""
+echo "========================================================"
+echo "Step 6/8: Installing HTTP Service (Perl)"
+echo "========================================================"
+
+cat > /usr/local/bin/proxmox-temp-service.pl << 'PERL_SERVICE_EOF'
+#!/usr/bin/perl
+use strict;
+use warnings;
+use HTTP::Daemon;
+use HTTP::Status;
+use JSON;
+use IPC::Open3;
+use Symbol 'gensym';
+
+# Proxmox Temperature HTTP Service (Perl version)
+# Provides temperature data via HTTP on port 8899
+
+package TemperatureReader;
+
+sub new {
+    my $class = shift;
+    my $self = {
+        sensors_cmd => '/usr/bin/sensors'
+    };
+    return bless $self, $class;
+}
+
+sub read_all_temperatures {
+    my $self = shift;
+    
+    unless (-x $self->{sensors_cmd}) {
+        return {
+            status => 'error',
+            error => 'lm-sensors not installed',
+            sensors => []
+        };
+    }
+    
+    my $output = `$self->{sensors_cmd} -A -u 2>&1`;
+    if ($? != 0) {
+        return {
+            status => 'error',
+            error => 'sensors command failed',
+            sensors => []
+        };
+    }
+    
+    my $sensors = $self->parse_sensors_output($output);
+    
+    return {
+        status => 'ok',
+        sensors => $sensors,
+        count => scalar(@$sensors)
+    };
+}
+
+sub parse_sensors_output {
+    my ($self, $output) = @_;
+    my @sensors;
+    
+    my $current_chip = '';
+    my $current_sensor = '';
+    my $current_label = undef;
+    my $current_input = undef;
+    
+    foreach my $original_line (split /\n/, $output) {
+        my $line = $original_line;
+        $line =~ s/^\s+|\s+$//g;
+        
+        next if $line eq '';
+        
+        my $is_indented = ($original_line =~ /^[\s\t]/);
+        
+        if (!$is_indented && $line !~ /:/) {
+            $current_chip = $line;
+            next;
+        }
+        
+        if ($line =~ /^Adapter:/) {
+            next;
+        }
+        
+        if (!$is_indented && $line =~ /:\s*$/) {
+            $current_sensor = $line;
+            $current_sensor =~ s/:\s*$//;
+            $current_label = undef;
+            $current_input = undef;
+            next;
+        }
+        
+        if ($is_indented && $current_sensor && $line =~ /:/) {
+            my ($key, $value) = split /:/, $line, 2;
+            $key =~ s/^\s+|\s+$//g;
+            $value =~ s/^\s+|\s+$//g;
+            
+            if ($key =~ /_input/ && $key =~ /temp/) {
+                if ($value =~ /^[\d.]+$/) {
+                    $current_input = $value + 0.0;
+                }
+            }
+            elsif ($key =~ /_label/ && $key =~ /temp/) {
+                $current_label = $value;
+            }
+            
+            if (defined $current_input) {
+                my ($sensor_type, $display_label) = $self->categorize_sensor(
+                    $current_chip, $current_sensor, $current_label
+                );
+                
+                push @sensors, {
+                    chip => $current_chip,
+                    sensor => $current_sensor,
+                    label => $display_label,
+                    type => $sensor_type,
+                    temperature => sprintf("%.1f", $current_input),
+                    unit => 'C'
+                };
+                
+                $current_label = undef;
+                $current_input = undef;
+            }
+        }
+    }
+    
+    return \@sensors;
+}
+
+sub categorize_sensor {
+    my ($self, $chip, $sensor, $label) = @_;
+    
+    my $chip_lower = lc($chip // '');
+    my $sensor_lower = lc($sensor // '');
+    
+    if ($chip_lower =~ /coretemp|k10temp|zenpower/) {
+        if ($sensor_lower =~ /package|tctl|tdie/) {
+            return ('cpu_package', 'CPU Package');
+        }
+        elsif ($sensor_lower =~ /core/) {
+            if ($sensor_lower =~ /core\s*(\d+)/) {
+                return ('cpu_core', "CPU Core $1");
+            }
+            return ('cpu_core', 'CPU Core');
+        }
+    }
+    
+    if ($chip_lower =~ /x86_pkg_temp/) {
+        return ('cpu_package', 'CPU Package');
+    }
+    
+    if ($chip_lower =~ /acpitz|thermal/) {
+        return ('thermal_zone', 'ACPI Thermal Zone');
+    }
+    
+    if ($chip_lower =~ /nct|it87|w83|f71|asus|gigabyte/) {
+        return ('motherboard', "Motherboard ($sensor)");
+    }
+    
+    if ($chip_lower =~ /nvme/) {
+        return ('nvme', "NVMe ($chip)");
+    }
+    
+    return ('other', "$chip - $sensor");
+}
+
+sub get_summary {
+    my $self = shift;
+    my $data = $self->read_all_temperatures();
+    
+    if ($data->{status} ne 'ok' || !@{$data->{sensors}}) {
+        return $data;
+    }
+    
+    my $cpu_package;
+    foreach my $sensor (@{$data->{sensors}}) {
+        if ($sensor->{type} eq 'cpu_package') {
+            $cpu_package = $sensor;
+            last;
+        }
+    }
+    
+    if (!$cpu_package) {
+        foreach my $sensor (@{$data->{sensors}}) {
+            if ($sensor->{type} eq 'cpu_core') {
+                $cpu_package = $sensor;
+                last;
+            }
+        }
+    }
+    
+    if ($cpu_package) {
+        $data->{primary_temp} = $cpu_package->{temperature};
+        $data->{primary_label} = $cpu_package->{label};
+        $data->{primary_type} = $cpu_package->{type};
+    } else {
+        my $first_sensor = $data->{sensors}[0];
+        $data->{primary_temp} = $first_sensor->{temperature};
+        $data->{primary_label} = $first_sensor->{label};
+        $data->{primary_type} = $first_sensor->{type};
+    }
+    
+    return $data;
+}
+
+package main;
+
+# Listen on localhost only - stunnel will handle external access with TLS
+my $daemon = HTTP::Daemon->new(
+    LocalAddr => '127.0.0.1',
+    LocalPort => 8899,
+    ReuseAddr => 1
+) or die "Cannot create HTTP daemon: $!";
+
+print "Proxmox Temperature Service listening on 127.0.0.1:8899 (localhost only)\n";
+print "External access via stunnel on port 8898 (HTTPS)\n";
+
+my $reader = TemperatureReader->new();
+
+while (my $client = $daemon->accept) {
+    while (my $request = $client->get_request) {
+        if ($request->method eq 'GET') {
+            my $path = $request->uri->path;
+            
+            if ($path eq '/temperature') {
+                eval {
+                    my $result = $reader->get_summary();
+                    my $response_data = { data => $result };
+                    my $json = JSON->new->encode($response_data);
+                    
+                    my $response = HTTP::Response->new(200);
+                    $response->content_type('application/json');
+                    $response->header('Cache-Control' => 'max-age=2');
+                    $response->content($json);
+                    $client->send_response($response);
+                };
+                if ($@) {
+                    my $error_response = {
+                        data => {
+                            status => 'error',
+                            error => "$@",
+                            sensors => []
+                        }
+                    };
+                    my $json = JSON->new->encode($error_response);
+                    
+                    my $response = HTTP::Response->new(500);
+                    $response->content_type('application/json');
+                    $response->content($json);
+                    $client->send_response($response);
+                }
+            }
+            elsif ($path eq '/health') {
+                my $response = HTTP::Response->new(200);
+                $response->content_type('text/plain');
+                $response->content('OK');
+                $client->send_response($response);
+            }
+            else {
+                $client->send_error(404);
+            }
+        }
+        else {
+            $client->send_error(405);
+        }
+    }
+    $client->close;
+    undef($client);
+}
+PERL_SERVICE_EOF
+
+chmod +x /usr/local/bin/proxmox-temp-service.pl
+echo "  Created: /usr/local/bin/proxmox-temp-service.pl"
+
+echo ""
+echo "========================================================"
+echo "Step 7/8: Configuring stunnel"
+echo "========================================================"
+
+cat > /etc/stunnel/proxmox-temp-api.conf << EOF
+; stunnel configuration for Proxmox Temperature API
+; Provides TLS encryption for temperature monitoring
+
+; Global options
+pid = /var/run/stunnel-temp-api.pid
+output = /var/log/stunnel-temp-api.log
+
+; Service definition
+[proxmox-temp-api]
+accept = 0.0.0.0:8898
+connect = 127.0.0.1:8899
+cert = ${CERT_FILE}
+
+; TLS configuration
+sslVersion = TLSv1.2
+options = NO_SSLv2
+options = NO_SSLv3
+ciphers = HIGH:!aNULL:!MD5
+
+; Logging
+debug = 5
+
+; Security
+setuid = stunnel4
+setgid = stunnel4
+
+; Client verification (disabled for self-signed certs)
+verify = 0
+
+; Performance
+TIMEOUTclose = 0
+TIMEOUTidle = 3600
+EOF
+
+echo "  Created: /etc/stunnel/proxmox-temp-api.conf"
+
+# Enable stunnel in default config
+if [ -f /etc/default/stunnel4 ]; then
+    sed -i 's/^ENABLED=.*/ENABLED=1/' /etc/default/stunnel4
+    if ! grep -q "^ENABLED=" /etc/default/stunnel4; then
+        echo "ENABLED=1" >> /etc/default/stunnel4
+    fi
+else
+    echo "ENABLED=1" > /etc/default/stunnel4
+    echo "FILES=\"/etc/stunnel/*.conf\"" >> /etc/default/stunnel4
+    echo "OPTIONS=\"\"" >> /etc/default/stunnel4
+fi
+
+echo "  stunnel4 enabled in /etc/default/stunnel4"
+
+# Ensure log directory exists and has correct permissions
+touch /var/log/stunnel-temp-api.log
+chown stunnel4:stunnel4 /var/log/stunnel-temp-api.log
+chmod 640 /var/log/stunnel-temp-api.log
+
+mkdir -p /var/run
+chmod 755 /var/run
+
+echo ""
+echo "========================================================"
+echo "Step 8/8: Creating and Starting Services"
+echo "========================================================"
+
+# Create unprivileged user for the temperature service
+if ! id "proxmox-temp" &>/dev/null; then
+    useradd --system --no-create-home --shell /usr/sbin/nologin proxmox-temp
+    echo "  Created user: proxmox-temp"
+else
+    echo "  User proxmox-temp already exists"
+fi
+
+# Temperature API service
+cat > /etc/systemd/system/proxmox-temp-api.service << 'SYSTEMD_EOF'
+[Unit]
+Description=Proxmox Temperature API Service (Perl)
+After=network.target
+Before=stunnel4.service
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/perl /usr/local/bin/proxmox-temp-service.pl
+Restart=always
+RestartSec=10
+
+# Run as unprivileged user
+User=proxmox-temp
+Group=proxmox-temp
+
+# Logging
+StandardOutput=journal
+StandardError=journal
+
+# Security hardening
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+
+[Install]
+WantedBy=multi-user.target
+SYSTEMD_EOF
+
+echo "  Created: /etc/systemd/system/proxmox-temp-api.service"
+
+# Reload and start services
+systemctl daemon-reload
+
+# Start temperature API
+systemctl enable proxmox-temp-api.service
+systemctl restart proxmox-temp-api.service
+
+# Start stunnel
+systemctl enable stunnel4.service
+systemctl restart stunnel4.service
+
+echo "  Services enabled and started"
+
+# Wait for services to start
+sleep 2
+
+# Verify stunnel started correctly
+if ! systemctl is-active --quiet stunnel4; then
+    echo ""
+    echo "  WARNING: stunnel4 failed to start"
+    echo "  Checking logs..."
+    systemctl status stunnel4.service --no-pager | tail -20
+else
+    echo "  stunnel4 started successfully"
+fi
+
+# Verify temperature API started correctly
+if ! systemctl is-active --quiet proxmox-temp-api; then
+    echo "  WARNING: proxmox-temp-api failed to start"
+    echo "  Check: journalctl -u proxmox-temp-api -n 50"
+else
+    echo "  proxmox-temp-api started successfully"
+fi
+
+echo ""
+echo "========================================================"
+echo "Testing Installation"
+echo "========================================================"
+
+sleep 3
+
+echo ""
+echo "  Testing HTTP service (localhost only)..."
+if curl -s http://127.0.0.1:8899/health > /dev/null 2>&1; then
+    echo "    HTTP service: OK"
+else
+    echo "    HTTP service: FAILED"
+    systemctl status proxmox-temp-api.service --no-pager | tail -10
+fi
+
+echo ""
+echo "  Testing HTTPS service (stunnel)..."
+if curl -sk https://127.0.0.1:8898/health > /dev/null 2>&1; then
+    echo "    HTTPS service (stunnel): OK"
+    echo ""
+    echo "  Temperature data (via HTTPS):"
+    TEMP_RESULT=$(curl -sk https://127.0.0.1:8898/temperature)
+    echo "$TEMP_RESULT" | perl -MJSON -e 'local $/; print JSON->new->pretty->decode(<STDIN>)' 2>/dev/null || echo "$TEMP_RESULT"
+else
+    echo "    HTTPS service: FAILED"
+    systemctl status stunnel4.service --no-pager | tail -10
+fi
+
+echo ""
+echo "========================================================"
+echo "Installation Complete!"
+echo "========================================================"
+echo ""
+NODE_IP=$(hostname -I | awk '{print $1}')
+NODE_NAME=$(hostname)
+echo "The temperature service is now available:"
+echo ""
+echo "  HTTPS (TLS):   https://${NODE_IP}:8898/temperature  ← USE THIS"
+echo "  HTTP (local):  http://127.0.0.1:8899/temperature   (localhost only)"
+echo ""
+echo "IMPORTANT - This is the PERL VERSION of the temperature API"
+echo ""
+echo "Test with curl:"
+echo "  curl -k https://${NODE_IP}:8898/temperature"
+echo "  curl http://127.0.0.1:8899/temperature"
+echo ""
+echo "Or test with Perl directly:"
+echo "  /usr/local/bin/proxmox-temp-reader.pl --summary"
+echo "  /usr/local/bin/proxmox-temp-reader.pl --json"
+echo ""
+echo "Service management:"
+echo "  systemctl status proxmox-temp-api"
+echo "  systemctl restart proxmox-temp-api"
+echo "  journalctl -u proxmox-temp-api -f"
+echo ""
+echo "Files installed:"
+echo "  /usr/local/bin/proxmox-temp-reader.pl"
+echo "  /usr/local/bin/proxmox-temp-service.pl"
+echo "  /etc/systemd/system/proxmox-temp-api.service"
+echo ""
