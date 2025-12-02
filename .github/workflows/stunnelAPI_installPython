@@ -1,5 +1,5 @@
 #!/bin/bash
-# install-temp-api-Python.sh
+# install-temp-api-python.sh
 # Proxmox Temperature API Installation with stunnel TLS encryption
 # Run this on EACH Proxmox node
 # HTTPS: https://{node-ip}:8898/temperature (TLS encrypted via stunnel)
