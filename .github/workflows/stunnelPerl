@@ -26,9 +26,6 @@ use threads::shared;
 use Thread::Queue;
 use Time::HiRes qw(sleep usleep);
 
-# Proxmox Dashboard - Full-Featured Perl/Tk Version
-# Complete port of Python version with all features
-
 our $VERSION = '2.0.0';
 
 # Configuration
