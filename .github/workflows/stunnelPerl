@@ -26,6 +26,9 @@ use threads::shared;
 use Thread::Queue;
 use Time::HiRes qw(sleep usleep);
 
+# Proxmox Dashboard - Full-Featured Perl/Tk Version
+# Complete port of Python version with all features
+
 our $VERSION = '2.0.0';
 
 # Configuration
@@ -360,16 +363,16 @@ How to Create Token:
    (Top of the API Tokens page)
 
 4. Fill in the form:
-   • User: root@pam
-   • Token ID: dashboard (or any name you want)
-   • Privilege Separation: UNCHECK THIS BOX ⚠️
-   • Expire: Never
-   • Comment: Dashboard access (optional)
+   - User: root@pam
+   - Token ID: dashboard (or any name you want)
+   - Privilege Separation: UNCHECK THIS BOX [WARNING!]
+   - Expire: Never
+   - Comment: Dashboard access (optional)
 
 5. Click 'Add' button
    The token will be created.
 
-6. COPY THE SECRET! ⚠️
+6. COPY THE SECRET! [IMPORTANT!]
    A popup or message will show the token secret.
    COPY IT IMMEDIATELY - it's shown only once!
 
@@ -384,8 +387,8 @@ The secret will appear in the output immediately.
 
 What You'll Need for Next Step:
 
-• Token ID: root@pam!dashboard
-• Token Secret: (the long string you copied)
+- Token ID: root@pam!dashboard
+- Token Secret: (the long string you copied)
 EOF
     
     $text->insert('end', $instructions);
@@ -700,7 +703,7 @@ sub create_widgets {
         ["< 50°C Cool", '#27ae60'],
         ["50-70°C Normal", '#3498db'],
         ["70-85°C Warm", '#e67e22'],
-        ["≥ 85°C Hot", '#e74c3c']
+        [">= 85°C Hot", '#e74c3c']
     );
     
     foreach my $item (@color_key) {
