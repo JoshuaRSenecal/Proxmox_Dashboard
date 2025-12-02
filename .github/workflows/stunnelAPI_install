@@ -3,8 +3,6 @@
 # Proxmox Temperature API Installation with stunnel TLS encryption
 # Run this on EACH Proxmox node
 #
-# This installs a temperature service with TWO endpoints:
-#   HTTP:  http://{node-ip}:8899/temperature  (local/trusted only)
 #   HTTPS: https://{node-ip}:8898/temperature (TLS encrypted via stunnel)
 #
 # stunnel provides TLS encryption for the temperature API
@@ -17,10 +15,8 @@ echo "========================================================"
 echo ""
 echo "This script will install a temperature service with:"
 echo "  - HTTPS endpoint on port 8898 (TLS encrypted via stunnel)"
-echo "  - HTTP service on port 8899 (LOCALHOST ONLY - not accessible remotely)"
 echo ""
 echo "SECURITY: Only HTTPS (port 8898) is accessible from the network."
-echo "          HTTP (port 8899) is bound to 127.0.0.1 for local use only."
 echo ""
 echo "Components installed:"
 echo "  1. lm-sensors for standardized sensor detection"
@@ -397,7 +393,7 @@ cat > /usr/local/bin/proxmox-temp-service.py << 'PYTHON_SERVICE_EOF'
 #!/usr/bin/env python3
 """
 Proxmox Temperature HTTP Service
-Provides temperature data via HTTP on port 8899 (localhost only for security)
+Provides temperature data via HTTP on port 8899
 """
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from urllib.parse import urlparse, parse_qs
@@ -840,7 +836,6 @@ echo "  HTTP (local):  http://127.0.0.1:8899/temperature   (localhost only)"
 echo ""
 echo "IMPORTANT - Security Configuration:"
 echo "  * HTTPS port 8898 is TLS encrypted and accessible from your network"
-echo "  * HTTP port 8899 is bound to localhost (127.0.0.1) ONLY"
 echo "  * External clients MUST use HTTPS endpoint for security"
 echo "  * Dashboard automatically uses HTTPS - no fallback to HTTP"
 echo ""
