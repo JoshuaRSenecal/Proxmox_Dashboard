@@ -2,7 +2,7 @@
 # Disable PVE Enterprise
 if [ -f /etc/apt/sources.list.d/pve-enterprise.list ]; then
     mv /etc/apt/sources.list.d/pve-enterprise.list /etc/apt/sources.list.d/pve-enterprise.list.disabled
-fi
+fi;
 
 # Disable Ceph Enterprise
 if [ -f /etc/apt/sources.list.d/ceph.list ]; then
