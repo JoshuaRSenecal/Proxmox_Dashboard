@@ -1,7 +1,4 @@
-if [ -f /etc/apt/sources.list.d/pve-enterprise.list ]; then
-    mv /etc/apt/sources.list.d/pve-enterprise.list /etc/apt/sources.list.d/pve-enterprise.list.disabled
-fi;
+[ -f /etc/apt/sources.list.d/pve-enterprise.list ] && mv /etc/apt/sources.list.d/pve-enterprise.list /etc/apt/sources.list.d/pve-enterprise.list.disabled
+[ -f /etc/apt/sources.list.d/ceph.list ] && mv /etc/apt/sources.list.d/ceph.list /etc/apt/sources.list.d/ceph.list.disabled
 
-if [ -f /etc/apt/sources.list.d/ceph.list ]; then
-    mv /etc/apt/sources.list.d/ceph.list /etc/apt/sources.list.d/ceph.list.disabled
-fi
+sed -i 's|^deb https://enterprise.proxmox.com|#deb https://enterprise.proxmox.com|g' /etc/apt/sources.list
