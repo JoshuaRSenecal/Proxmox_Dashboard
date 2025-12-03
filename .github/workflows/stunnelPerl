@@ -2173,7 +2173,7 @@ sub start_health_check {
 sub on_closing {
     my ($self) = @_;
     
-    # Set closing flag immediately to stop all operations
+    # Set flags to stop all operations
     $self->{is_closing} = 1;
     $self->{auto_refresh} = 0;
     $self->{is_loading} = 0;
@@ -2187,10 +2187,26 @@ sub on_closing {
         };
     }
     
-    # Just destroy - callbacks will check is_closing and exit naturally
-    if ($self->{mw} && Tk::Exists($self->{mw})) {
-        $self->{mw}->destroy();
-    }
+    # Store main window ref temporarily
+    my $mw = $self->{mw};
+    
+    # Clear ALL widget references BEFORE destroying to avoid double-free
+    delete $self->{tree};
+    delete $self->{connection_label};
+    delete $self->{ssl_label};
+    delete $self->{node_label};
+    delete $self->{last_update_label};
+    delete $self->{running_count_label};
+    delete $self->{stopped_count_label};
+    delete $self->{status_label};
+    delete $self->{search_entry};
+    delete $self->{live_indicator};
+    delete $self->{pause_resume_btn};
+    delete $self->{node_temp_frame};
+    delete $self->{mw};
+    
+    # Now destroy the window - widget refs are gone so no double-free
+    $mw->destroy() if $mw && Tk::Exists($mw);
 }
 
 sub run {
