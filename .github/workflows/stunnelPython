@@ -1,2246 +1,2749 @@
-#!/usr/bin/perl
-use strict;
-use warnings;
-use Tk;
-use Tk::Dialog;
-use Tk::DialogBox;
-use Tk::Entry;
-use Tk::HList;
-use Tk::ROText;
-use Tk::Toplevel;
-use Tk::Frame;
-use Tk::Label;
-use Tk::Button;
-use Tk::Scrollbar;
-use LWP::UserAgent;
-use HTTP::Request;
-use JSON;
-use MIME::Base64;
-use Digest::SHA qw(sha256);
-use Crypt::CBC;
-use Crypt::OpenSSL::AES;
-use File::Path qw(make_path);
-use POSIX qw(strftime);
-use threads;
-use threads::shared;
-use Thread::Queue;
-use Time::HiRes qw(sleep usleep);
+#!/usr/bin/env python3
 
-# Proxmox Dashboard - Full-Featured Perl/Tk Version
-# Complete port of Python version with all features
+import tkinter as tk
+from tkinter import ttk, messagebox, simpledialog
+import requests
+from requests.adapters import HTTPAdapter
+from urllib3.poolmanager import PoolManager
+import urllib3
+import ssl
+import json
+import base64
+import os
+import threading
+import time
+import queue
+import logging
+from datetime import datetime, timedelta
+from cryptography.fernet import Fernet
+from cryptography.hazmat.primitives import hashes
+from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
 
-our $VERSION = '2.0.0';
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.FileHandler(os.path.expanduser('~/.proxmox_dashboard.log'))
+    ]
+)
+logger = logging.getLogger('ProxmoxDashboard')
+
+# Secure log file permissions (owner read/write only)
+LOG_FILE = os.path.expanduser('~/.proxmox_dashboard.log')
+if os.path.exists(LOG_FILE):
+    os.chmod(LOG_FILE, 0o600)
 
 # Configuration
-my $SALT = 'proxmox_dashboard_salt_v1';
-my $HOME = $ENV{HOME} || '/root';
-my $CREDENTIALS_FILE = "$HOME/.proxmox_credentials_perl.enc";
-my $PROXMOX_CA_CERT = "$HOME/proxmox-ca.pem";
-my $AUDIT_LOG_FILE = "$HOME/.proxmox_dashboard_audit_perl.log";
-my $LOG_FILE = "$HOME/.proxmox_dashboard_perl.log";
-my $REFRESH_INTERVAL = 3;
-my $MAX_RETRIES = 3;
-my $RETRY_DELAY = 2;
+SALT = b'proxmox_dashboard_salt_v1'
+CREDENTIALS_FILE = os.path.expanduser('~/.proxmox_credentials.enc')
+PROXMOX_CA_CERT = os.path.expanduser('~/proxmox-ca.pem')
+AUDIT_LOG_FILE = os.path.expanduser('~/.proxmox_dashboard_audit.log')
+REFRESH_INTERVAL = 3  # seconds - Live data feed (near-constant updates)
+MAX_RETRIES = 3
+RETRY_DELAY = 2
 
-# Check for CA certificate
-unless (-f $PROXMOX_CA_CERT) {
-    print STDERR <<"EOF";
-
+# SSL Configuration - MANDATORY
+if not os.path.exists(PROXMOX_CA_CERT):
+    error_msg = f"""
 SSL CERTIFICATE REQUIRED
 
 The Proxmox CA certificate is required for secure connections.
 
-Certificate not found at: $PROXMOX_CA_CERT
+Certificate not found at: {PROXMOX_CA_CERT}
 
 To obtain the certificate:
   1. SSH into your Proxmox server
-  2. Run: scp root\@YOUR_PROXMOX_IP:/etc/pve/pve-root-ca.pem $PROXMOX_CA_CERT
+  2. Run: scp root@YOUR_PROXMOX_IP:/etc/pve/pve-root-ca.pem {PROXMOX_CA_CERT}
+  
+Or manually copy /etc/pve/pve-root-ca.pem from Proxmox to {PROXMOX_CA_CERT}
 
 SSL verification is MANDATORY for security.
 Dashboard cannot start without the CA certificate.
-EOF
-    exit 1;
-}
+"""
+    print(error_msg)
+    logger.error("SSL Certificate not found - cannot start")
+    logger.error(f"Expected location: {PROXMOX_CA_CERT}")
+    exit(1)
 
-# Secure log file permissions
-if (-f $LOG_FILE) {
-    chmod 0600, $LOG_FILE;
-}
+logger.info(f"SSL Verification: Enabled (using {PROXMOX_CA_CERT})")
 
-# Logger
-sub log_message {
-    my ($level, $message) = @_;
-    my $timestamp = strftime("%Y-%m-%d %H:%M:%S", localtime);
-    open my $fh, '>>', $LOG_FILE or return;
-    print $fh "$timestamp - $level - $message\n";
-    close $fh;
-}
+# Suppress InsecureRequestWarning for temperature API self-signed certificates
+# The temperature API uses self-signed certs via stunnel, which is intentional
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
-log_message('INFO', 'Dashboard starting - Full Perl version');
 
-################################################################################
-# Audit Logger
-################################################################################
-package AuditLogger;
+class AuditLogger:
+    """Audit logger for tracking all critical operations"""
+    
+    @staticmethod
+    def log(action, target, result, details=None):
+        try:
+            timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            log_entry = f"{timestamp} | {action:20} | {target:20} | {result:10}"
+            if details:
+                log_entry += f" | {details}"
+            
+            with open(AUDIT_LOG_FILE, 'a') as f:
+                f.write(log_entry + '\n')
+            
+            # Secure audit log permissions (owner read/write only)
+            if os.path.exists(AUDIT_LOG_FILE):
+                os.chmod(AUDIT_LOG_FILE, 0o600)
+        except Exception as e:
+            logger.error(f"Failed to write audit log: {e}")
+    
+    @staticmethod
+    def log_authentication(host, user, success):
+        result = "SUCCESS" if success else "FAILED"
+        AuditLogger.log("AUTH", f"{user}@{host}", result)
+    
+    @staticmethod
+    def log_vm_action(action, vmid, vm_type, vm_name, success, error=None):
+        result = "SUCCESS" if success else "FAILED"
+        target = f"{vm_type} {vmid} ({vm_name})"
+        details = f"Error: {error}" if error else None
+        AuditLogger.log(action, target, result, details)
 
-sub log_entry {
-    my ($action, $target, $result, $details) = @_;
-    my $timestamp = POSIX::strftime("%Y-%m-%d %H:%M:%S", localtime);
-    my $log_entry = sprintf("%s | %-20s | %-20s | %-10s", 
-        $timestamp, $action, $target, $result);
-    $log_entry .= " | $details" if $details;
-    
-    open my $fh, '>>', $AUDIT_LOG_FILE or return;
-    print $fh "$log_entry\n";
-    close $fh;
-    
-    chmod 0600, $AUDIT_LOG_FILE if -f $AUDIT_LOG_FILE;
-}
 
-sub log_authentication {
-    my ($host, $user, $success) = @_;
-    my $result = $success ? "SUCCESS" : "FAILED";
-    log_entry("AUTH", "$user\@$host", $result);
-}
-
-sub log_vm_action {
-    my ($action, $vmid, $vm_type, $vm_name, $success, $error) = @_;
-    my $result = $success ? "SUCCESS" : "FAILED";
-    my $target = "$vm_type $vmid ($vm_name)";
-    my $details = $error ? "Error: $error" : undef;
-    log_entry($action, $target, $result, $details);
-}
-
-################################################################################
-# Credential Manager
-################################################################################
-package CredentialManager;
-
-sub derive_key {
-    my ($password) = @_;
-    my $key = Digest::SHA::sha256($password . $SALT);
-    return $key;
-}
-
-sub save_credentials {
-    my ($host, $master_password, $token_id, $token_secret) = @_;
+class SSLAdapter(HTTPAdapter):
+    """Custom HTTPAdapter that verifies both CA cert AND hostname"""
     
-    my $credentials = {
-        host => $host,
-        auth_type => 'token',
-        token_id => $token_id,
-        token_secret => $token_secret
-    };
-    
-    my $json = JSON->new->encode($credentials);
-    my $key = derive_key($master_password);
-    
-    my $cipher = Crypt::CBC->new(
-        -key => $key,
-        -cipher => 'Crypt::OpenSSL::AES',
-        -header => 'salt',
-        -padding => 'standard'
-    );
-    
-    my $encrypted = $cipher->encrypt($json);
-    my $encoded = MIME::Base64::encode_base64($encrypted, '');
-    
-    my $temp_file = "$CREDENTIALS_FILE.tmp";
-    open my $fh, '>', $temp_file or die "Cannot write to $temp_file: $!";
-    print $fh $encoded;
-    close $fh;
-    
-    chmod 0600, $temp_file;
-    rename $temp_file, $CREDENTIALS_FILE or die "Cannot rename: $!";
-    
-    main::log_message('INFO', "Credentials saved for $host");
-    return 1;
-}
-
-sub load_credentials {
-    my ($master_password) = @_;
-    
-    return undef unless -f $CREDENTIALS_FILE;
-    
-    open my $fh, '<', $CREDENTIALS_FILE or die "Cannot read $CREDENTIALS_FILE: $!";
-    my $encoded = do { local $/; <$fh> };
-    close $fh;
-    
-    my $encrypted = MIME::Base64::decode_base64($encoded);
-    my $key = derive_key($master_password);
-    
-    my $cipher = Crypt::CBC->new(
-        -key => $key,
-        -cipher => 'Crypt::OpenSSL::AES',
-        -header => 'salt',
-        -padding => 'standard'
-    );
-    
-    my $decrypted = eval { $cipher->decrypt($encrypted) };
-    
-    if ($@ || !$decrypted) {
-        die "Invalid master password or corrupted credentials file";
-    }
-    
-    return JSON->new->decode($decrypted);
-}
-
-################################################################################
-# Proxmox API Client
-################################################################################
-package ProxmoxAPI;
-
-sub new {
-    my ($class, $host, $token_id, $token_secret) = @_;
-    
-    my $self = {
-        host => $host,
-        base_url => "https://$host:8006/api2/json",
-        token_id => $token_id,
-        token_secret => $token_secret,
-        ssl_status => 'Verified',
-    };
-    
-    $self->{ua} = LWP::UserAgent->new(
-        ssl_opts => {
-            verify_hostname => 1,
-            SSL_ca_file => $PROXMOX_CA_CERT,
-        },
-        timeout => 10,
-    );
-    
-    bless $self, $class;
-    
-    # Test authentication
-    eval {
-        $self->get('/version');
-        AuditLogger::log_authentication($host, $token_id, 1);
-        main::log_message('INFO', "Successfully authenticated with token: $token_id");
-    };
-    
-    if ($@) {
-        AuditLogger::log_authentication($host, $token_id, 0);
-        main::log_message('ERROR', "API authentication failed: $@");
-        die $@;
-    }
-    
-    return $self;
-}
-
-sub api_request {
-    my ($self, $method, $path, $data, $retries) = @_;
-    $retries //= $MAX_RETRIES;
-    
-    my $url = $self->{base_url} . $path;
-    my $auth_header = "PVEAPIToken=$self->{token_id}=$self->{token_secret}";
-    
-    for my $attempt (1..$retries) {
-        my $request;
+    def init_poolmanager(self, *args, **kwargs):
+        # Create SSL context that verifies BOTH certificate AND hostname
+        context = ssl.create_default_context(cafile=PROXMOX_CA_CERT)
+        context.check_hostname = True   # FIXED: Enable hostname verification
+        context.verify_mode = ssl.CERT_REQUIRED  # Verify certificate
         
-        if ($method eq 'GET') {
-            $request = HTTP::Request->new(GET => $url);
-        } elsif ($method eq 'POST') {
-            $request = HTTP::Request->new(POST => $url);
-            if ($data) {
-                $request->content_type('application/x-www-form-urlencoded');
-                my @pairs;
-                while (my ($k, $v) = each %$data) {
-                    push @pairs, "$k=$v";
-                }
-                $request->content(join('&', @pairs));
+        kwargs['ssl_context'] = context
+        return super().init_poolmanager(*args, **kwargs)
+
+
+class ProxmoxAPI:
+    """Proxmox API Client - API Token Authentication Only"""
+    
+    def __init__(self, host, token_id, token_secret):
+        self.base = f"https://{host}:8006/api2/json"
+        self.host = host
+        
+        # SSL verification with CA cert AND hostname checking enabled
+        self.verify = PROXMOX_CA_CERT
+        self.ssl_status = "Verified"
+        
+        # Create session with custom SSL adapter
+        self.session = requests.Session()
+        self.session.mount('https://', SSLAdapter())
+        
+        # API Token authentication
+        self.headers = {'Authorization': f'PVEAPIToken={token_id}={token_secret}'}
+        
+        # Test authentication
+        try:
+            self._api_request('get', '/version')
+            AuditLogger.log_authentication(host, token_id, True)
+            logger.info(f"Successfully authenticated with token: {token_id}")
+        except requests.exceptions.HTTPError as e:
+            # Authentication or HTTP error - preserve original error message
+            AuditLogger.log_authentication(host, token_id, False)
+            logger.error(f"API authentication failed: {str(e)}")
+            raise
+        except Exception as e:
+            # Other errors (connection, timeout, etc.)
+            AuditLogger.log_authentication(host, token_id, False)
+            logger.error(f"API connection failed: {str(e)}")
+            raise
+    
+    def _api_request(self, method, path, retries=MAX_RETRIES, **kwargs):
+        """Make API request with retry logic - Token authentication only"""
+        for attempt in range(retries):
+            try:
+                if method == 'get':
+                    r = self.session.get(
+                        f"{self.base}{path}",
+                        headers=self.headers,
+                        verify=self.verify,
+                        timeout=10,
+                        **kwargs
+                    )
+                elif method == 'post':
+                    r = self.session.post(
+                        f"{self.base}{path}",
+                        headers=self.headers,
+                        verify=self.verify,
+                        timeout=10,
+                        **kwargs
+                    )
+                
+                if r.status_code in [200, 201]:
+                    return r
+                elif r.status_code == 401:
+                    # Authentication failure - don't retry, fail immediately
+                    r.raise_for_status()
+                elif r.status_code >= 500 and attempt < retries - 1:
+                    # Server error - retry with backoff
+                    delay = RETRY_DELAY * (2 ** attempt)
+                    time.sleep(delay)
+                    continue
+                else:
+                    # Other errors - fail immediately
+                    r.raise_for_status()
+            
+            except requests.exceptions.HTTPError:
+                # HTTP errors (401, 403, 404, etc.) - never retry, re-raise immediately
+                raise
+            except requests.exceptions.ConnectionError as e:
+                if attempt == retries - 1:
+                    raise
+                time.sleep(RETRY_DELAY * (2 ** attempt))
+            except requests.exceptions.Timeout as e:
+                if attempt == retries - 1:
+                    raise
+                time.sleep(RETRY_DELAY * (2 ** attempt))
+            except Exception as e:
+                # Unknown error - fail immediately
+                raise
+        
+        raise Exception(f"API request failed after {retries} attempts")
+    
+    def get(self, path):
+        r = self._api_request('get', path)
+        try:
+            response_data = r.json()
+            if 'data' in response_data:
+                return response_data['data']
+            else:
+                return response_data
+        except (ValueError, KeyError, TypeError) as e:
+            raise Exception(f"Invalid API response from {path}: {str(e)}")
+    
+    def post(self, path, data=None):
+        kwargs = {'data': data} if data else {}
+        return self._api_request('post', path, **kwargs)
+
+
+class CredentialManager:
+    """Manages encrypted credential storage - supports API tokens"""
+    
+    @staticmethod
+    def get_key_from_password(password):
+        kdf = PBKDF2HMAC(
+            algorithm=hashes.SHA256(),
+            length=32,
+            salt=SALT,
+            iterations=100000,
+        )
+        return base64.urlsafe_b64encode(kdf.derive(password.encode()))
+    
+    @staticmethod
+    def save_credentials(host, master_password, token_id, token_secret):
+        """Save API token credentials (token authentication only)"""
+        try:
+            credentials = {
+                'host': host,
+                'auth_type': 'token',
+                'token_id': token_id,
+                'token_secret': token_secret
             }
+            
+            key = CredentialManager.get_key_from_password(master_password)
+            cipher = Fernet(key)
+            encrypted_data = cipher.encrypt(json.dumps(credentials).encode())
+            
+            # Write to temporary file first, then rename (atomic operation)
+            temp_file = CREDENTIALS_FILE + '.tmp'
+            
+            with open(temp_file, 'wb') as f:
+                f.write(encrypted_data)
+            
+            # Set permissions before rename
+            os.chmod(temp_file, 0o600)
+            
+            # Atomic rename
+            os.rename(temp_file, CREDENTIALS_FILE)
+            
+            # Verify final file exists
+            if not os.path.exists(CREDENTIALS_FILE):
+                raise IOError(f"Credentials file does not exist after save")
+            
+            logger.info(f"Credentials saved successfully for {host}")
+            
+        except IOError as e:
+            logger.error(f"IO Error saving credentials: {str(e)}")
+            raise Exception(f"Failed to save credentials file: {str(e)}")
+        except Exception as e:
+            logger.error(f"Error saving credentials: {str(e)}")
+            raise Exception(f"Failed to encrypt credentials: {str(e)}")
+    
+    @staticmethod
+    def load_credentials(master_password):
+        if not os.path.exists(CREDENTIALS_FILE):
+            return None
+        
+        try:
+            with open(CREDENTIALS_FILE, 'rb') as f:
+                encrypted_data = f.read()
+            
+            key = CredentialManager.get_key_from_password(master_password)
+            cipher = Fernet(key)
+            decrypted_data = cipher.decrypt(encrypted_data)
+            return json.loads(decrypted_data.decode())
+        except IOError as e:
+            raise Exception(f"Failed to read credentials file: {str(e)}")
+        except Exception as e:
+            # Most likely wrong password or corrupted file
+            raise Exception("Invalid master password or corrupted credentials file")
+
+
+def extract_hostname_from_certificate(cert_path):
+    """Extract Common Name from SSL certificate"""
+    try:
+        import subprocess
+        result = subprocess.run(
+            ['openssl', 'x509', '-in', cert_path, '-noout', '-subject'],
+            capture_output=True,
+            text=True,
+            timeout=5
+        )
+        if result.returncode == 0:
+            # Parse subject line: "subject=CN = pve"
+            for part in result.stdout.split(','):
+                if 'CN' in part or 'CN=' in part:
+                    hostname = part.split('=')[-1].strip()
+                    return hostname
+    except Exception as e:
+        logger.error(f"Failed to extract hostname from certificate: {e}")
+    return None
+
+
+class TokenCreationGuide(tk.Toplevel):
+    """Guide dialog for creating API tokens in Proxmox"""
+    
+    def __init__(self, parent):
+        super().__init__(parent)
+        self.title("Create Proxmox API Token")
+        self.geometry("700x650")
+        self.resizable(True, True)
+        
+        self.update_idletasks()
+        x = (self.winfo_screenwidth() // 2) - 350
+        y = (self.winfo_screenheight() // 2) - 325
+        self.geometry(f"700x650+{x}+{y}")
+        
+        self.create_widgets()
+        self.protocol("WM_DELETE_WINDOW", self.on_close)
+        self.grab_set()
+    
+    def create_widgets(self):
+        # Title
+        title_frame = tk.Frame(self, bg="#3498db", height=60)
+        title_frame.pack(fill=tk.X)
+        title_frame.pack_propagate(False)
+        
+        title_label = tk.Label(
+            title_frame,
+            text="Step 1: Create API Token in Proxmox",
+            font=("Arial", 16, "bold"),
+            bg="#3498db",
+            fg="white"
+        )
+        title_label.pack(pady=15)
+        
+        # Main content with scrollbar
+        main_frame = tk.Frame(self, bg="white")
+        main_frame.pack(fill=tk.BOTH, expand=True, padx=20, pady=20)
+        
+        # Create canvas and scrollbar
+        canvas = tk.Canvas(main_frame, bg="white", highlightthickness=0)
+        scrollbar = tk.Scrollbar(main_frame, orient="vertical", command=canvas.yview)
+        scrollable_frame = tk.Frame(canvas, bg="white")
+        
+        scrollable_frame.bind(
+            "<Configure>",
+            lambda e: canvas.configure(scrollregion=canvas.bbox("all"))
+        )
+        
+        canvas.create_window((0, 0), window=scrollable_frame, anchor="nw")
+        canvas.configure(yscrollcommand=scrollbar.set)
+        
+        # Instructions content
+        instructions = [
+            ("What is an API Token?", "bold", "#2c3e50"),
+            ("An API token is a secure way to connect to Proxmox without using your password.\n", "normal", "#34495e"),
+            
+            ("How to Create Token:", "bold", "#2c3e50"),
+            ("1. Open Proxmox web interface", "bold", "#27ae60"),
+            ("   Go to: https://YOUR_PROXMOX_IP:8006\n", "normal", "#7f8c8d"),
+            
+            ("2. Navigate to API Tokens", "bold", "#27ae60"),
+            ("   Click: Datacenter -> Permissions -> API Tokens\n", "normal", "#7f8c8d"),
+            
+            ("3. Click 'Add' button", "bold", "#27ae60"),
+            ("   (Top of the API Tokens page)\n", "normal", "#7f8c8d"),
+            
+            ("4. Fill in the form:", "bold", "#27ae60"),
+            ("   • User: root@pam", "normal", "#7f8c8d"),
+            ("   • Token ID: dashboard (or any name you want)", "normal", "#7f8c8d"),
+            ("   • Privilege Separation: UNCHECK THIS BOX", "normal", "#e74c3c"),
+            ("   • Expire: Never", "normal", "#7f8c8d"),
+            ("   • Comment: Dashboard access (optional)\n", "normal", "#7f8c8d"),
+            
+            ("5. Click 'Add' button", "bold", "#27ae60"),
+            ("   The token will be created.\n", "normal", "#7f8c8d"),
+            
+            ("6. COPY THE SECRET!", "bold", "#e74c3c"),
+            ("   A popup or message will show the token secret.", "normal", "#e74c3c"),
+            ("   COPY IT IMMEDIATELY - it's shown only once!\n", "normal", "#e74c3c"),
+            
+            ("Alternative: Command Line (Recommended)", "bold", "#2c3e50"),
+            ("If you have SSH access, this is more reliable:\n", "normal", "#34495e"),
+            
+            ("ssh root@YOUR_PROXMOX_IP", "normal", "#16a085"),
+            ("pveum user token add root@pam dashboard --privsep 0\n", "normal", "#16a085"),
+            
+            ("The secret will appear in the output immediately.\n", "normal", "#7f8c8d"),
+            
+            ("What You'll Need for Next Step:", "bold", "#2c3e50"),
+            ("• Token ID: root@pam!dashboard", "normal", "#34495e"),
+            ("• Token Secret: (the long string you copied)\n", "normal", "#34495e"),
+        ]
+        
+        for text, weight, color in instructions:
+            label = tk.Label(
+                scrollable_frame,
+                text=text,
+                font=("Arial", 10, weight),
+                bg="white",
+                fg=color,
+                justify=tk.LEFT,
+                wraplength=620,
+                anchor="w"
+            )
+            label.pack(anchor="w", pady=2)
+        
+        canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+        
+        # Button frame
+        btn_frame = tk.Frame(self, bg="white")
+        btn_frame.pack(fill=tk.X, padx=20, pady=20)
+        
+        tk.Button(
+            btn_frame,
+            text="I've Created the Token - Continue",
+            command=self.on_continue,
+            bg="#27ae60",
+            fg="white",
+            font=("Arial", 12, "bold"),
+            width=30,
+            height=2,
+            cursor="hand2"
+        ).pack(pady=5)
+        
+        tk.Button(
+            btn_frame,
+            text="Cancel",
+            command=self.on_close,
+            bg="#95a5a6",
+            fg="white",
+            font=("Arial", 10),
+            width=30,
+            cursor="hand2"
+        ).pack(pady=5)
+    
+    def on_continue(self):
+        self.destroy()
+    
+    def on_close(self):
+        self.destroy()
+
+
+class CredentialsDialog(tk.Toplevel):
+    """Dialog for entering API token credentials - Token Authentication Only"""
+    
+    def __init__(self, parent, is_setup=False):
+        super().__init__(parent)
+        self.title("Setup Credentials" if is_setup else "Enter Credentials")
+        self.geometry("500x470")
+        self.resizable(True, True)
+        self.result = None
+        self.is_setup = is_setup
+        
+        self.update_idletasks()
+        x = (self.winfo_screenwidth() // 2) - 250
+        y = (self.winfo_screenheight() // 2) - 235
+        self.geometry(f"500x470+{x}+{y}")
+        
+        self.create_widgets()
+        self.protocol("WM_DELETE_WINDOW", self.on_cancel)
+        self.grab_set()
+    
+    def create_widgets(self):
+        # Title
+        title_frame = tk.Frame(self, bg="#2c3e50", height=60)
+        title_frame.pack(fill=tk.X)
+        title_frame.pack_propagate(False)
+        
+        title_label = tk.Label(
+            title_frame,
+            text="Proxmox Dashboard Setup" if self.is_setup else "Unlock Dashboard",
+            font=("Arial", 16, "bold"),
+            bg="#2c3e50",
+            fg="white"
+        )
+        title_label.pack(pady=15)
+        
+        # Form frame
+        form_frame = tk.Frame(self, bg="white")
+        form_frame.pack(fill=tk.BOTH, expand=True, padx=20, pady=20)
+        
+        # Host
+        tk.Label(form_frame, text="Proxmox Host:", font=("Arial", 10), bg="white").grid(row=0, column=0, sticky="w", pady=5)
+        self.host_entry = tk.Entry(form_frame, font=("Arial", 10), width=35)
+        self.host_entry.grid(row=0, column=1, pady=5, columnspan=2)
+        self.host_entry.insert(0, "pve")
+        
+        # Auth type label
+        tk.Label(form_frame, text="Authentication: API Token", font=("Arial", 10, "bold"), bg="white", fg="#27ae60").grid(row=1, column=0, sticky="w", pady=10, columnspan=3)
+        
+        # Token fields
+        tk.Label(form_frame, text="Token ID:", font=("Arial", 10), bg="white").grid(row=2, column=0, sticky="w", pady=5)
+        self.token_id_entry = tk.Entry(form_frame, font=("Arial", 10), width=35)
+        self.token_id_entry.grid(row=2, column=1, pady=5, columnspan=2)
+        self.token_id_entry.insert(0, "root@pam!")
+        
+        tk.Label(form_frame, text="Token Secret:", font=("Arial", 10), bg="white").grid(row=3, column=0, sticky="w", pady=5)
+        self.token_secret_entry = tk.Entry(form_frame, font=("Arial", 10), width=35, show="*")
+        self.token_secret_entry.grid(row=3, column=1, pady=5, columnspan=2)
+        
+        tk.Label(
+            form_frame,
+            text="Create token: Datacenter -> Permissions -> API Tokens -> Add",
+            font=("Arial", 8),
+            bg="white",
+            fg="#7f8c8d"
+        ).grid(row=4, column=0, columnspan=3, sticky="w", pady=2)
+        
+        # Master password
+        tk.Label(form_frame, text="Master Password:", font=("Arial", 10, "bold"), bg="white").grid(row=5, column=0, sticky="w", pady=(15, 5))
+        self.master_entry = tk.Entry(form_frame, font=("Arial", 10), width=35, show="*")
+        self.master_entry.grid(row=5, column=1, pady=(15, 5), columnspan=2)
+        
+        tk.Label(
+            form_frame,
+            text="(Used to encrypt credentials locally)",
+            font=("Arial", 8),
+            bg="white",
+            fg="#7f8c8d"
+        ).grid(row=6, column=1, sticky="w", columnspan=2)
+        
+        if self.is_setup:
+            tk.Label(form_frame, text="Confirm Master:", font=("Arial", 10), bg="white").grid(row=7, column=0, sticky="w", pady=5)
+            self.master_confirm = tk.Entry(form_frame, font=("Arial", 10), width=35, show="*")
+            self.master_confirm.grid(row=7, column=1, pady=5, columnspan=2)
+        
+        # Buttons
+        btn_frame = tk.Frame(form_frame, bg="white")
+        btn_frame.grid(row=8, column=0, columnspan=3, pady=15)
+        
+        tk.Button(
+            btn_frame,
+            text="Save & Connect" if self.is_setup else "Connect",
+            command=self.on_ok,
+            bg="#27ae60",
+            fg="white",
+            font=("Arial", 10, "bold"),
+            width=15,
+            cursor="hand2"
+        ).pack(side=tk.LEFT, padx=5)
+        
+        tk.Button(
+            btn_frame,
+            text="Cancel",
+            command=self.on_cancel,
+            bg="#95a5a6",
+            fg="white",
+            font=("Arial", 10),
+            width=15,
+            cursor="hand2"
+        ).pack(side=tk.LEFT, padx=5)
+    
+    def on_ok(self):
+        host = self.host_entry.get().strip()
+        master = self.master_entry.get()
+        
+        if not host or not master:
+            messagebox.showerror("Error", "Host and master password are required!", parent=self)
+            return
+        
+        if self.is_setup:
+            confirm = self.master_confirm.get()
+            if master != confirm:
+                messagebox.showerror("Error", "Master passwords don't match!", parent=self)
+                return
+        
+        token_id = self.token_id_entry.get().strip()
+        token_secret = self.token_secret_entry.get()
+        
+        if not token_id or not token_secret:
+            messagebox.showerror("Error", "Token ID and Token Secret are required!", parent=self)
+            return
+        
+        # Always return token authentication
+        self.result = ('token', host, None, None, token_id, token_secret, master)
+        
+        self.destroy()
+    
+    def on_cancel(self):
+        self.result = None
+        self.destroy()
+
+
+class ProxmoxDashboard:
+    """Main Dashboard Application - Enhanced with Full Metrics and Node Temperature Monitoring"""
+    
+    def __init__(self, root):
+        self.root = root
+        self.root.title("Proxmox Dashboard - Live Feed")
+        self.root.geometry("1600x900")
+        self.root.resizable(True, True)
+        
+        self.root.update_idletasks()
+        x = (self.root.winfo_screenwidth() // 2) - 800
+        y = (self.root.winfo_screenheight() // 2) - 450
+        self.root.geometry(f"1600x900+{x}+{y}")
+        
+        self.api = None
+        self.auto_refresh = True
+        self.refresh_thread = None
+        self.health_check_thread = None
+        self.vm_data = []
+        self.filtered_vm_data = []
+        self.search_query = ""
+        self.is_loading = False
+        self.task_queue = queue.Queue()
+        self.connection_healthy = False
+        self.node_count = 0
+        
+        # Node temperature storage
+        self.node_temp_labels = {}
+        self.node_temp_api_available = {}
+        self.node_addresses = {}  # Maps node names to IP addresses for temperature API
+        self.node_temps_full_data = {}  # Store full temperature data for details view
+        
+        # Safety flags
+        self.tooltips_enabled = False 
+        self.window_ready = False  # Flag to indicate window is fully created
+        
+        self.setup_styles()
+        self.create_widgets()
+        
+        # Mark window as ready
+        self.window_ready = True
+        logger.info("Dashboard window created successfully")
+        
+        # Add cleanup handler for window close
+        self.root.protocol("WM_DELETE_WINDOW", self.on_closing)
+        
+        if not self.authenticate():
+            self.root.destroy()
+            return
+        
+        # Start task processor FIRST (before any async operations)
+        self.start_task_processor()
+        
+        # Delay temperature check to ensure window is fully initialized
+        self.root.after(2000, self.check_temperature_api_status)
+        
+        # Start auto-refresh and health check
+        self.start_auto_refresh()
+        self.start_health_check()
+    
+    def setup_styles(self):
+        style = ttk.Style()
+        style.theme_use('clam')
+        
+        style.configure("Treeview",
+                       background="#ecf0f1",
+                       foreground="black",
+                       rowheight=30,
+                       fieldbackground="#ecf0f1",
+                       font=("Arial", 9))
+        style.map('Treeview', background=[('selected', '#3498db')])
+        
+        style.configure("Treeview.Heading",
+                       background="#34495e",
+                       foreground="white",
+                       font=("Arial", 9, "bold"))
+    
+    def create_led_indicator(self, parent, color="green", size=12):
+        """Create a simple LED indicator using Canvas"""
+        canvas = tk.Canvas(
+            parent,
+            width=size,
+            height=size,
+            bg="#2c3e50",
+            highlightthickness=0
+        )
+        padding = 2
+        canvas.led = canvas.create_oval(
+            padding, padding,
+            size - padding, size - padding,
+            fill=color,
+            outline=color
+        )
+        return canvas
+    
+    def update_led_color(self, canvas, color):
+        """Update LED indicator color"""
+        canvas.itemconfig(canvas.led, fill=color, outline=color)
+    
+    def create_status_badge(self, parent, text, status):
+        """Create a colored status badge"""
+        colors = {
+            "running": {"bg": "#27ae60", "fg": "white"},
+            "stopped": {"bg": "#e74c3c", "fg": "white"},
+            "paused": {"bg": "#f39c12", "fg": "white"},
+            "unknown": {"bg": "#95a5a6", "fg": "white"}
         }
         
-        $request->header('Authorization' => $auth_header);
+        style = colors.get(status.lower(), colors["unknown"])
         
-        my $response = $self->{ua}->request($request);
+        label = tk.Label(
+            parent,
+            text=text.upper(),
+            bg=style["bg"],
+            fg=style["fg"],
+            font=("Arial", 8, "bold"),
+            padx=8,
+            pady=3,
+            relief=tk.FLAT
+        )
+        return label
+    
+    def get_temp_color(self, temp):
+        """Get color for temperature"""
+        if temp is None:
+            return "#95a5a6"  # Gray for N/A
+        elif temp < 50:
+            return "#27ae60"  # Green - Cool
+        elif temp < 70:
+            return "#3498db"  # Blue - Normal
+        elif temp < 85:
+            return "#f39c12"  # Orange - Warm
+        else:
+            return "#e74c3c"  # Red - Hot
+    
+    def check_temperature_api_status(self):
+        """
+        Check which nodes have temperature API available via HTTPS.
+        This runs in a background thread to avoid blocking the UI.
+        Connects to port 8898 (HTTPS via stunnel).
+        """
+        if not self.api:
+            return
         
-        if ($response->is_success) {
-            return $response;
-        } elsif ($response->code == 401) {
-            die "Authentication failed: " . $response->status_line;
-        } elsif ($response->code >= 500 && $attempt < $retries) {
-            Time::HiRes::sleep($RETRY_DELAY * (2 ** ($attempt - 1)));
-            next;
-        } else {
-            die "API request failed: " . $response->status_line;
-        }
-    }
-    
-    die "API request failed after $retries attempts";
-}
-
-sub get {
-    my ($self, $path) = @_;
-    my $response = $self->api_request('GET', $path);
-    my $json = $response->decoded_content;
-    my $data = JSON->new->decode($json);
-    return $data->{data} // $data;
-}
-
-sub post {
-    my ($self, $path, $data) = @_;
-    return $self->api_request('POST', $path, $data);
-}
-
-################################################################################
-# Token Creation Guide Dialog
-################################################################################
-package TokenCreationGuide;
-
-sub new {
-    my ($class, $parent) = @_;
-    
-    my $self = {
-        parent => $parent,
-    };
-    
-    bless $self, $class;
-    
-    $self->{dialog} = $parent->Toplevel();
-    $self->{dialog}->title("Create Proxmox API Token");
-    $self->{dialog}->geometry("700x650");
-    
-    # Center window
-    $self->{dialog}->update();
-    my $x = int(($self->{dialog}->screenwidth - 700) / 2);
-    my $y = int(($self->{dialog}->screenheight - 650) / 2);
-    $self->{dialog}->geometry("700x650+$x+$y");
-    
-    $self->create_widgets();
-    
-    # Make modal
-    $self->{dialog}->grab();
-    
-    return $self;
-}
-
-sub create_widgets {
-    my ($self) = @_;
-    
-    my $d = $self->{dialog};
-    
-    # Title
-    my $title_frame = $d->Frame(
-        -background => '#3498db',
-        -height => 60
-    )->pack(-fill => 'x');
-    
-    $title_frame->Label(
-        -text => "Step 1: Create API Token in Proxmox",
-        -font => ['Arial', 16, 'bold'],
-        -background => '#3498db',
-        -foreground => 'white'
-    )->pack(-pady => 15);
-    
-    # Scrolled text area
-    my $text_frame = $d->Frame()->pack(-fill => 'both', -expand => 1, -padx => 20, -pady => 20);
-    
-    my $text = $text_frame->Scrolled('ROText',
-        -scrollbars => 'e',
-        -wrap => 'word',
-        -font => ['Arial', 10],
-        -background => 'white',
-        -relief => 'sunken',
-        -borderwidth => 2
-    )->pack(-fill => 'both', -expand => 1);
-    
-    # Instructions
-    my $instructions = <<'EOF';
-What is an API Token?
-
-An API token is a secure way to connect to Proxmox without using your password.
-
-How to Create Token:
-
-1. Open Proxmox web interface
-   Go to: https://YOUR_PROXMOX_IP:8006
-
-2. Navigate to API Tokens
-   Click: Datacenter -> Permissions -> API Tokens
-
-3. Click 'Add' button
-   (Top of the API Tokens page)
-
-4. Fill in the form:
-   - User: root@pam
-   - Token ID: dashboard (or any name you want)
-   - Privilege Separation: UNCHECK THIS BOX [WARNING!]
-   - Expire: Never
-   - Comment: Dashboard access (optional)
-
-5. Click 'Add' button
-   The token will be created.
-
-6. COPY THE SECRET! [IMPORTANT!]
-   A popup or message will show the token secret.
-   COPY IT IMMEDIATELY - it's shown only once!
-
-Alternative: Command Line (Recommended)
-
-If you have SSH access, this is more reliable:
-
-  ssh root@YOUR_PROXMOX_IP
-  pveum user token add root@pam dashboard --privsep 0
-
-The secret will appear in the output immediately.
-
-What You'll Need for Next Step:
-
-- Token ID: root@pam!dashboard
-- Token Secret: (the long string you copied)
-EOF
-    
-    $text->insert('end', $instructions);
-    $text->configure(-state => 'disabled');
-    
-    # Buttons
-    my $btn_frame = $d->Frame()->pack(-fill => 'x', -padx => 20, -pady => 20);
-    
-    $btn_frame->Button(
-        -text => "I've Created the Token - Continue",
-        -command => sub { $self->on_continue() },
-        -background => '#27ae60',
-        -foreground => 'white',
-        -font => ['Arial', 12, 'bold'],
-        -width => 30,
-        -height => 2,
-        -cursor => 'hand2'
-    )->pack(-pady => 5);
-    
-    $btn_frame->Button(
-        -text => "Cancel",
-        -command => sub { $self->on_cancel() },
-        -background => '#95a5a6',
-        -foreground => 'white',
-        -font => ['Arial', 10],
-        -width => 30,
-        -cursor => 'hand2'
-    )->pack(-pady => 5);
-}
-
-sub on_continue {
-    my ($self) = @_;
-    $self->{result} = 'continue';
-    $self->{dialog}->destroy();
-}
-
-sub on_cancel {
-    my ($self) = @_;
-    $self->{result} = 'cancel';
-    $self->{dialog}->destroy();
-}
-
-sub show {
-    my ($self) = @_;
-    $self->{dialog}->waitWindow();
-    return $self->{result} // 'cancel';
-}
-
-################################################################################
-# Credentials Dialog
-################################################################################
-package CredentialsDialog;
-
-sub new {
-    my ($class, $parent, $is_setup) = @_;
-    
-    my $self = {
-        parent => $parent,
-        is_setup => $is_setup,
-        result => undef,
-    };
-    
-    bless $self, $class;
-    
-    $self->{dialog} = $parent->Toplevel();
-    $self->{dialog}->title($is_setup ? "Setup Credentials" : "Enter Credentials");
-    $self->{dialog}->geometry("500x470");
-    
-    # Center window
-    $self->{dialog}->update();
-    my $x = int(($self->{dialog}->screenwidth - 500) / 2);
-    my $y = int(($self->{dialog}->screenheight - 470) / 2);
-    $self->{dialog}->geometry("500x470+$x+$y");
-    
-    $self->create_widgets();
-    
-    $self->{dialog}->protocol('WM_DELETE_WINDOW', sub { $self->on_cancel() });
-    $self->{dialog}->grab();
-    
-    return $self;
-}
-
-sub create_widgets {
-    my ($self) = @_;
-    
-    my $d = $self->{dialog};
-    
-    # Title
-    my $title_frame = $d->Frame(
-        -background => '#2c3e50',
-        -height => 60
-    )->pack(-fill => 'x');
-    
-    $title_frame->Label(
-        -text => $self->{is_setup} ? "Proxmox Dashboard Setup" : "Unlock Dashboard",
-        -font => ['Arial', 16, 'bold'],
-        -background => '#2c3e50',
-        -foreground => 'white'
-    )->pack(-pady => 15);
-    
-    # Form
-    my $form_frame = $d->Frame(-background => 'white')->pack(-fill => 'both', -expand => 1, -padx => 20, -pady => 20);
-    
-    # Host
-    $form_frame->Label(-text => "Proxmox Host:", -font => ['Arial', 10], -background => 'white')
-        ->grid(-row => 0, -column => 0, -sticky => 'w', -pady => 5);
-    $self->{host_entry} = $form_frame->Entry(-font => ['Arial', 10], -width => 35)
-        ->grid(-row => 0, -column => 1, -pady => 5, -columnspan => 2);
-    $self->{host_entry}->insert(0, 'pve');
-    
-    # Auth type
-    $form_frame->Label(
-        -text => "Authentication: API Token",
-        -font => ['Arial', 10, 'bold'],
-        -background => 'white',
-        -foreground => '#27ae60'
-    )->grid(-row => 1, -column => 0, -sticky => 'w', -pady => 10, -columnspan => 3);
-    
-    # Token ID
-    $form_frame->Label(-text => "Token ID:", -font => ['Arial', 10], -background => 'white')
-        ->grid(-row => 2, -column => 0, -sticky => 'w', -pady => 5);
-    $self->{token_id_entry} = $form_frame->Entry(-font => ['Arial', 10], -width => 35)
-        ->grid(-row => 2, -column => 1, -pady => 5, -columnspan => 2);
-    $self->{token_id_entry}->insert(0, 'root@pam!');
-    
-    # Token Secret
-    $form_frame->Label(-text => "Token Secret:", -font => ['Arial', 10], -background => 'white')
-        ->grid(-row => 3, -column => 0, -sticky => 'w', -pady => 5);
-    $self->{token_secret_entry} = $form_frame->Entry(-font => ['Arial', 10], -width => 35, -show => '*')
-        ->grid(-row => 3, -column => 1, -pady => 5, -columnspan => 2);
-    
-    # Help text
-    $form_frame->Label(
-        -text => "Create token: Datacenter -> Permissions -> API Tokens -> Add",
-        -font => ['Arial', 8],
-        -background => 'white',
-        -foreground => '#7f8c8d'
-    )->grid(-row => 4, -column => 0, -columnspan => 3, -sticky => 'w', -pady => 2);
-    
-    # Master password
-    $form_frame->Label(-text => "Master Password:", -font => ['Arial', 10, 'bold'], -background => 'white')
-        ->grid(-row => 5, -column => 0, -sticky => 'w', -pady => [15, 5]);
-    $self->{master_entry} = $form_frame->Entry(-font => ['Arial', 10], -width => 35, -show => '*')
-        ->grid(-row => 5, -column => 1, -pady => [15, 5], -columnspan => 2);
-    
-    $form_frame->Label(
-        -text => "(Used to encrypt credentials locally)",
-        -font => ['Arial', 8],
-        -background => 'white',
-        -foreground => '#7f8c8d'
-    )->grid(-row => 6, -column => 1, -sticky => 'w', -columnspan => 2);
-    
-    # Confirm password (setup only)
-    if ($self->{is_setup}) {
-        $form_frame->Label(-text => "Confirm Master:", -font => ['Arial', 10], -background => 'white')
-            ->grid(-row => 7, -column => 0, -sticky => 'w', -pady => 5);
-        $self->{master_confirm} = $form_frame->Entry(-font => ['Arial', 10], -width => 35, -show => '*')
-            ->grid(-row => 7, -column => 1, -pady => 5, -columnspan => 2);
-    }
-    
-    # Buttons
-    my $btn_frame = $form_frame->Frame(-background => 'white')
-        ->grid(-row => 8, -column => 0, -columnspan => 3, -pady => 15);
-    
-    $btn_frame->Button(
-        -text => $self->{is_setup} ? "Save & Connect" : "Connect",
-        -command => sub { $self->on_ok() },
-        -background => '#27ae60',
-        -foreground => 'white',
-        -font => ['Arial', 10, 'bold'],
-        -width => 15,
-        -cursor => 'hand2'
-    )->pack(-side => 'left', -padx => 5);
-    
-    $btn_frame->Button(
-        -text => "Cancel",
-        -command => sub { $self->on_cancel() },
-        -background => '#95a5a6',
-        -foreground => 'white',
-        -font => ['Arial', 10],
-        -width => 15,
-        -cursor => 'hand2'
-    )->pack(-side => 'left', -padx => 5);
-}
-
-sub on_ok {
-    my ($self) = @_;
-    
-    my $host = $self->{host_entry}->get();
-    $host =~ s/^\s+|\s+$//g;
-    my $master = $self->{master_entry}->get();
-    
-    unless ($host && $master) {
-        $self->{parent}->messageBox(
-            -title => "Error",
-            -message => "Host and master password are required!",
-            -type => 'OK',
-            -icon => 'error'
-        );
-        return;
-    }
-    
-    if ($self->{is_setup}) {
-        my $confirm = $self->{master_confirm}->get();
-        if ($master ne $confirm) {
-            $self->{parent}->messageBox(
-                -title => "Error",
-                -message => "Master passwords don't match!",
-                -type => 'OK',
-                -icon => 'error'
-            );
-            return;
-        }
-    }
-    
-    my $token_id = $self->{token_id_entry}->get();
-    $token_id =~ s/^\s+|\s+$//g;
-    my $token_secret = $self->{token_secret_entry}->get();
-    
-    unless ($token_id && $token_secret) {
-        $self->{parent}->messageBox(
-            -title => "Error",
-            -message => "Token ID and Token Secret are required!",
-            -type => 'OK',
-            -icon => 'error'
-        );
-        return;
-    }
-    
-    $self->{result} = {
-        auth_type => 'token',
-        host => $host,
-        token_id => $token_id,
-        token_secret => $token_secret,
-        master => $master
-    };
-    
-    $self->{dialog}->destroy();
-}
-
-sub on_cancel {
-    my ($self) = @_;
-    $self->{result} = undef;
-    $self->{dialog}->destroy();
-}
-
-sub show {
-    my ($self) = @_;
-    $self->{dialog}->waitWindow();
-    return $self->{result};
-}
-
-################################################################################
-# Temperature Details Window
-################################################################################
-package TemperatureDetailsWindow;
-
-sub new {
-    my ($class, $parent, $node_name, $node_temps_data, $node_addresses) = @_;
-    
-    my $self = {
-        parent => $parent,
-        node_name => $node_name,
-        node_temps_data => $node_temps_data,
-        node_addresses => $node_addresses,
-    };
-    
-    bless $self, $class;
-    
-    $self->{window} = $parent->Toplevel();
-    $self->{window}->title("Temperature Details - " . ($node_name || 'All Nodes'));
-    $self->{window}->geometry("800x600");
-    
-    # Center window
-    $self->{window}->update();
-    my $x = int(($self->{window}->screenwidth - 800) / 2);
-    my $y = int(($self->{window}->screenheight - 600) / 2);
-    $self->{window}->geometry("800x600+$x+$y");
-    
-    $self->create_widgets();
-    
-    return $self;
-}
-
-sub create_widgets {
-    my ($self) = @_;
-    
-    my $w = $self->{window};
-    
-    # Title
-    my $title_frame = $w->Frame(-background => '#2c3e50', -height => 50)->pack(-fill => 'x');
-    
-    $title_frame->Label(
-        -text => "Temperature Sensors - " . ($self->{node_name} || 'All Nodes'),
-        -font => ['Arial', 14, 'bold'],
-        -background => '#2c3e50',
-        -foreground => 'white'
-    )->pack(-pady => 12);
-    
-    # Legend
-    my $legend_frame = $w->Frame(-background => '#ecf0f1', -relief => 'ridge', -borderwidth => 1)
-        ->pack(-fill => 'x', -padx => 10, -pady => 5);
-    
-    $legend_frame->Label(
-        -text => "Temperature Key:",
-        -font => ['Arial', 9, 'bold'],
-        -background => '#ecf0f1',
-        -foreground => '#2c3e50'
-    )->pack(-side => 'left', -padx => 10, -pady => 5);
-    
-    my @color_key = (
-        ["< 50°C Cool", '#27ae60'],
-        ["50-70°C Normal", '#3498db'],
-        ["70-85°C Warm", '#e67e22'],
-        [">= 85°C Hot", '#e74c3c']
-    );
-    
-    foreach my $item (@color_key) {
-        my ($text, $color) = @$item;
-        my $key_frame = $legend_frame->Frame(-background => '#ecf0f1')->pack(-side => 'left', -padx => 5);
-        
-        $key_frame->Frame(
-            -background => $color,
-            -width => 15,
-            -height => 15,
-            -relief => 'solid',
-            -borderwidth => 1
-        )->pack(-side => 'left', -padx => [0, 3]);
-        
-        $key_frame->Label(
-            -text => $text,
-            -font => ['Arial', 8],
-            -background => '#ecf0f1',
-            -foreground => '#2c3e50'
-        )->pack(-side => 'left');
-    }
-    
-    # Scrolled content
-    my $scroll_frame = $w->Frame()->pack(-fill => 'both', -expand => 1);
-    
-    my $canvas = $scroll_frame->Canvas(-background => 'white')->pack(-side => 'left', -fill => 'both', -expand => 1);
-    my $scrollbar = $scroll_frame->Scrollbar(-orient => 'vertical', -command => ['yview', $canvas])
-        ->pack(-side => 'right', -fill => 'y');
-    
-    $canvas->configure(-yscrollcommand => ['set', $scrollbar]);
-    
-    my $content_frame = $canvas->Frame(-background => 'white');
-    $canvas->create('window', 0, 0, -anchor => 'nw', -window => $content_frame);
-    
-    # Populate content
-    $self->populate_sensors($content_frame);
-    
-    # Update scroll region
-    $content_frame->update();
-    $canvas->configure(-scrollregion => [$canvas->bbox('all')]);
-    
-    # Close button
-    my $btn_frame = $w->Frame()->pack(-fill => 'x', -pady => 10);
-    
-    $btn_frame->Button(
-        -text => "Close",
-        -command => sub { $w->destroy() },
-        -background => '#95a5a6',
-        -foreground => 'white',
-        -font => ['Arial', 10, 'bold'],
-        -width => 15,
-        -cursor => 'hand2'
-    )->pack();
-}
-
-sub populate_sensors {
-    my ($self, $parent) = @_;
-    
-    my $nodes_to_show = {};
-    
-    if ($self->{node_name}) {
-        if ($self->{node_temps_data}{$self->{node_name}}) {
-            $nodes_to_show->{$self->{node_name}} = $self->{node_temps_data}{$self->{node_name}};
-        }
-    } else {
-        $nodes_to_show = $self->{node_temps_data};
-    }
-    
-    foreach my $node_name (sort keys %$nodes_to_show) {
-        my $temp_info = $nodes_to_show->{$node_name};
-        
-        # Node frame
-        my $node_frame = $parent->Frame(
-            -background => '#ecf0f1',
-            -relief => 'raised',
-            -borderwidth => 2
-        )->pack(-fill => 'x', -padx => 10, -pady => 10);
-        
-        # Header
-        my $header_frame = $node_frame->Frame(-background => '#34495e')->pack(-fill => 'x');
-        
-        $header_frame->Label(
-            -text => "Node: $node_name",
-            -font => ['Arial', 12, 'bold'],
-            -background => '#34495e',
-            -foreground => 'white',
-            -anchor => 'w'
-        )->pack(-side => 'left', -padx => 10, -pady => 8);
-        
-        my $node_ip = $self->{node_addresses}{$node_name} || 'unknown';
-        $header_frame->Label(
-            -text => "IP: $node_ip:8898 (HTTPS)",
-            -font => ['Arial', 9],
-            -background => '#34495e',
-            -foreground => '#bdc3c7',
-            -anchor => 'e'
-        )->pack(-side => 'right', -padx => 10, -pady => 8);
-        
-        # Sensors
-        my $sensors = $temp_info->{sensors} || [];
-        my $status = $temp_info->{status};
-        
-        if ($status ne 'ok' || !@$sensors) {
-            $node_frame->Label(
-                -text => $status ne 'ok' ? "Status: $status" : "No sensors found",
-                -font => ['Arial', 10],
-                -background => '#ecf0f1',
-                -foreground => '#e74c3c'
-            )->pack(-padx => 10, -pady => 10);
-            next;
-        }
-        
-        # Group sensors by type
-        my %sensor_groups = (
-            cpu_package => [],
-            cpu_core => [],
-            thermal_zone => [],
-            motherboard => [],
-            nvme => [],
-            other => []
-        );
-        
-        foreach my $sensor (@$sensors) {
-            my $type = $sensor->{type} || 'other';
-            push @{$sensor_groups{$type}}, $sensor;
-        }
-        
-        # Display order
-        my @display_order = qw(cpu_package cpu_core thermal_zone motherboard nvme other);
-        my %type_names = (
-            cpu_package => 'CPU Package',
-            cpu_core => 'CPU Cores',
-            thermal_zone => 'Thermal Zones',
-            motherboard => 'Motherboard',
-            nvme => 'NVMe Drives',
-            other => 'Other Sensors'
-        );
-        
-        foreach my $sensor_type (@display_order) {
-            my $group_sensors = $sensor_groups{$sensor_type};
-            next unless @$group_sensors;
-            
-            # Type header
-            my $type_frame = $node_frame->Frame(-background => '#ecf0f1')
-                ->pack(-fill => 'x', -padx => 10, -pady => [10, 5]);
-            
-            $type_frame->Label(
-                -text => $type_names{$sensor_type},
-                -font => ['Arial', 10, 'bold'],
-                -background => '#ecf0f1',
-                -foreground => '#2c3e50',
-                -anchor => 'w'
-            )->pack(-anchor => 'w');
-            
-            # Sensors
-            foreach my $sensor (@$group_sensors) {
-                my $temp = $sensor->{temperature};
-                my $label_text = $sensor->{label} || 'Unknown';
-                my $chip = $sensor->{chip} || 'N/A';
+        def check_async():
+            try:
+                nodes = self.api.get('/nodes')
+                logger.info(f"Checking temperature API on {len(nodes)} node(s)")
                 
-                my $sensor_frame = $node_frame->Frame(-background => 'white')
-                    ->pack(-fill => 'x', -padx => 20, -pady => 2);
+                # For single-node setups, use the API host
+                # For clusters, try to get node IPs from /cluster/status
+                try:
+                    cluster_status = self.api.get('/cluster/status')
+                    for item in cluster_status:
+                        if item.get('type') == 'node' and item.get('ip'):
+                            self.node_addresses[item['name']] = item['ip']
+                            logger.debug(f"Node {item['name']} IP from cluster: {item['ip']}")
+                except Exception:
+                    logger.debug("Single-node setup or cluster API unavailable")
+                    pass  # Single-node setup or cluster API unavailable
                 
-                $sensor_frame->Label(
-                    -text => "$label_text:",
-                    -font => ['Arial', 9],
-                    -background => 'white',
-                    -anchor => 'w',
-                    -width => 30
-                )->pack(-side => 'left');
+                # Default any missing nodes to API host
+                for node in nodes:
+                    node_name = node['node']
+                    if node_name not in self.node_addresses:
+                        self.node_addresses[node_name] = self.api.host
+                        logger.debug(f"Node {node_name} using default host: {self.api.host}")
                 
-                my $temp_color = $self->get_temp_color($temp);
-                $sensor_frame->Label(
-                    -text => "${temp}°C",
-                    -font => ['Arial', 9, 'bold'],
-                    -background => 'white',
-                    -foreground => $temp_color,
-                    -width => 10
-                )->pack(-side => 'left');
+                # Check all nodes in parallel using ThreadPoolExecutor
+                from concurrent.futures import ThreadPoolExecutor, as_completed
                 
-                $sensor_frame->Label(
-                    -text => "($chip)",
-                    -font => ['Arial', 8],
-                    -background => 'white',
-                    -foreground => '#7f8c8d'
-                )->pack(-side => 'left', -padx => 5);
-            }
-        }
-    }
-}
-
-sub get_temp_color {
-    my ($self, $temp) = @_;
-    return '#95a5a6' unless defined $temp;
-    return '#27ae60' if $temp < 50;
-    return '#3498db' if $temp < 70;
-    return '#f39c12' if $temp < 85;
-    return '#e74c3c';
-}
-
-sub show {
-    my ($self) = @_;
-    $self->{window}->waitWindow();
-}
-
-################################################################################
-# Main Dashboard Application
-################################################################################
-package ProxmoxDashboard;
-
-sub new {
-    my ($class) = @_;
-    
-    my $self = {
-        api => undef,
-        auto_refresh => 1,
-        vm_data => [],
-        filtered_vm_data => [],
-        is_loading => 0,
-        is_closing => 0,
-        connection_healthy => 0,
-        node_count => 0,
-        refresh_interval => $REFRESH_INTERVAL,
-        node_temp_api_available => {},
-        node_addresses => {},
-        node_temps_full_data => {},
-        refresh_thread => undef,
-        health_thread => undef,
-        active_thread => undef,
-    };
-    
-    bless $self, $class;
-    
-    # Create main window
-    $self->{mw} = MainWindow->new;
-    $self->{mw}->title("Proxmox VM/CT Dashboard - Live Feed");
-    $self->{mw}->geometry("1600x900");
-    
-    # Center window
-    $self->{mw}->update;
-    my $x = int(($self->{mw}->screenwidth - 1600) / 2);
-    my $y = int(($self->{mw}->screenheight - 900) / 2);
-    $self->{mw}->geometry("1600x900+$x+$y");
-    
-    $self->create_widgets();
-    
-    # Handle window close
-    $self->{mw}->protocol('WM_DELETE_WINDOW', sub { $self->on_closing() });
-    
-    # Authenticate
-    unless ($self->authenticate()) {
-        $self->{mw}->destroy();
-        return undef;
-    }
-    
-    # Start auto-refresh
-    $self->start_auto_refresh();
-    
-    # Start health check
-    $self->start_health_check();
-    
-    # Check temperature API status
-    $self->{mw}->after(2000, sub { $self->check_temperature_api_status() });
-    
-    return $self;
-}
-
-sub create_widgets {
-    my ($self) = @_;
-    
-    # Top frame
-    my $top_frame = $self->{mw}->Frame(
-        -background => '#2c3e50',
-        -height => 140
-    )->pack(-fill => 'x');
-    
-    # Title
-    $top_frame->Label(
-        -text => "Proxmox VM/CT Dashboard",
-        -font => ['Arial', 18, 'bold'],
-        -background => '#2c3e50',
-        -foreground => 'white'
-    )->pack(-side => 'left', -padx => 20, -pady => 50);
-    
-    # Status frame (right side)
-    my $status_frame = $top_frame->Frame(-background => '#2c3e50')
-        ->pack(-side => 'right', -padx => 20, -pady => 10);
-    
-    # Connection status
-    my $conn_frame = $status_frame->Frame(-background => '#2c3e50')
-        ->grid(-row => 0, -column => 0, -sticky => 'w', -padx => 5);
-    
-    $self->{connection_label} = $conn_frame->Label(
-        -text => "Connected",
-        -font => ['Arial', 10, 'bold'],
-        -background => '#2c3e50',
-        -foreground => '#27ae60'
-    )->pack(-side => 'left');
-    
-    # Live indicator
-    my $live_frame = $status_frame->Frame(-background => '#2c3e50')
-        ->grid(-row => 0, -column => 1, -sticky => 'w', -padx => 15);
-    
-    $self->{live_indicator} = $live_frame->Label(
-        -text => "LIVE",
-        -font => ['Arial', 10, 'bold'],
-        -background => '#2c3e50',
-        -foreground => '#27ae60'
-    )->pack(-side => 'left');
-    
-    # SSL status
-    my $ssl_frame = $status_frame->Frame(-background => '#2c3e50')
-        ->grid(-row => 1, -column => 0, -sticky => 'w', -padx => 5);
-    
-    $self->{ssl_label} = $ssl_frame->Label(
-        -text => "SSL: Checking...",
-        -font => ['Arial', 10],
-        -background => '#2c3e50',
-        -foreground => 'white'
-    )->pack();
-    
-    # Node count
-    my $nodes_frame = $status_frame->Frame(-background => '#2c3e50')
-        ->grid(-row => 1, -column => 1, -sticky => 'w', -padx => 15);
-    
-    $self->{node_label} = $nodes_frame->Label(
-        -text => "Nodes: 0",
-        -font => ['Arial', 10],
-        -background => '#2c3e50',
-        -foreground => 'white'
-    )->pack();
-    
-    # Last update
-    my $update_frame = $status_frame->Frame(-background => '#2c3e50')
-        ->grid(-row => 2, -column => 0, -columnspan => 2, -sticky => 'w', -padx => 5);
-    
-    $self->{last_update_label} = $update_frame->Label(
-        -text => "Updated: --",
-        -font => ['Arial', 9],
-        -background => '#2c3e50',
-        -foreground => '#bdc3c7'
-    )->pack();
-    
-    # VM Summary (center)
-    my $summary_container = $top_frame->Frame(-background => '#2c3e50')
-        ->pack(-side => 'left', -fill => 'both', -expand => 1);
-    
-    my $summary_frame = $summary_container->Frame(-background => '#2c3e50')
-        ->place(-relx => 0.5, -rely => 0.5, -anchor => 'center');
-    
-    $summary_frame->Label(
-        -text => "VMs/CTs:",
-        -font => ['Arial', 12, 'bold'],
-        -background => '#2c3e50',
-        -foreground => '#ecf0f1'
-    )->pack(-pady => [0, 5]);
-    
-    my $running_frame = $summary_frame->Frame(-background => '#2c3e50')->pack();
-    $self->{running_count_label} = $running_frame->Label(
-        -text => "Running: 0",
-        -font => ['Arial', 10],
-        -background => '#2c3e50',
-        -foreground => '#27ae60'
-    )->pack();
-    
-    my $stopped_frame = $summary_frame->Frame(-background => '#2c3e50')->pack();
-    $self->{stopped_count_label} = $stopped_frame->Label(
-        -text => "Stopped: 0",
-        -font => ['Arial', 10],
-        -background => '#2c3e50',
-        -foreground => '#e74c3c'
-    )->pack();
-    
-    # Temperature frame
-    my $temp_container = $self->{mw}->Frame(
-        -background => '#34495e',
-        -height => 40
-    )->pack(-fill => 'x');
-    
-    $self->{node_temp_frame} = $temp_container->Frame(-background => '#34495e')
-        ->pack(-side => 'left', -padx => 10, -pady => 5, -fill => 'both', -expand => 1);
-    
-    $self->{node_temp_frame}->Label(
-        -text => "Node Temperatures:",
-        -font => ['Arial', 9, 'bold'],
-        -background => '#34495e',
-        -foreground => '#bdc3c7'
-    )->pack(-side => 'left', -padx => [0, 10]);
-    
-    # Details button
-    $temp_container->Button(
-        -text => "[Details]",
-        -command => sub { $self->show_temperature_details(undef) },
-        -background => '#3498db',
-        -foreground => 'white',
-        -font => ['Arial', 9, 'bold'],
-        -cursor => 'hand2',
-        -relief => 'flat'
-    )->pack(-side => 'right', -padx => 10, -pady => 5);
-    
-    # Control panel
-    my $control_frame = $self->{mw}->Frame(
-        -background => '#ecf0f1',
-        -height => 80
-    )->pack(-fill => 'x');
-    
-    my $btn_container = $control_frame->Frame(-background => '#ecf0f1')
-        ->pack(-pady => 15);
-    
-    $self->{start_btn} = $btn_container->Button(
-        -text => "Start",
-        -command => sub { $self->start_selected() },
-        -background => '#27ae60',
-        -foreground => 'white',
-        -font => ['Arial', 11, 'bold'],
-        -width => 12,
-        -height => 2,
-        -cursor => 'hand2'
-    )->pack(-side => 'left', -padx => 5);
-    
-    $self->{stop_btn} = $btn_container->Button(
-        -text => "Stop",
-        -command => sub { $self->stop_selected() },
-        -background => '#e74c3c',
-        -foreground => 'white',
-        -font => ['Arial', 11, 'bold'],
-        -width => 12,
-        -height => 2,
-        -cursor => 'hand2'
-    )->pack(-side => 'left', -padx => 5);
-    
-    $btn_container->Button(
-        -text => "Refresh",
-        -command => sub { $self->refresh_data_async() },
-        -background => '#3498db',
-        -foreground => 'white',
-        -font => ['Arial', 11, 'bold'],
-        -width => 12,
-        -height => 2,
-        -cursor => 'hand2'
-    )->pack(-side => 'left', -padx => 5);
-    
-    $btn_container->Button(
-        -text => "Start All",
-        -command => sub { $self->start_all_stopped() },
-        -background => '#16a085',
-        -foreground => 'white',
-        -font => ['Arial', 11, 'bold'],
-        -width => 12,
-        -height => 2,
-        -cursor => 'hand2'
-    )->pack(-side => 'left', -padx => 5);
-    
-    $btn_container->Button(
-        -text => "Change Credentials",
-        -command => sub { $self->change_credentials() },
-        -background => '#9b59b6',
-        -foreground => 'white',
-        -font => ['Arial', 10, 'bold'],
-        -width => 15,
-        -height => 2,
-        -cursor => 'hand2'
-    )->pack(-side => 'left', -padx => 5);
-    
-    # Live controls
-    my $live_controls = $btn_container->Frame(-background => '#ecf0f1')
-        ->pack(-side => 'left', -padx => 15);
-    
-    $self->{pause_resume_btn} = $live_controls->Button(
-        -text => "Pause Live",
-        -command => sub { $self->toggle_auto_refresh() },
-        -background => '#e67e22',
-        -foreground => 'white',
-        -font => ['Arial', 10, 'bold'],
-        -width => 12,
-        -cursor => 'hand2'
-    )->pack(-side => 'left', -padx => 5);
-    
-    # Search bar
-    my $search_frame = $self->{mw}->Frame(
-        -background => '#ecf0f1',
-        -height => 40
-    )->pack(-fill => 'x');
-    
-    $search_frame->Label(
-        -text => "Search:",
-        -font => ['Arial', 10],
-        -background => '#ecf0f1'
-    )->pack(-side => 'left', -padx => 10);
-    
-    $self->{search_entry} = $search_frame->Entry(
-        -font => ['Arial', 10],
-        -width => 30
-    )->pack(-side => 'left', -padx => 5);
-    
-    $self->{search_entry}->bind('<KeyRelease>', sub { $self->filter_vms() });
-    
-    $search_frame->Label(
-        -text => "Filter by ID, Name, Type, Status, Node",
-        -font => ['Arial', 9],
-        -background => '#ecf0f1',
-        -foreground => '#7f8c8d'
-    )->pack(-side => 'left', -padx => 10);
-    
-    # Table
-    my $table_frame = $self->{mw}->Frame()->pack(-fill => 'both', -expand => 1, -padx => 10, -pady => 10);
-    
-    my @columns = qw(ID Type Status Name Node Cores CPU Memory Disk FreeDisk Free%);
-    
-    $self->{tree} = $table_frame->Scrolled('HList',
-        -scrollbars => 'se',
-        -columns => scalar(@columns),
-        -header => 1,
-        -selectmode => 'single',
-        -background => '#ecf0f1',
-        -font => ['Arial', 9]
-    )->pack(-fill => 'both', -expand => 1);
-    
-    for my $i (0..$#columns) {
-        $self->{tree}->header('create', $i, 
-            -text => $columns[$i],
-            -headerbackground => '#34495e'
-        );
-    }
-    
-    # Status bar
-    my $status_bar = $self->{mw}->Frame(
-        -background => '#34495e',
-        -height => 30
-    )->pack(-fill => 'x');
-    
-    $self->{status_label} = $status_bar->Label(
-        -text => "Ready",
-        -font => ['Arial', 9],
-        -background => '#34495e',
-        -foreground => 'white',
-        -anchor => 'w'
-    )->pack(-side => 'left', -padx => 10, -fill => 'x', -expand => 1);
-}
-
-sub authenticate {
-    my ($self) = @_;
-    
-    if (-f $CREDENTIALS_FILE) {
-        # Existing credentials - ask for master password
-        while (1) {
-            my $dialog = $self->{mw}->DialogBox(
-                -title => "Master Password",
-                -buttons => ["OK", "Cancel"]
-            );
-            
-            $dialog->add('Label', -text => "Enter your master password:")->pack();
-            my $password_entry = $dialog->add('Entry', -show => '*', -width => 30)->pack();
-            $password_entry->focus();
-            
-            # Bind Enter key
-            $password_entry->bind('<Return>', sub { $dialog->{'selected_button'} = 'OK'; });
-            
-            my $answer = $dialog->Show();
-            
-            return 0 if $answer eq "Cancel";
-            
-            my $master_password = $password_entry->get();
-            
-            eval {
-                my $creds = CredentialManager::load_credentials($master_password);
+                def check_node(node_name):
+                    try:
+                        result = self._get_node_temperature_direct(node_name, timeout=1.5)
+                        available = result and result.get('status') == 'ok'
+                        sensor_count = len(result.get('sensors', [])) if result else 0
+                        return node_name, available, sensor_count
+                    except Exception as e:
+                        logger.debug(f"Exception checking {node_name}: {e}")
+                        return node_name, False, 0
                 
-                $self->{api} = ProxmoxAPI->new(
-                    $creds->{host},
-                    $creds->{token_id},
-                    $creds->{token_secret}
-                );
-                
-                $self->{status_label}->configure(-text => "Connected to $creds->{host}");
-                $self->{ssl_label}->configure(-text => "SSL: " . $self->{api}{ssl_status});
-                $self->{connection_healthy} = 1;
-                
-                main::log_message('INFO', "Successfully authenticated to $creds->{host}");
-            };
-            
-            if ($@) {
-                my $error = $@;
-                
-                if ($error =~ /Invalid master password/) {
-                    $self->{mw}->messageBox(
-                        -title => "Error",
-                        -message => "Invalid master password. Please try again.",
-                        -type => 'OK',
-                        -icon => 'error'
-                    );
-                    next;  # Try again
-                } else {
-                    # Authentication failed - ask to delete credentials
-                    my $response = $self->{mw}->messageBox(
-                        -title => "Authentication Failed",
-                        -message => "Failed to authenticate:\n$error\n\nDelete old credentials and set up new ones?",
-                        -type => 'YesNo',
-                        -icon => 'warning'
-                    );
+                with ThreadPoolExecutor(max_workers=min(len(nodes), 5)) as executor:
+                    futures = {executor.submit(check_node, node['node']): node['node'] for node in nodes}
                     
-                    if ($response eq 'Yes') {
-                        unlink $CREDENTIALS_FILE;
-                        main::log_message('INFO', "Deleted invalid credentials file");
-                        last;  # Exit while loop, will go to setup
-                    } else {
-                        return 0;  # User cancelled
-                    }
-                }
-            } else {
-                return 1;  # Success
-            }
-        }
-    }
-    
-    # No credentials - show setup
-    $self->{mw}->messageBox(
-        -title => "Setup Required",
-        -message => "No credentials found.\n\nYou'll need to create an API token in Proxmox first.\n\nThe next screen will show you how.",
-        -type => 'OK',
-        -icon => 'info'
-    );
-    
-    # Show token creation guide
-    my $guide = TokenCreationGuide->new($self->{mw});
-    my $result = $guide->show();
-    
-    return 0 if $result eq 'cancel';
-    
-    # Show credentials dialog
-    my $creds_dialog = CredentialsDialog->new($self->{mw}, 1);
-    my $creds = $creds_dialog->show();
-    
-    return 0 unless $creds;
-    
-    eval {
-        $self->{api} = ProxmoxAPI->new(
-            $creds->{host},
-            $creds->{token_id},
-            $creds->{token_secret}
-        );
-        
-        CredentialManager::save_credentials(
-            $creds->{host},
-            $creds->{master},
-            $creds->{token_id},
-            $creds->{token_secret}
-        );
-        
-        $self->{mw}->messageBox(
-            -title => "Success",
-            -message => "Credentials saved successfully!",
-            -type => 'OK',
-            -icon => 'info'
-        );
-        
-        $self->{status_label}->configure(-text => "Connected to $creds->{host}");
-        $self->{ssl_label}->configure(-text => "SSL: " . $self->{api}{ssl_status});
-        $self->{connection_healthy} = 1;
-        
-        main::log_message('INFO', "Successfully set up connection to $creds->{host}");
-    };
-    
-    if ($@) {
-        $self->{mw}->messageBox(
-            -title => "Error",
-            -message => "Connection failed:\n$@",
-            -type => 'OK',
-            -icon => 'error'
-        );
-        return 0;
-    }
-    
-    return 1;
-}
-
-sub change_credentials {
-    my ($self) = @_;
-    
-    my $response = $self->{mw}->messageBox(
-        -title => "Change Credentials",
-        -message => "This will delete your current credentials and guide you through setting up new ones.\n\nContinue?",
-        -type => 'YesNo',
-        -icon => 'warning'
-    );
-    
-    return unless $response eq 'Yes';
-    
-    # Stop auto-refresh
-    $self->{auto_refresh} = 0;
-    
-    # Delete credentials
-    if (-f $CREDENTIALS_FILE) {
-        unlink $CREDENTIALS_FILE;
-        main::log_message('INFO', "Old credentials file deleted");
-    }
-    
-    # Close API connection
-    $self->{api} = undef;
-    $self->{connection_healthy} = 0;
-    
-    $self->{status_label}->configure(-text => "Not connected - setting up new credentials");
-    $self->{connection_label}->configure(-foreground => '#e74c3c');
-    
-    # Clear temperature data
-    $self->{node_temp_api_available} = {};
-    $self->{node_addresses} = {};
-    $self->{node_temps_full_data} = {};
-    
-    # Show guide
-    $self->{mw}->messageBox(
-        -title => "Setup New Credentials",
-        -message => "You'll need to create a new API token in Proxmox.\n\nThe next screen will show you how.",
-        -type => 'OK',
-        -icon => 'info'
-    );
-    
-    my $guide = TokenCreationGuide->new($self->{mw});
-    my $result = $guide->show();
-    
-    return if $result eq 'cancel';
-    
-    # Show credentials dialog
-    my $creds_dialog = CredentialsDialog->new($self->{mw}, 1);
-    my $creds = $creds_dialog->show();
-    
-    unless ($creds) {
-        $self->{mw}->messageBox(
-            -title => "Cancelled",
-            -message => "Credential change cancelled.\n\nYour old credentials were deleted.\nRestart the dashboard to set up credentials.",
-            -type => 'OK',
-            -icon => 'warning'
-        );
-        $self->{mw}->destroy();
-        return;
-    }
-    
-    eval {
-        $self->{api} = ProxmoxAPI->new(
-            $creds->{host},
-            $creds->{token_id},
-            $creds->{token_secret}
-        );
-        
-        CredentialManager::save_credentials(
-            $creds->{host},
-            $creds->{master},
-            $creds->{token_id},
-            $creds->{token_secret}
-        );
-        
-        $self->{mw}->messageBox(
-            -title => "Success",
-            -message => "New credentials saved successfully!\n\nThe dashboard will now refresh.",
-            -type => 'OK',
-            -icon => 'info'
-        );
-        
-        $self->{status_label}->configure(-text => "Connected to $creds->{host}");
-        $self->{ssl_label}->configure(-text => "SSL: " . $self->{api}{ssl_status});
-        $self->{connection_healthy} = 1;
-        
-        # Re-enable auto-refresh
-        $self->{auto_refresh} = 1;
-        
-        # Refresh
-        $self->refresh_data_async();
-        
-        # Re-check temperature API
-        $self->{mw}->after(1000, sub { $self->check_temperature_api_status() });
-        
-        main::log_message('INFO', "Successfully changed credentials");
-    };
-    
-    if ($@) {
-        $self->{mw}->messageBox(
-            -title => "Error",
-            -message => "Failed to set up new credentials:\n$@\n\nPlease restart the dashboard.",
-            -type => 'OK',
-            -icon => 'error'
-        );
-        $self->{mw}->destroy();
-    }
-}
-
-sub check_temperature_api_status {
-    my ($self) = @_;
-    
-    return unless $self->{api};
-    
-    # Run in background thread
-    my $thread = threads->create(sub {
-        my $nodes = eval { $self->{api}->get('/nodes') };
-        return unless $nodes;
-        
-        foreach my $node (@$nodes) {
-            my $node_name = $node->{node};
-            my $node_ip = $self->{api}{host};
-            
-            $self->{node_addresses}{$node_name} = $node_ip;
-            
-            eval {
-                my $ua = LWP::UserAgent->new(timeout => 2, ssl_opts => { verify_hostname => 0 });
-                my $response = $ua->get("https://$node_ip:8898/health");
-                
-                $self->{node_temp_api_available}{$node_name} = $response->is_success ? 1 : 0;
-            };
-            
-            $self->{node_temp_api_available}{$node_name} = 0 if $@;
-        }
-    });
-    
-    $thread->detach();
-}
-
-sub get_all_node_temperatures {
-    my ($self) = @_;
-    
-    return {} unless $self->{api};
-    
-    my $node_temps = {};
-    
-    my $nodes = eval { $self->{api}->get('/nodes') };
-    return {} unless $nodes;
-    
-    foreach my $node (@$nodes) {
-        my $node_name = $node->{node};
-        my $node_ip = $self->{node_addresses}{$node_name} || $self->{api}{host};
-        
-        eval {
-            my $ua = LWP::UserAgent->new(timeout => 1.5, ssl_opts => { verify_hostname => 0 });
-            my $response = $ua->get("https://$node_ip:8898/temperature");
-            
-            if ($response->is_success) {
-                my $data = JSON->new->decode($response->decoded_content);
-                $node_temps->{$node_name} = $data->{data} || {};
-            } else {
-                $node_temps->{$node_name} = { status => 'error', sensors => [] };
-            }
-        };
-        
-        if ($@) {
-            $node_temps->{$node_name} = { status => 'not_installed', sensors => [] };
-        }
-    }
-    
-    return $node_temps;
-}
-
-sub update_node_temperatures {
-    my ($self) = @_;
-    
-    return unless $self->{api};
-    return if $self->{is_closing};
-    
-    my $thread = threads->create(sub {
-        return $self->get_all_node_temperatures();
-    });
-    
-    # Proper polling callback
-    my $poll;
-    $poll = sub {
-        return if $self->{is_closing} || !Tk::Exists($self->{mw});
-        return unless $thread;
-        
-        if ($thread->is_joinable()) {
-            my $node_temps = $thread->join();
-            $self->update_temp_ui($node_temps) if Tk::Exists($self->{mw});
-        } else {
-            $self->{mw}->after(100, $poll) if Tk::Exists($self->{mw});
-        }
-    };
-    
-    $self->{mw}->after(100, $poll);
-}
-
-sub update_temp_ui {
-    my ($self, $node_temps) = @_;
-    
-    # Store full data
-    $self->{node_temps_full_data} = $node_temps;
-    
-    # Clear existing labels
-    foreach my $widget ($self->{node_temp_frame}->children) {
-        next if ref($widget) =~ /Label/ && $widget->cget(-text) eq "Node Temperatures:";
-        $widget->destroy();
-    }
-    
-    foreach my $node_name (sort keys %$node_temps) {
-        my $temp_info = $node_temps->{$node_name};
-        my $status = $temp_info->{status};
-        
-        if ($status ne 'ok') {
-            my $label = $self->{node_temp_frame}->Label(
-                -text => "$node_name: N/A",
-                -font => ['Arial', 9, 'bold'],
-                -background => '#34495e',
-                -foreground => '#95a5a6'
-            )->pack(-side => 'left', -padx => 8);
-            next;
-        }
-        
-        my $sensors = $temp_info->{sensors} || [];
-        next unless @$sensors;
-        
-        # Find CPU package or first core
-        my $cpu_package;
-        foreach my $sensor (@$sensors) {
-            if ($sensor->{type} eq 'cpu_package') {
-                $cpu_package = $sensor;
-                last;
-            }
-        }
-        
-        unless ($cpu_package) {
-            foreach my $sensor (@$sensors) {
-                if ($sensor->{type} eq 'cpu_core') {
-                    $cpu_package = $sensor;
-                    last;
-                }
-            }
-        }
-        
-        next unless $cpu_package;
-        
-        my $temp = $cpu_package->{temperature};
-        my $temp_color = $self->get_temp_color($temp);
-        
-        my $label = $self->{node_temp_frame}->Label(
-            -text => "$node_name: ${temp}°C",
-            -font => ['Arial', 10, 'bold'],
-            -background => '#34495e',
-            -foreground => $temp_color,
-            -cursor => 'hand2'
-        )->pack(-side => 'left', -padx => 10);
-        
-        $label->bind('<Button-1>', sub { $self->show_temperature_details($node_name) });
-    }
-}
-
-sub get_temp_color {
-    my ($self, $temp) = @_;
-    return '#95a5a6' unless defined $temp;
-    return '#27ae60' if $temp < 50;
-    return '#3498db' if $temp < 70;
-    return '#f39c12' if $temp < 85;
-    return '#e74c3c';
-}
-
-sub show_temperature_details {
-    my ($self, $node_name) = @_;
-    
-    unless (%{$self->{node_temps_full_data}}) {
-        $self->{mw}->messageBox(
-            -title => "Temperature Details",
-            -message => "No temperature data available yet.\nPlease wait for data refresh.",
-            -type => 'OK',
-            -icon => 'info'
-        );
-        return;
-    }
-    
-    my $details_window = TemperatureDetailsWindow->new(
-        $self->{mw},
-        $node_name,
-        $self->{node_temps_full_data},
-        $self->{node_addresses}
-    );
-}
-
-sub refresh_data_async {
-    my ($self) = @_;
-    
-    return if $self->{is_loading};
-    return if $self->{is_closing};
-    return unless $self->{api};
-    
-    $self->{is_loading} = 1;
-    $self->{status_label}->configure(-text => "[Loading] Fetching data from Proxmox...");
-    $self->{mw}->configure(-cursor => 'watch');
-    
-    # Fetch data in background
-    my $thread = threads->create(sub {
-        my @vm_data;
-        
-        eval {
-            my $nodes = $self->{api}->get('/nodes');
-            $self->{node_count} = scalar(@$nodes);
-            
-            foreach my $node (@$nodes) {
-                my $n = $node->{node};
-                
-                # Get VMs
-                my $vms = eval { $self->{api}->get("/nodes/$n/qemu") } || [];
-                foreach my $vm (@$vms) {
-                    my $cfg = eval { $self->{api}->get("/nodes/$n/qemu/$vm->{vmid}/config") } || {};
+                    # Track what we've logged to avoid spam
+                    if not hasattr(self, '_temp_api_logged'):
+                        self._temp_api_logged = {}  # {node: status}
                     
-                    push @vm_data, {
-                        id => $vm->{vmid},
-                        type => 'VM',
-                        status => $vm->{status},
-                        name => $vm->{name},
-                        node => $n,
-                        cores => $cfg->{cores} || 'N/A',
-                        cpu => $cfg->{cpu} || 'N/A',
-                        memory => $self->format_memory($cfg, 'VM'),
-                        disk => 'N/A',
-                        free_disk => 'N/A',
-                        free_pct => 'N/A'
-                    };
+                    for future in as_completed(futures, timeout=5):
+                        try:
+                            node_name, available, sensor_count = future.result()
+                            self.node_temp_api_available[node_name] = available
+                            
+                            # Only log if status changed or first time
+                            prev_status = self._temp_api_logged.get(node_name)
+                            if prev_status != available:
+                                if available:
+                                    logger.info(f"[OK] Temperature API available on {node_name} ({self.node_addresses.get(node_name)}:8898 HTTPS) - {sensor_count} sensors")
+                                else:
+                                    logger.warning(f"Temperature API not available on {node_name} - install with install-temp-api-stunnel.sh")
+                                self._temp_api_logged[node_name] = available
+                        except Exception as e:
+                            node_name = futures[future]
+                            self.node_temp_api_available[node_name] = False
+                            # Only log error if we haven't seen this error before
+                            if self._temp_api_logged.get(node_name) is not False:
+                                logger.warning(f"Error checking {node_name}: {e}")
+                                self._temp_api_logged[node_name] = False
+                
+                available_count = sum(1 for v in self.node_temp_api_available.values() if v)
+                
+                # Only log summary if it's the first check or count changed
+                if not hasattr(self, '_temp_api_summary_logged'):
+                    self._temp_api_summary_logged = -1
+                
+                if self._temp_api_summary_logged != available_count:
+                    if available_count == 0:
+                        logger.warning("Temperature API not installed on any nodes (optional)")
+                    else:
+                        logger.info(f"Temperature API available on {available_count}/{len(nodes)} nodes")
+                    self._temp_api_summary_logged = available_count
+            
+            except Exception as e:
+                logger.error(f"Failed to check temperature API status: {e}")
+        
+        # Run in background thread
+        thread = threading.Thread(target=check_async, daemon=True)
+        thread.start()
+    
+    def _get_node_temperature_direct(self, node_name, timeout=2):
+        """
+        Get all temperature sensors directly from node's port 8898 (HTTPS via stunnel).
+        Returns None if service not available or timeout.
+        """
+        try:
+            node_ip = self.node_addresses.get(node_name, self.api.host)
+            url = f"https://{node_ip}:8898/temperature"
+            
+            # HTTPS only with self-signed certificate acceptance
+            response = requests.get(url, timeout=timeout, verify=False)
+        
+            if response.status_code == 200:
+                data = response.json()
+                return data.get('data', {})
+            else:
+                logger.debug(f"Temperature API returned status {response.status_code} for {node_name}")
+                return None
+        
+        except requests.Timeout:
+            logger.debug(f"Timeout connecting to temperature API on {node_name} (https://{node_ip}:8898)")
+            return None
+        except requests.ConnectionError as e:
+            logger.debug(f"Connection error to temperature API on {node_name}: {e}")
+            return None
+        except requests.RequestException as e:
+            logger.debug(f"Request error to temperature API on {node_name}: {e}")
+            return None
+        except Exception as e:
+            logger.debug(f"Unexpected error getting temperature from {node_name}: {e}")
+            return None
+
+    def get_all_node_temperatures(self):
+        """
+        Get temperature from all nodes via their temperature API.
+        Returns dict of {node_name: {sensors: [...], primary_temp: X, status: ...}}
+        """
+        if not self.api:
+            logger.debug("get_all_node_temperatures: No API connection")
+            return {}
+        
+        node_temps = {}
+        
+        try:
+            nodes = self.api.get('/nodes')
+            logger.debug(f"get_all_node_temperatures: Fetching temps for {len(nodes)} nodes")
+        except Exception as e:
+            logger.error(f"Failed to get node list: {e}")
+            return {}
+        
+        # Separate nodes into available and unavailable
+        nodes_to_check = []
+        for node in nodes:
+            node_name = node['node']
+            if node_name in self.node_temp_api_available and not self.node_temp_api_available[node_name]:
+                node_temps[node_name] = {
+                    'status': 'not_installed',
+                    'sensors': []
+                }
+                logger.debug(f"  {node_name}: Skipping (API not installed)")
+            else:
+                nodes_to_check.append(node_name)
+        
+        # Query available nodes in parallel
+        if nodes_to_check:
+            from concurrent.futures import ThreadPoolExecutor, as_completed
+            
+            def fetch_temp(node_name):
+                try:
+                    result = self._get_node_temperature_direct(node_name, timeout=1.5)
+                    if result and result.get('status') == 'ok':
+                        sensor_count = len(result.get('sensors', []))
+                        logger.debug(f"  {node_name}: Got {sensor_count} sensors")
+                        return node_name, result, True
+                    logger.debug(f"  {node_name}: Status={result.get('status') if result else 'None'}")
+                    return node_name, result or {'status': 'error', 'sensors': []}, False
+                except Exception as e:
+                    logger.debug(f"  {node_name}: Exception: {e}")
+                    return node_name, {'status': 'exception', 'sensors': []}, False
+            
+            with ThreadPoolExecutor(max_workers=min(len(nodes_to_check), 5)) as executor:
+                futures = {executor.submit(fetch_temp, n): n for n in nodes_to_check}
+                
+                for future in as_completed(futures, timeout=5):
+                    try:
+                        node_name, temp_data, available = future.result()
+                        node_temps[node_name] = temp_data
+                        self.node_temp_api_available[node_name] = available
+                    except Exception as e:
+                        node_name = futures[future]
+                        logger.warning(f"  {node_name}: Timeout/error: {e}")
+                        node_temps[node_name] = {'status': 'timeout', 'sensors': []}
+                        self.node_temp_api_available[node_name] = False
+        
+        logger.debug(f"get_all_node_temperatures: Returning data for {len(node_temps)} nodes")
+        return node_temps
+
+    def update_node_temperatures(self):
+        """Update all node temperature displays in background thread"""
+        if not self.api:
+            return
+        
+        def update_async():
+            node_temps = self.get_all_node_temperatures()
+            # Schedule UI updates on main thread
+            self.root.after(0, lambda: self._update_temp_ui(node_temps))
+        
+        # Run in background to not block UI
+        thread = threading.Thread(target=update_async, daemon=True)
+        thread.start()
+
+    def _update_temp_ui(self, node_temps):
+        """Update temperature UI elements - COMPACT VIEW showing only CPU package"""
+        logger.debug(f"_update_temp_ui called with {len(node_temps)} nodes")
+        
+        # Store full temp data for details view
+        self.node_temps_full_data = node_temps
+        
+        # Clear existing temperature labels
+        cleared_count = 0
+        for widget in self.node_temp_frame.winfo_children():
+            if hasattr(widget, 'is_temp_label'):
+                widget.destroy()
+                cleared_count += 1
+        logger.debug(f"  Cleared {cleared_count} old temperature labels")
+        
+        for node_name, temp_info in node_temps.items():
+            status = temp_info.get('status')
+            logger.debug(f"  {node_name}: status={status}, sensors={len(temp_info.get('sensors', []))}")
+            
+            if status != 'ok':
+                # Show node with error status
+                label = tk.Label(
+                    self.node_temp_frame,
+                    text=f"{node_name}: N/A",
+                    font=("Arial", 9, "bold"),
+                    bg="#34495e",
+                    fg="#95a5a6"
+                )
+                label.is_temp_label = True
+                label.pack(side=tk.LEFT, padx=8)
+                
+                node_ip = self.node_addresses.get(node_name, 'unknown')
+                tooltip = f"IP: {node_ip}:8898 (HTTPS)\nStatus: {status}"
+                if status == 'not_installed':
+                    tooltip += "\nTemperature API not installed\nRun install script on this node"
+                self._bind_tooltip(label, tooltip)
+                logger.debug(f"    Created N/A label for {node_name}")
+                continue
+            
+            # Get all sensors for this node
+            sensors = temp_info.get('sensors', [])
+            if not sensors:
+                logger.debug(f"    No sensors for {node_name}")
+                continue
+            
+            # COMPACT VIEW: Show only CPU Package (or highest CPU core if no package)
+            cpu_package = None
+            cpu_cores = []
+            
+            for sensor in sensors:
+                sensor_type = sensor.get('type')
+                if sensor_type == 'cpu_package':
+                    cpu_package = sensor
+                    break
+                elif sensor_type == 'cpu_core':
+                    cpu_cores.append(sensor)
+            
+            # Use package temp, or highest core temp as fallback
+            display_sensor = cpu_package
+            if not display_sensor and cpu_cores:
+                display_sensor = max(cpu_cores, key=lambda s: s.get('temperature', 0))
+            
+            if display_sensor:
+                temp = display_sensor.get('temperature')
+                label_text = display_sensor.get('label', 'CPU')
+                
+                # Truncate long label text to prevent X11 errors
+                if len(label_text) > 20:
+                    label_text = label_text[:17] + "..."
+                
+                temp_color = self.get_temp_color(temp)
+                
+                # Create compact display: "node: temp°C"
+                sensor_label = tk.Label(
+                    self.node_temp_frame,
+                    text=f"{node_name}: {temp}°C",
+                    font=("Arial", 10, "bold"),
+                    bg="#34495e",
+                    fg=temp_color,
+                    cursor="hand2"
+                )
+                sensor_label.is_temp_label = True
+                sensor_label.pack(side=tk.LEFT, padx=10)
+                
+                # Tooltip shows it's clickable
+                tooltip = f"CPU Temperature: {temp}°C\nClick for detailed sensor view"
+                self._bind_tooltip(sensor_label, tooltip)
+                
+                # Click to show details
+                sensor_label.bind("<Button-1>", lambda e, nn=node_name: self.show_temperature_details(nn))
+                
+                logger.debug(f"    Displayed compact temp for {node_name}: {temp}°C")
+            else:
+                # No CPU temp found, show sensor count
+                label = tk.Label(
+                    self.node_temp_frame,
+                    text=f"{node_name}: {len(sensors)} sensors",
+                    font=("Arial", 9),
+                    bg="#34495e",
+                    fg="#bdc3c7",
+                    cursor="hand2"
+                )
+                label.is_temp_label = True
+                label.pack(side=tk.LEFT, padx=8)
+                label.bind("<Button-1>", lambda e, nn=node_name: self.show_temperature_details(nn))
+                self._bind_tooltip(label, "Click for detailed sensor view")
+        
+        logger.debug(f"_update_temp_ui completed")
+    
+    def show_temperature_details(self, node_name=None):
+        """Show detailed temperature window for all sensors"""
+        if not hasattr(self, 'node_temps_full_data'):
+            messagebox.showinfo("Temperature Details", "No temperature data available yet.\nPlease wait for data refresh.")
+            return
+        
+        try:
+            # Create details window
+            details_window = tk.Toplevel(self.root)
+            details_window.title(f"Temperature Details - {node_name if node_name else 'All Nodes'}")
+            details_window.geometry("800x600")
+            
+            # Center window
+            details_window.update_idletasks()
+            x = (details_window.winfo_screenwidth() // 2) - 400
+            y = (details_window.winfo_screenheight() // 2) - 300
+            details_window.geometry(f"800x600+{x}+{y}")
+            
+            # Title
+            title_frame = tk.Frame(details_window, bg="#2c3e50", height=50)
+            title_frame.pack(fill=tk.X)
+            title_frame.pack_propagate(False)
+            
+            tk.Label(
+                title_frame,
+                text=f"Temperature Sensors - {node_name if node_name else 'All Nodes'}",
+                font=("Arial", 14, "bold"),
+                bg="#2c3e50",
+                fg="white"
+            ).pack(pady=12)
+            
+            # Color Legend Frame
+            legend_frame = tk.Frame(details_window, bg="#ecf0f1", relief=tk.RIDGE, borderwidth=1)
+            legend_frame.pack(fill=tk.X, padx=10, pady=5)
+            
+            tk.Label(
+                legend_frame,
+                text="Temperature Key:",
+                font=("Arial", 9, "bold"),
+                bg="#ecf0f1",
+                fg="#2c3e50"
+            ).pack(side=tk.LEFT, padx=10, pady=5)
+            
+            # Color indicators
+            color_key = [
+                ("< 50°C Cool", "#27ae60"),
+                ("50-70°C Normal", "#3498db"),
+                ("70-85°C Warm", "#e67e22"),
+                ("≥ 85°C Hot", "#e74c3c")
+            ]
+            
+            for label_text, color in color_key:
+                key_frame = tk.Frame(legend_frame, bg="#ecf0f1")
+                key_frame.pack(side=tk.LEFT, padx=5, pady=5)
+                
+                # Color box
+                color_box = tk.Frame(key_frame, bg=color, width=15, height=15, relief=tk.SOLID, borderwidth=1)
+                color_box.pack(side=tk.LEFT, padx=(0, 3))
+                color_box.pack_propagate(False)
+                
+                # Label
+                tk.Label(
+                    key_frame,
+                    text=label_text,
+                    font=("Arial", 8),
+                    bg="#ecf0f1",
+                    fg="#2c3e50"
+                ).pack(side=tk.LEFT)
+            
+            # Scrollable content
+            canvas = tk.Canvas(details_window, bg="white")
+            scrollbar = tk.Scrollbar(details_window, orient="vertical", command=canvas.yview)
+            scrollable_frame = tk.Frame(canvas, bg="white")
+            
+            scrollable_frame.bind(
+                "<Configure>",
+                lambda e: canvas.configure(scrollregion=canvas.bbox("all"))
+            )
+            
+            canvas.create_window((0, 0), window=scrollable_frame, anchor="nw")
+            canvas.configure(yscrollcommand=scrollbar.set)
+            
+            # Filter nodes to display
+            nodes_to_show = {}
+            if node_name:
+                if node_name in self.node_temps_full_data:
+                    nodes_to_show[node_name] = self.node_temps_full_data[node_name]
+            else:
+                nodes_to_show = self.node_temps_full_data
+            
+            # Safety limit: max 5 nodes at once to prevent X11 errors
+            if len(nodes_to_show) > 5:
+                nodes_to_show = dict(list(nodes_to_show.items())[:5])
+                # Add warning
+                warning_frame = tk.Frame(scrollable_frame, bg="#f39c12")
+                warning_frame.pack(fill=tk.X, padx=10, pady=5)
+                tk.Label(
+                    warning_frame,
+                    text="[WARNING] Showing first 5 nodes only (too many to display)",
+                    font=("Arial", 9, "bold"),
+                    bg="#f39c12",
+                    fg="white",
+                    padx=10,
+                    pady=5
+                ).pack()
+            
+            self._populate_temperature_details(scrollable_frame, nodes_to_show)
+            
+            # Pack scrollbar and canvas
+            canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+            scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+            
+            # Close button
+            btn_frame = tk.Frame(details_window, bg="white")
+            btn_frame.pack(fill=tk.X, pady=10)
+            
+            tk.Button(
+                btn_frame,
+                text="Close",
+                command=details_window.destroy,
+                bg="#95a5a6",
+                fg="white",
+                font=("Arial", 10, "bold"),
+                width=15,
+                cursor="hand2"
+            ).pack()
+            
+        except Exception as e:
+            logger.error(f"Error creating temperature details window: {e}")
+            messagebox.showerror(
+                "Display Error",
+                f"Failed to show temperature details.\n\n"
+                f"Error: {str(e)}\n\n"
+                f"This may be due to too many sensors.\n"
+                f"Try viewing individual nodes instead of all nodes."
+            )
+    
+    def _populate_temperature_details(self, parent, nodes_to_show):
+        """Populate temperature details in the scrollable frame"""
+        for nn, temp_info in nodes_to_show.items():
+            try:
+                # Node header
+                node_frame = tk.Frame(parent, bg="#ecf0f1", relief=tk.RAISED, borderwidth=2)
+                node_frame.pack(fill=tk.X, padx=10, pady=10)
+                
+                header_frame = tk.Frame(node_frame, bg="#34495e")
+                header_frame.pack(fill=tk.X)
+                
+                # Truncate node name if too long
+                display_node_name = nn if len(nn) <= 30 else nn[:27] + "..."
+                
+                tk.Label(
+                    header_frame,
+                    text=f"Node: {display_node_name}",
+                    font=("Arial", 12, "bold"),
+                    bg="#34495e",
+                    fg="white",
+                    anchor="w"
+                ).pack(side=tk.LEFT, padx=10, pady=8)
+                
+                node_ip = self.node_addresses.get(nn, 'unknown')
+                tk.Label(
+                    header_frame,
+                    text=f"IP: {node_ip}:8898 (HTTPS)",
+                    font=("Arial", 9),
+                    bg="#34495e",
+                    fg="#bdc3c7",
+                    anchor="e"
+                ).pack(side=tk.RIGHT, padx=10, pady=8)
+                
+                # Sensor data
+                sensors = temp_info.get('sensors', [])
+                status = temp_info.get('status')
+                
+                if status != 'ok' or not sensors:
+                    tk.Label(
+                        node_frame,
+                        text=f"Status: {status}" if status != 'ok' else "No sensors found",
+                        font=("Arial", 10),
+                        bg="#ecf0f1",
+                        fg="#e74c3c"
+                    ).pack(padx=10, pady=10)
+                    continue
+                
+                # Group sensors by type
+                sensor_groups = {
+                    'cpu_package': [],
+                    'cpu_core': [],
+                    'thermal_zone': [],
+                    'motherboard': [],
+                    'nvme': [],
+                    'other': []
                 }
                 
-                # Get Containers
-                my $cts = eval { $self->{api}->get("/nodes/$n/lxc") } || [];
-                foreach my $ct (@$cts) {
-                    my $cfg = eval { $self->{api}->get("/nodes/$n/lxc/$ct->{vmid}/config") } || {};
+                for sensor in sensors:
+                    sensor_type = sensor.get('type', 'other')
+                    sensor_groups[sensor_type].append(sensor)
+                
+                # Display sensors grouped by type
+                display_order = ['cpu_package', 'cpu_core', 'thermal_zone', 'motherboard', 'nvme', 'other']
+                type_names = {
+                    'cpu_package': 'CPU Package',
+                    'cpu_core': 'CPU Cores',
+                    'thermal_zone': 'Thermal Zones',
+                    'motherboard': 'Motherboard',
+                    'nvme': 'NVMe Drives',
+                    'other': 'Other Sensors'
+                }
+                
+                # Limit sensors per type to prevent X11 rendering errors
+                max_sensors_per_type = 20
+                
+                total_displayed = 0
+                for sensor_type in display_order:
+                    group_sensors = sensor_groups[sensor_type]
+                    if not group_sensors:
+                        continue
                     
-                    push @vm_data, {
-                        id => $ct->{vmid},
-                        type => 'CT',
-                        status => $ct->{status},
-                        name => $ct->{name},
-                        node => $n,
-                        cores => $cfg->{cores} || 'N/A',
-                        cpu => 'N/A',
-                        memory => $self->format_memory($cfg, 'CT'),
-                        disk => 'N/A',
-                        free_disk => 'N/A',
-                        free_pct => 'N/A'
-                    };
-                }
-            }
-        };
-        
-        @vm_data = sort { $a->{id} <=> $b->{id} } @vm_data;
-        return \@vm_data;
-    });
-    
-    # Store active thread
-    $self->{active_thread} = $thread;
-    
-    # Create polling callback with proper closure
-    my $wait_count = 0;
-    my $max_wait = 300; # 30 seconds maximum wait (300 * 100ms)
-    
-    # Define the polling function that references itself
-    my $poll_thread;
-    $poll_thread = sub {
-        # Check if we're closing or window destroyed
-        if ($self->{is_closing} || !Tk::Exists($self->{mw})) {
-            $thread->detach() if $thread && !$thread->is_joinable();
-            $self->{is_loading} = 0;
-            $self->{active_thread} = undef;
-            return;
-        }
-        
-        # Check if thread finished
-        if ($thread->is_joinable()) {
-            my $vm_data = $thread->join();
-            $self->{vm_data} = $vm_data;
-            $self->{is_loading} = 0;
-            $self->{active_thread} = undef;
-            
-            # Only update widgets if they still exist
-            return unless Tk::Exists($self->{mw});
-            
-            $self->{mw}->configure(-cursor => '');
-            $self->filter_vms();
-            
-            my $now = strftime("%H:%M:%S", localtime);
-            my $interval = $self->{refresh_interval};
-            $self->{last_update_label}->configure(
-                -text => "LIVE - Updated: $now (every ${interval}s)"
-            ) if Tk::Exists($self->{last_update_label});
-            
-            $self->{connection_label}->configure(-foreground => '#27ae60') if Tk::Exists($self->{connection_label});
-            $self->{node_label}->configure(-text => "Nodes: $self->{node_count}") if Tk::Exists($self->{node_label});
-            
-            # Update temperatures
-            $self->update_node_temperatures();
-        } elsif ($wait_count < $max_wait) {
-            # Keep waiting - increment counter and schedule next poll
-            $wait_count++;
-            $self->{mw}->after(100, $poll_thread) if Tk::Exists($self->{mw});
-        } else {
-            # Timeout - detach thread and reset
-            main::log_message('ERROR', 'Data fetch timeout - detaching thread');
-            $thread->detach();
-            $self->{is_loading} = 0;
-            $self->{active_thread} = undef;
-            
-            return unless Tk::Exists($self->{mw});
-            $self->{mw}->configure(-cursor => '');
-            $self->{status_label}->configure(-text => "Timeout fetching data - please retry") if Tk::Exists($self->{status_label});
-        }
-    };
-    
-    # Start polling
-    $self->{mw}->after(100, $poll_thread);
-}
-
-sub format_memory {
-    my ($self, $cfg, $type) = @_;
-    
-    if ($type eq 'VM') {
-        my $memory = $cfg->{memory} || 0;
-        return "N/A" unless $memory;
-        return $self->format_bytes($memory * 1024 * 1024);
-    } else {
-        my $memory = $cfg->{memory} || 0;
-        return "N/A" unless $memory;
-        return $self->format_bytes($memory * 1024 * 1024);
-    }
-}
-
-sub format_bytes {
-    my ($self, $bytes) = @_;
-    return 'N/A' unless $bytes;
-    
-    my @units = qw(B KiB MiB GiB TiB);
-    my $unit_idx = 0;
-    
-    while ($bytes >= 1024 && $unit_idx < $#units) {
-        $bytes /= 1024;
-        $unit_idx++;
-    }
-    
-    return sprintf("%.1f %s", $bytes, $units[$unit_idx]);
-}
-
-sub filter_vms {
-    my ($self) = @_;
-    my $query = lc($self->{search_entry}->get() || '');
-    
-    $self->{tree}->delete('all');
-    
-    my $running_count = 0;
-    my $stopped_count = 0;
-    
-    foreach my $vm (@{$self->{vm_data}}) {
-        next if $query && index(lc($vm->{id}), $query) == -1
-                       && index(lc($vm->{name}), $query) == -1
-                       && index(lc($vm->{type}), $query) == -1
-                       && index(lc($vm->{status}), $query) == -1
-                       && index(lc($vm->{node}), $query) == -1;
-        
-        $running_count++ if lc($vm->{status}) eq 'running';
-        $stopped_count++ if lc($vm->{status}) ne 'running';
-        
-        my $entry = $self->{tree}->add($vm->{id});
-        
-        $self->{tree}->itemCreate($entry, 0, -text => $vm->{id});
-        $self->{tree}->itemCreate($entry, 1, -text => $vm->{type});
-        $self->{tree}->itemCreate($entry, 2, -text => $vm->{status});
-        $self->{tree}->itemCreate($entry, 3, -text => $vm->{name});
-        $self->{tree}->itemCreate($entry, 4, -text => $vm->{node});
-        $self->{tree}->itemCreate($entry, 5, -text => $vm->{cores});
-        $self->{tree}->itemCreate($entry, 6, -text => $vm->{cpu});
-        $self->{tree}->itemCreate($entry, 7, -text => $vm->{memory});
-        $self->{tree}->itemCreate($entry, 8, -text => $vm->{disk});
-        $self->{tree}->itemCreate($entry, 9, -text => $vm->{free_disk});
-        $self->{tree}->itemCreate($entry, 10, -text => $vm->{free_pct});
-    }
-    
-    $self->{running_count_label}->configure(-text => "Running: $running_count");
-    $self->{stopped_count_label}->configure(-text => "Stopped: $stopped_count");
-}
-
-sub start_selected {
-    my ($self) = @_;
-    
-    return if $self->{is_closing};
-    
-    my @selection = $self->{tree}->info('selection');
-    return unless @selection;
-    
-    my $vmid = $selection[0];
-    my ($vm) = grep { $_->{id} eq $vmid } @{$self->{vm_data}};
-    return unless $vm;
-    
-    $self->{status_label}->configure(-text => "Starting $vm->{type} $vm->{id}...");
-    
-    my $thread = threads->create(sub {
-        eval {
-            my $endpoint = $vm->{type} eq 'VM' ? 'qemu' : 'lxc';
-            $self->{api}->post("/nodes/$vm->{node}/$endpoint/$vm->{id}/status/start");
-            AuditLogger::log_vm_action("START", $vm->{id}, $vm->{type}, $vm->{name}, 1);
-        };
-        
-        if ($@) {
-            AuditLogger::log_vm_action("START", $vm->{id}, $vm->{type}, $vm->{name}, 0, "$@");
-            return "Error: $@";
-        }
-        
-        return "SUCCESS";
-    });
-    
-    # Proper polling callback
-    my $poll;
-    $poll = sub {
-        return if $self->{is_closing} || !Tk::Exists($self->{mw});
-        
-        if ($thread->is_joinable()) {
-            my $result = $thread->join();
-            
-            return unless Tk::Exists($self->{mw});
-            
-            if ($result eq "SUCCESS") {
-                $self->{status_label}->configure(-text => "Started $vm->{type} $vm->{id} ($vm->{name})") if Tk::Exists($self->{status_label});
-                $self->{mw}->after(2000, sub { $self->refresh_data_async() unless $self->{is_closing} });
-            } else {
-                $self->{mw}->messageBox(
-                    -title => "Error",
-                    -message => "Failed to start:\n$result",
-                    -type => 'OK',
-                    -icon => 'error'
-                );
-            }
-        } else {
-            $self->{mw}->after(100, $poll) if Tk::Exists($self->{mw});
-        }
-    };
-    
-    $self->{mw}->after(100, $poll);
-}
-
-sub stop_selected {
-    my ($self) = @_;
-    
-    return if $self->{is_closing};
-    
-    my @selection = $self->{tree}->info('selection');
-    return unless @selection;
-    
-    my $vmid = $selection[0];
-    my ($vm) = grep { $_->{id} eq $vmid } @{$self->{vm_data}};
-    return unless $vm;
-    
-    my $answer = $self->{mw}->messageBox(
-        -title => "Confirm",
-        -message => "Stop $vm->{type} $vm->{id} ($vm->{name})?",
-        -type => 'YesNo',
-        -icon => 'question'
-    );
-    
-    return unless $answer eq 'Yes';
-    
-    $self->{status_label}->configure(-text => "Stopping $vm->{type} $vm->{id}...");
-    
-    my $thread = threads->create(sub {
-        eval {
-            my $endpoint = $vm->{type} eq 'VM' ? 'qemu' : 'lxc';
-            $self->{api}->post("/nodes/$vm->{node}/$endpoint/$vm->{id}/status/stop");
-            AuditLogger::log_vm_action("STOP", $vm->{id}, $vm->{type}, $vm->{name}, 1);
-        };
-        
-        if ($@) {
-            AuditLogger::log_vm_action("STOP", $vm->{id}, $vm->{type}, $vm->{name}, 0, "$@");
-            return "Error: $@";
-        }
-        
-        return "SUCCESS";
-    });
-    
-    # Proper polling callback
-    my $poll;
-    $poll = sub {
-        return if $self->{is_closing} || !Tk::Exists($self->{mw});
-        
-        if ($thread->is_joinable()) {
-            my $result = $thread->join();
-            
-            return unless Tk::Exists($self->{mw});
-            
-            if ($result eq "SUCCESS") {
-                $self->{status_label}->configure(-text => "Stopped $vm->{type} $vm->{id} ($vm->{name})") if Tk::Exists($self->{status_label});
-                $self->{mw}->after(2000, sub { $self->refresh_data_async() unless $self->{is_closing} });
-            } else {
-                $self->{mw}->messageBox(
-                    -title => "Error",
-                    -message => "Failed to stop:\n$result",
-                    -type => 'OK',
-                    -icon => 'error'
-                );
-            }
-        } else {
-            $self->{mw}->after(100, $poll) if Tk::Exists($self->{mw});
-        }
-    };
-    
-    $self->{mw}->after(100, $poll);
-}
-
-sub start_all_stopped {
-    my ($self) = @_;
-    
-    return if $self->{is_closing};
-    
-    my @stopped = grep { lc($_->{status}) ne 'running' } @{$self->{vm_data}};
-    
-    unless (@stopped) {
-        $self->{mw}->messageBox(
-            -title => "Info",
-            -message => "All VMs/CTs are already running",
-            -type => 'OK',
-            -icon => 'info'
-        ) unless $self->{is_closing};
-        return;
-    }
-    
-    my $answer = $self->{mw}->messageBox(
-        -title => "Confirm",
-        -message => "Start " . scalar(@stopped) . " stopped VMs/CTs?",
-        -type => 'YesNo',
-        -icon => 'question'
-    );
-    
-    return unless $answer eq 'Yes';
-    
-    $self->{status_label}->configure(-text => "Starting " . scalar(@stopped) . " VMs/CTs...");
-    
-    my $thread = threads->create(sub {
-        my $success_count = 0;
-        
-        foreach my $vm (@stopped) {
-            eval {
-                my $endpoint = $vm->{type} eq 'VM' ? 'qemu' : 'lxc';
-                $self->{api}->post("/nodes/$vm->{node}/$endpoint/$vm->{id}/status/start");
-                AuditLogger::log_vm_action("START_ALL", $vm->{id}, $vm->{type}, $vm->{name}, 1);
-                $success_count++;
-            };
-            
-            if ($@) {
-                AuditLogger::log_vm_action("START_ALL", $vm->{id}, $vm->{type}, $vm->{name}, 0, "$@");
-            }
-        }
-        
-        return $success_count;
-    });
-    
-    # Proper polling callback
-    my $poll;
-    $poll = sub {
-        return if $self->{is_closing} || !Tk::Exists($self->{mw});
-        
-        if ($thread->is_joinable()) {
-            my $success_count = $thread->join();
-            
-            return unless Tk::Exists($self->{mw});
-            
-            $self->{status_label}->configure(
-                -text => "Started $success_count/" . scalar(@stopped) . " VMs/CTs"
-            ) if Tk::Exists($self->{status_label});
-            $self->{mw}->after(3000, sub { $self->refresh_data_async() unless $self->{is_closing} });
-        } else {
-            $self->{mw}->after(100, $poll) if Tk::Exists($self->{mw});
-        }
-    };
-    
-    $self->{mw}->after(100, $poll);
-}
-
-sub toggle_auto_refresh {
-    my ($self) = @_;
-    
-    $self->{auto_refresh} = !$self->{auto_refresh};
-    
-    if ($self->{auto_refresh}) {
-        $self->{pause_resume_btn}->configure(
-            -text => "Pause Live",
-            -background => '#e67e22'
-        );
-        $self->{live_indicator}->configure(
-            -text => "LIVE",
-            -foreground => '#27ae60'
-        );
-        $self->{status_label}->configure(-text => "Live feed enabled");
-        main::log_message('INFO', "Live feed enabled");
-    } else {
-        $self->{pause_resume_btn}->configure(
-            -text => "Resume Live",
-            -background => '#27ae60'
-        );
-        $self->{live_indicator}->configure(
-            -text => "PAUSED",
-            -foreground => '#95a5a6'
-        );
-        $self->{status_label}->configure(-text => "Live feed paused");
-        main::log_message('INFO', "Live feed paused");
-    }
-}
-
-sub start_auto_refresh {
-    my ($self) = @_;
-    
-    $self->refresh_data_async();
-    
-    # Set up periodic refresh
-    $self->{mw}->repeat($self->{refresh_interval} * 1000, sub {
-        return if $self->{is_closing};
-        return unless Tk::Exists($self->{mw});
-        $self->refresh_data_async() if $self->{auto_refresh};
-    });
-    
-    main::log_message('INFO', "Live feed started with ${REFRESH_INTERVAL}s refresh rate");
-}
-
-sub start_health_check {
-    my ($self) = @_;
-    
-    # Periodic health check
-    $self->{mw}->repeat(60000, sub {
-        return if $self->{is_closing};
-        return unless Tk::Exists($self->{mw});
-        return unless $self->{api};
-        
-        eval {
-            $self->{api}->get('/version');
-            $self->{connection_healthy} = 1;
-            $self->{connection_label}->configure(-foreground => '#27ae60') if Tk::Exists($self->{connection_label});
-        };
-        
-        if ($@) {
-            $self->{connection_healthy} = 0;
-            return if $self->{is_closing};
-            
-            $self->{connection_label}->configure(-foreground => '#e74c3c') if Tk::Exists($self->{connection_label});
-            
-            return if $self->{is_closing};
-            
-            my $response = $self->{mw}->messageBox(
-                -title => "Connection Lost",
-                -message => "Connection to Proxmox was lost. Attempt to reconnect?",
-                -type => 'YesNo',
-                -icon => 'warning'
-            );
-            
-            return if $self->{is_closing};
-            
-            if ($response eq 'Yes') {
-                eval {
-                    $self->{api}->get('/version');
-                    $self->{connection_healthy} = 1;
-                    return if $self->{is_closing};
-                    $self->{mw}->messageBox(
-                        -title => "Success",
-                        -message => "Reconnected successfully!",
-                        -type => 'OK',
-                        -icon => 'info'
-                    ) if Tk::Exists($self->{mw});
-                    $self->refresh_data_async() unless $self->{is_closing};
-                };
+                    # Type header
+                    type_frame = tk.Frame(node_frame, bg="#ecf0f1")
+                    type_frame.pack(fill=tk.X, padx=10, pady=(10, 5))
+                    
+                    tk.Label(
+                        type_frame,
+                        text=type_names[sensor_type],
+                        font=("Arial", 10, "bold"),
+                        bg="#ecf0f1",
+                        fg="#2c3e50"
+                    ).pack(anchor="w")
+                    
+                    # Limit number of sensors displayed
+                    sensors_to_show = group_sensors[:max_sensors_per_type]
+                    remaining = len(group_sensors) - len(sensors_to_show)
+                    
+                    # Sensors in this group
+                    for sensor in sensors_to_show:
+                        temp = sensor.get('temperature')
+                        label_text = sensor.get('label', 'Unknown')
+                        chip = sensor.get('chip', 'N/A')
+                        
+                        # Truncate long text to prevent X11 errors
+                        if len(label_text) > 40:
+                            label_text = label_text[:37] + "..."
+                        if len(chip) > 30:
+                            chip = chip[:27] + "..."
+                        
+                        sensor_frame = tk.Frame(node_frame, bg="white")
+                        sensor_frame.pack(fill=tk.X, padx=20, pady=2)
+                        
+                        # Temperature with color
+                        temp_color = self.get_temp_color(temp)
+                        tk.Label(
+                            sensor_frame,
+                            text=f"{label_text}:",
+                            font=("Arial", 9),
+                            bg="white",
+                            anchor="w",
+                            width=30
+                        ).pack(side=tk.LEFT)
+                        
+                        tk.Label(
+                            sensor_frame,
+                            text=f"{temp}°C",
+                            font=("Arial", 9, "bold"),
+                            bg="white",
+                            fg=temp_color,
+                            width=10
+                        ).pack(side=tk.LEFT)
+                        
+                        tk.Label(
+                            sensor_frame,
+                            text=f"({chip})",
+                            font=("Arial", 8),
+                            bg="white",
+                            fg="#7f8c8d"
+                        ).pack(side=tk.LEFT, padx=5)
+                        
+                        total_displayed += 1
+                    
+                    # Show "and X more" if we hit the limit
+                    if remaining > 0:
+                        more_frame = tk.Frame(node_frame, bg="white")
+                        more_frame.pack(fill=tk.X, padx=20, pady=2)
+                        
+                        tk.Label(
+                            more_frame,
+                            text=f"... and {remaining} more {type_names[sensor_type].lower()}",
+                            font=("Arial", 8, "italic"),
+                            bg="white",
+                            fg="#7f8c8d"
+                        ).pack(anchor="w")
                 
-                if ($@) {
-                    return if $self->{is_closing};
-                    $self->{mw}->messageBox(
-                        -title => "Error",
-                        -message => "Reconnection failed. Please restart the application.",
-                        -type => 'OK',
-                        -icon => 'error'
-                    ) if Tk::Exists($self->{mw});
-                }
-            }
+                # Add total count at bottom
+                if total_displayed > 0:
+                    summary_frame = tk.Frame(node_frame, bg="#ecf0f1")
+                    summary_frame.pack(fill=tk.X, padx=10, pady=10)
+                    
+                    tk.Label(
+                        summary_frame,
+                        text=f"Showing {total_displayed} of {len(sensors)} total sensors",
+                        font=("Arial", 8),
+                        bg="#ecf0f1",
+                        fg="#7f8c8d"
+                    ).pack()
+                    
+            except Exception as e:
+                # Log error but continue with other nodes
+                logger.error(f"Error displaying sensors for node {nn}: {e}")
+                error_frame = tk.Frame(parent, bg="#fadbd8", relief=tk.RAISED, borderwidth=2)
+                error_frame.pack(fill=tk.X, padx=10, pady=5)
+                tk.Label(
+                    error_frame,
+                    text=f"Error displaying {nn}: {str(e)[:100]}",
+                    font=("Arial", 9),
+                    bg="#fadbd8",
+                    fg="#e74c3c",
+                    padx=10,
+                    pady=5
+                ).pack()
+
+    def _bind_tooltip(self, widget, text):
+        """Bind tooltip to widget - SAFE VERSION without closures"""
+        # Skip if tooltips are disabled
+        if not self.tooltips_enabled:
+            return
+        
+        # Truncate very long text to prevent X11 errors
+        max_chars = 150
+        if len(text) > max_chars:
+            text = text[:max_chars] + "..."
+        
+        # Store text on widget
+        widget._tooltip_text = text
+        
+        def on_enter(event):
+            w = event.widget
+            if not hasattr(w, '_tooltip_text'):
+                return
+            
+            # Destroy old tooltip if it exists
+            if hasattr(w, '_tooltip_window'):
+                try:
+                    w._tooltip_window.destroy()
+                except Exception:
+                    pass
+            
+            # Create new tooltip
+            try:
+                tooltip = tk.Toplevel()
+                tooltip.wm_overrideredirect(True)
+                
+                # Position slightly offset from cursor
+                x = event.x_root + 10
+                y = event.y_root + 10
+                tooltip.wm_geometry(f"+{x}+{y}")
+                
+                # Simple label with word wrap
+                label = tk.Label(
+                    tooltip,
+                    text=w._tooltip_text,
+                    background="#2c3e50",
+                    foreground="white",
+                    relief=tk.SOLID,
+                    borderwidth=1,
+                    font=("Arial", 8),
+                    justify=tk.LEFT,
+                    wraplength=250,
+                    padx=5,
+                    pady=3
+                )
+                label.pack()
+                
+                # Store reference on widget
+                w._tooltip_window = tooltip
+            except Exception as e:
+                # Silently fail if tooltip can't be created
+                logger.debug(f"Failed to create tooltip: {e}")
+        
+        def on_leave(event):
+            w = event.widget
+            if hasattr(w, '_tooltip_window'):
+                try:
+                    w._tooltip_window.destroy()
+                    delattr(w, '_tooltip_window')
+                except Exception:
+                    pass
+        
+        # Unbind any existing handlers
+        try:
+            widget.unbind("<Enter>")
+            widget.unbind("<Leave>")
+        except Exception:
+            pass
+        
+        # Bind new handlers
+        try:
+            widget.bind("<Enter>", on_enter, add=False)
+            widget.bind("<Leave>", on_leave, add=False)
+        except Exception as e:
+            logger.debug(f"Failed to bind tooltip: {e}")
+    
+    # ========================================================================
+    # END NODE TEMPERATURE API MONITORING
+    # ========================================================================
+    
+    def create_widgets(self):
+        # Top bar
+        top_frame = tk.Frame(self.root, bg="#2c3e50", height=140)
+        top_frame.pack(fill=tk.X)
+        top_frame.pack_propagate(False)
+
+        # NEW: Node Temperature Frame (below the top bar)
+        self.node_temp_container = tk.Frame(self.root, bg="#34495e", height=40)  # Increased height
+        self.node_temp_container.pack(fill=tk.X)
+        self.node_temp_container.pack_propagate(False)
+    
+        self.node_temp_frame = tk.Frame(self.node_temp_container, bg="#34495e")
+        self.node_temp_frame.pack(side=tk.LEFT, padx=10, pady=5, fill=tk.BOTH, expand=True)
+    
+        tk.Label(
+            self.node_temp_frame,
+            text="Node Temperatures:",
+            font=("Arial", 9, "bold"),
+            bg="#34495e",
+            fg="#bdc3c7"
+        ).pack(side=tk.LEFT, padx=(0, 10))
+        
+        # Add Details button on the right side
+        details_btn = tk.Button(
+            self.node_temp_container,
+            text="[Details]",  # Removed emoji - can cause X11 errors
+            command=lambda: self.show_temperature_details(None),
+            bg="#3498db",
+            fg="white",
+            font=("Arial", 9, "bold"),
+            cursor="hand2",
+            relief=tk.FLAT,
+            padx=10,
+            pady=5
+        )
+        details_btn.pack(side=tk.RIGHT, padx=10, pady=5)
+        # Don't bind tooltip here - do it later after window is created
+        
+        # Left section: Title
+        title_label = tk.Label(
+            top_frame,
+            text="Proxmox VM/CT Dashboard",
+            font=("Arial", 18, "bold"),
+            bg="#2c3e50",
+            fg="white"
+        )
+        title_label.pack(side=tk.LEFT, padx=20, pady=50)
+        
+        # Right section: Status indicators (pack first to anchor right side)
+        self.status_frame = tk.Frame(top_frame, bg="#2c3e50")
+        self.status_frame.pack(side=tk.RIGHT, padx=20, pady=10)
+        
+        # Center section: VM Summary (fills remaining space and centers content)
+        vm_summary_container = tk.Frame(top_frame, bg="#2c3e50")
+        vm_summary_container.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        
+        # Inner frame for VM summary (centered within container)
+        vm_summary_frame = tk.Frame(vm_summary_container, bg="#2c3e50")
+        vm_summary_frame.place(relx=0.5, rely=0.5, anchor="center")
+        
+        # VMs/CTs: label
+        summary_title = tk.Label(
+            vm_summary_frame,
+            text="VMs/CTs:",
+            font=("Arial", 12, "bold"),
+            bg="#2c3e50",
+            fg="#ecf0f1"
+        )
+        summary_title.pack(pady=(0, 5))
+        
+        # Running count with green indicator
+        running_summary_frame = tk.Frame(vm_summary_frame, bg="#2c3e50")
+        running_summary_frame.pack(pady=2)
+        
+        self.running_led = self.create_led_indicator(running_summary_frame, "#27ae60", size=8)
+        self.running_led.pack(side=tk.LEFT, padx=(0, 5))
+        
+        self.running_count_label = tk.Label(
+            running_summary_frame,
+            text="Running: 0",
+            font=("Arial", 10),
+            bg="#2c3e50",
+            fg="#27ae60"
+        )
+        self.running_count_label.pack(side=tk.LEFT)
+        
+        # Stopped count with red indicator
+        stopped_summary_frame = tk.Frame(vm_summary_frame, bg="#2c3e50")
+        stopped_summary_frame.pack(pady=2)
+        
+        self.stopped_led = self.create_led_indicator(stopped_summary_frame, "#e74c3c", size=8)
+        self.stopped_led.pack(side=tk.LEFT, padx=(0, 5))
+        
+        self.stopped_count_label = tk.Label(
+            stopped_summary_frame,
+            text="Stopped: 0",
+            font=("Arial", 10),
+            bg="#2c3e50",
+            fg="#e74c3c"
+        )
+        self.stopped_count_label.pack(side=tk.LEFT)
+        
+        # Row 0: Connection and LIVE status
+        connection_frame = tk.Frame(self.status_frame, bg="#2c3e50")
+        connection_frame.grid(row=0, column=0, sticky="w", padx=5, pady=3)
+        
+        self.connection_led = self.create_led_indicator(connection_frame, "#27ae60")
+        self.connection_led.pack(side=tk.LEFT, padx=(0, 5))
+        
+        self.connection_label = tk.Label(
+            connection_frame,
+            text="Connected",
+            font=("Arial", 10, "bold"),
+            bg="#2c3e50",
+            fg="#27ae60"
+        )
+        self.connection_label.pack(side=tk.LEFT)
+        
+        live_frame = tk.Frame(self.status_frame, bg="#2c3e50")
+        live_frame.grid(row=0, column=1, sticky="w", padx=15, pady=3)
+        
+        self.live_led = self.create_led_indicator(live_frame, "#27ae60")
+        self.live_led.pack(side=tk.LEFT, padx=(0, 5))
+        
+        self.live_indicator = tk.Label(
+            live_frame,
+            text="LIVE",
+            font=("Arial", 10, "bold"),
+            bg="#2c3e50",
+            fg="#27ae60"
+        )
+        self.live_indicator.pack(side=tk.LEFT)
+        
+        # Row 1: SSL and Nodes
+        ssl_frame = tk.Frame(self.status_frame, bg="#2c3e50")
+        ssl_frame.grid(row=1, column=0, sticky="w", padx=5, pady=3)
+        
+        self.ssl_label = tk.Label(
+            ssl_frame,
+            text="SSL: Checking...",
+            font=("Arial", 10),
+            bg="#2c3e50",
+            fg="white"
+        )
+        self.ssl_label.pack()
+        
+        nodes_frame = tk.Frame(self.status_frame, bg="#2c3e50")
+        nodes_frame.grid(row=1, column=1, sticky="w", padx=15, pady=3)
+        
+        self.node_label = tk.Label(
+            nodes_frame,
+            text="Nodes: 0",
+            font=("Arial", 10),
+            bg="#2c3e50",
+            fg="white"
+        )
+        self.node_label.pack()
+        
+        # Row 2: Last update
+        update_frame = tk.Frame(self.status_frame, bg="#2c3e50")
+        update_frame.grid(row=2, column=0, sticky="w", padx=5, pady=3, columnspan=2)
+        
+        self.last_update_label = tk.Label(
+            update_frame,
+            text="Updated: --",
+            font=("Arial", 9),
+            bg="#2c3e50",
+            fg="#bdc3c7"
+        )
+        self.last_update_label.pack()
+        
+        # Control panel
+        control_frame = tk.Frame(self.root, bg="#ecf0f1", height=80)
+        control_frame.pack(fill=tk.X)
+        control_frame.pack_propagate(False)
+        
+        btn_container = tk.Frame(control_frame, bg="#ecf0f1")
+        btn_container.pack(pady=15)
+        
+        self.start_btn = tk.Button(
+            btn_container,
+            text="Start",
+            command=self.start_selected,
+            bg="#27ae60",
+            fg="white",
+            font=("Arial", 11, "bold"),
+            width=12,
+            height=2,
+            cursor="hand2",
+            relief=tk.RAISED,
+            bd=2
+        )
+        self.start_btn.pack(side=tk.LEFT, padx=5)
+        
+        self.stop_btn = tk.Button(
+            btn_container,
+            text="Stop",
+            command=self.stop_selected,
+            bg="#e74c3c",
+            fg="white",
+            font=("Arial", 11, "bold"),
+            width=12,
+            height=2,
+            cursor="hand2",
+            relief=tk.RAISED,
+            bd=2
+        )
+        self.stop_btn.pack(side=tk.LEFT, padx=5)
+        
+        tk.Button(
+            btn_container,
+            text="Refresh",
+            command=self.refresh_data_async,
+            bg="#3498db",
+            fg="white",
+            font=("Arial", 11, "bold"),
+            width=12,
+            height=2,
+            cursor="hand2",
+            relief=tk.RAISED,
+            bd=2
+        ).pack(side=tk.LEFT, padx=5)
+        
+        tk.Button(
+            btn_container,
+            text="Start All",
+            command=self.start_all_stopped,
+            bg="#16a085",
+            fg="white",
+            font=("Arial", 11, "bold"),
+            width=12,
+            height=2,
+            cursor="hand2",
+            relief=tk.RAISED,
+            bd=2
+        ).pack(side=tk.LEFT, padx=5)
+        
+        tk.Button(
+            btn_container,
+            text="Change Credentials",
+            command=self.change_credentials,
+            bg="#9b59b6",
+            fg="white",
+            font=("Arial", 10, "bold"),
+            width=15,
+            height=2,
+            cursor="hand2",
+            relief=tk.RAISED,
+            bd=2
+        ).pack(side=tk.LEFT, padx=5)
+        
+        # Live feed controls
+        live_controls = tk.Frame(btn_container, bg="#ecf0f1")
+        live_controls.pack(side=tk.LEFT, padx=15)
+        
+        self.auto_refresh_var = tk.BooleanVar(value=True)
+        self.pause_resume_btn = tk.Button(
+            live_controls,
+            text="Pause Live",
+            command=self.toggle_auto_refresh,
+            bg="#e67e22",
+            fg="white",
+            font=("Arial", 10, "bold"),
+            width=12,
+            cursor="hand2",
+            relief=tk.RAISED,
+            bd=2
+        )
+        self.pause_resume_btn.pack(side=tk.LEFT, padx=5)
+        
+        # Refresh rate selector
+        rate_frame = tk.Frame(live_controls, bg="#ecf0f1")
+        rate_frame.pack(side=tk.LEFT, padx=10)
+        
+        tk.Label(
+            rate_frame,
+            text="Update every:",
+            font=("Arial", 9),
+            bg="#ecf0f1"
+        ).pack(side=tk.LEFT)
+        
+        self.refresh_rate_var = tk.IntVar(value=REFRESH_INTERVAL)
+        rate_options = [("2s", 2), ("3s", 3), ("5s", 5), ("10s", 10), ("30s", 30)]
+        
+        for text, value in rate_options:
+            rb = tk.Radiobutton(
+                rate_frame,
+                text=text,
+                variable=self.refresh_rate_var,
+                value=value,
+                command=self.update_refresh_rate,
+                font=("Arial", 9),
+                bg="#ecf0f1",
+                selectcolor="#3498db"
+            )
+            rb.pack(side=tk.LEFT, padx=2)
+        
+        # Search bar
+        search_frame = tk.Frame(self.root, bg="#ecf0f1", height=40)
+        search_frame.pack(fill=tk.X)
+        search_frame.pack_propagate(False)
+        
+        tk.Label(
+            search_frame,
+            text="Search:",
+            font=("Arial", 10),
+            bg="#ecf0f1"
+        ).pack(side=tk.LEFT, padx=10)
+        
+        self.search_entry = tk.Entry(search_frame, font=("Arial", 10), width=30)
+        self.search_entry.pack(side=tk.LEFT, padx=5)
+        self.search_entry.bind('<KeyRelease>', self.filter_vms)
+        
+        tk.Label(
+            search_frame,
+            text="Filter by ID, Name, Type, Status, Node",
+            font=("Arial", 9),
+            bg="#ecf0f1",
+            fg="#7f8c8d"
+        ).pack(side=tk.LEFT, padx=10)
+        
+        # Table with scrollbars
+        table_container = tk.Frame(self.root)
+        table_container.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
+        
+        # Create scrollbars
+        vsb = ttk.Scrollbar(table_container, orient="vertical")
+        hsb = ttk.Scrollbar(table_container, orient="horizontal")
+        
+        # Basic columns
+        columns = (
+            "ID", "Type", "Status", "Name", "Node", 
+            "Cores", "Sockets", "CPU", "Memory", "Disk", "Total FS", "Free Disk", "Free%"
+        )
+        
+        self.tree = ttk.Treeview(
+            table_container,
+            columns=columns,
+            show="tree headings",
+            yscrollcommand=vsb.set,
+            xscrollcommand=hsb.set,
+            selectmode="browse",
+            height=12
+        )
+        
+        # Connect scrollbars to tree
+        vsb.config(command=self.tree.yview)
+        hsb.config(command=self.tree.xview)
+        
+        self.tree.column("#0", width=0, stretch=tk.NO)
+        
+        # Column widths (increased for better visibility and earlier scrollbar activation)
+        column_widths = {
+            "ID": 80, "Type": 80, "Status": 110, "Name": 300, "Node": 150,
+            "Cores": 100, "Sockets": 110, "CPU": 180, "Memory": 250,
+            "Disk": 150, "Total FS": 150, "Free Disk": 150, "Free%": 110
         }
-    });
-}
-
-sub on_closing {
-    my ($self) = @_;
+        
+        for col in columns:
+            width = column_widths.get(col, 80)
+            self.tree.column(col, width=width, anchor="center")
+            self.tree.heading(col, text=col, anchor="center")
+        
+        # Configure colored tags for status highlighting
+        self.tree.tag_configure("running", background="#d5f4e6", foreground="#27ae60")
+        self.tree.tag_configure("stopped", background="#fadbd8", foreground="#e74c3c")
+        self.tree.tag_configure("paused", background="#fef5e7", foreground="#f39c12")
+        self.tree.tag_configure("unknown", background="#ecf0f1", foreground="#95a5a6")
+        
+        # Use grid layout for proper scrollbar positioning
+        self.tree.grid(row=0, column=0, sticky="nsew")
+        vsb.grid(row=0, column=1, sticky="ns")
+        hsb.grid(row=1, column=0, sticky="ew")
+        
+        # Configure grid weights so tree expands
+        table_container.grid_rowconfigure(0, weight=1)
+        table_container.grid_columnconfigure(0, weight=1)
+        
+        self.tree.bind("<<TreeviewSelect>>", self.on_select)
+        
+        # Status bar
+        status_bar = tk.Frame(self.root, bg="#34495e", height=30)
+        status_bar.pack(fill=tk.X)
+        status_bar.pack_propagate(False)
+        
+        self.status_label = tk.Label(
+            status_bar,
+            text="Ready",
+            font=("Arial", 9),
+            bg="#34495e",
+            fg="white",
+            anchor="w"
+        )
+        self.status_label.pack(side=tk.LEFT, padx=10, fill=tk.X, expand=True)
     
-    # Set flags to stop all operations
-    $self->{is_closing} = 1;
-    $self->{auto_refresh} = 0;
-    $self->{is_loading} = 0;
+    def authenticate(self):
+        """Handle authentication - API Token Only"""
+        
+        if os.path.exists(CREDENTIALS_FILE):
+            while True:
+                master_password = simpledialog.askstring(
+                    "Master Password",
+                    "Enter your master password:",
+                    show='*',
+                    parent=self.root
+                )
+                
+                if master_password is None:
+                    return False
+                
+                # Try to decrypt credentials
+                try:
+                    creds = CredentialManager.load_credentials(master_password)
+                except Exception as decrypt_error:
+                    logger.error(f"Failed to decrypt credentials: {str(decrypt_error)}")
+                    messagebox.showerror(
+                        "Decryption Error", 
+                        f"Failed to decrypt credentials:\n{str(decrypt_error)}\n\n"
+                        "Please check your master password."
+                    )
+                    continue  # Ask for password again
+                
+                if not creds:
+                    messagebox.showerror("Error", "No credentials found in file.")
+                    continue
+                
+                # Credentials decrypted successfully, now try to authenticate
+                try:
+                    self.api = ProxmoxAPI(
+                        creds['host'],
+                        token_id=creds['token_id'],
+                        token_secret=creds['token_secret']
+                    )
+                    
+                    self.status_label.config(text=f"Connected to {creds['host']}")
+                    self.ssl_label.config(text=f"SSL: {self.api.ssl_status}")
+                    self.connection_healthy = True
+                    logger.info(f"Successfully authenticated to {creds['host']}")
+                    return True
+                
+                except Exception as auth_error:
+                    # Authentication failed - token might be revoked or invalid
+                    logger.error(f"Authentication failed with stored credentials: {str(auth_error)}")
+                    
+                    # Ask user what to do
+                    response = messagebox.askyesno(
+                        "Authentication Failed",
+                        f"Failed to authenticate with stored credentials:\n\n{str(auth_error)}\n\n"
+                        "The API token may have been revoked or is invalid.\n\n"
+                        "Would you like to delete the old credentials and set up new ones?",
+                        icon='warning'
+                    )
+                    
+                    if response:
+                        # Delete old credentials and go to setup
+                        try:
+                            os.remove(CREDENTIALS_FILE)
+                            logger.info("Deleted invalid credentials file")
+                        except Exception as e:
+                            logger.error(f"Failed to delete credentials file: {e}")
+                        
+                        messagebox.showinfo(
+                            "Credentials Deleted",
+                            "Old credentials have been deleted.\n\n"
+                            "You will now be guided through setting up new credentials."
+                        )
+                        break  # Exit the while loop and go to setup flow
+                    else:
+                        # User chose not to delete, ask for password again
+                        continue
+        
+        # No credentials file exists OR user deleted it - show setup flow
+        messagebox.showinfo(
+            "Setup Required", 
+            "No credentials found.\n\n"
+            "You'll need to create an API token in Proxmox first.\n\n"
+            "The next screen will show you how."
+        )
+        guide = TokenCreationGuide(self.root)
+        self.root.wait_window(guide)
+        
+        # Now show credentials entry
+        dialog = CredentialsDialog(self.root, is_setup=True)
+        self.root.wait_window(dialog)
+        
+        if dialog.result:
+            auth_type, host, user, password, token_id, token_secret, master = dialog.result
+            try:
+                # Try to authenticate with new credentials
+                self.api = ProxmoxAPI(host, token_id=token_id, token_secret=token_secret)
+                CredentialManager.save_credentials(host, master, token_id, token_secret)
+                
+                messagebox.showinfo("Success", "Credentials saved successfully!")
+                self.status_label.config(text=f"Connected to {host}")
+                self.ssl_label.config(text=f"SSL: {self.api.ssl_status}")
+                self.connection_healthy = True
+                logger.info(f"Successfully set up connection to {host}")
+                return True
+            except Exception as e:
+                logger.error(f"Connection setup failed: {str(e)}")
+                messagebox.showerror("Error", f"Connection failed:\n{str(e)}")
+                return False
+        
+        return False
     
-    main::log_message('INFO', 'Dashboard closing');
+    def start_task_processor(self):
+        """Process async tasks"""
+        def process_tasks():
+            while True:
+                try:
+                    task = self.task_queue.get(timeout=1)
+                    if task:
+                        func, args, callback = task
+                        try:
+                            result = func(*args)
+                            if callback:
+                                self.root.after(0, lambda r=result: callback(r, None))
+                        except Exception as e:
+                            if callback:
+                                self.root.after(0, lambda er=e: callback(None, er))
+                except queue.Empty:
+                    continue
+                except Exception as e:
+                    logger.error(f"Task processor error: {e}")
+                    break
+        
+        task_thread = threading.Thread(target=process_tasks, daemon=True)
+        task_thread.start()
     
-    # Detach any active threads
-    if ($self->{active_thread}) {
-        eval { 
-            $self->{active_thread}->detach() if !$self->{active_thread}->is_joinable();
-        };
-    }
+    def run_async(self, func, args=(), callback=None):
+        """Run function asynchronously"""
+        self.task_queue.put((func, args, callback))
     
-    # Store main window ref temporarily
-    my $mw = $self->{mw};
+    def show_loading(self, message="Loading..."):
+        """Show loading indicator"""
+        self.is_loading = True
+        self.status_label.config(text=f"[Loading] {message}")
+        self.root.config(cursor="watch")
     
-    # Clear ALL widget references BEFORE destroying to avoid double-free
-    delete $self->{tree};
-    delete $self->{connection_label};
-    delete $self->{ssl_label};
-    delete $self->{node_label};
-    delete $self->{last_update_label};
-    delete $self->{running_count_label};
-    delete $self->{stopped_count_label};
-    delete $self->{status_label};
-    delete $self->{search_entry};
-    delete $self->{live_indicator};
-    delete $self->{pause_resume_btn};
-    delete $self->{node_temp_frame};
-    delete $self->{mw};
+    def hide_loading(self):
+        """Hide loading indicator"""
+        self.is_loading = False
+        self.root.config(cursor="")
     
-    # Now destroy the window - widget refs are gone so no double-free
-    $mw->destroy() if $mw && Tk::Exists($mw);
-}
+    def start_health_check(self):
+        """Start connection health check"""
+        def health_check_loop():
+            while True:
+                time.sleep(60)
+                try:
+                    if self.api:
+                        self.api.get('/version')
+                        self.connection_healthy = True
+                        self.root.after(0, lambda: [
+                            self.connection_label.config(text="Connected", fg="#27ae60"),
+                            self.update_led_color(self.connection_led, "#27ae60")
+                        ])
+                except Exception:
+                    self.connection_healthy = False
+                    self.root.after(0, lambda: [
+                        self.connection_label.config(text="Disconnected", fg="#e74c3c"),
+                        self.update_led_color(self.connection_led, "#e74c3c")
+                    ])
+                    self.root.after(0, self.attempt_reconnect)
+        
+        self.health_check_thread = threading.Thread(target=health_check_loop, daemon=True)
+        self.health_check_thread.start()
+    
+    def attempt_reconnect(self):
+        """Attempt reconnection"""
+        if self.is_loading:
+            return
+        
+        response = messagebox.askyesno(
+            "Connection Lost",
+            "Connection to Proxmox was lost. Attempt to reconnect?"
+        )
+        
+        if response:
+            self.show_loading("Reconnecting...")
+            
+            def try_reconnect():
+                try:
+                    self.api.get('/version')
+                    return True
+                except Exception:
+                    return False
+            
+            def reconnect_callback(success, error):
+                self.hide_loading()
+                if success:
+                    messagebox.showinfo("Success", "Reconnected successfully!")
+                    self.refresh_data_async()
+                else:
+                    messagebox.showerror("Error", "Reconnection failed. Please restart the application.")
+            
+            self.run_async(try_reconnect, callback=reconnect_callback)
+    
+    def filter_vms(self, event=None):
+        """Filter VMs based on search query"""
+        query = self.search_entry.get().lower()
+        
+        # Save current selection (VM ID) before clearing
+        selected_vm_id = None
+        selected_items = self.tree.selection()
+        if selected_items:
+            try:
+                selected_values = self.tree.item(selected_items[0])['values']
+                if selected_values:
+                    selected_vm_id = selected_values[0]  # VM ID is first column
+            except (IndexError, KeyError):
+                pass
+        
+        # Faster bulk delete
+        self.tree.delete(*self.tree.get_children())
+        
+        # Count statuses for summary
+        running_count = 0
+        stopped_count = 0
+        
+        self.filtered_vm_data = []
+        item_to_select = None
+        
+        for vm in self.vm_data:
+            if (query in str(vm.get('id', '')).lower() or
+                query in vm.get('name', '').lower() or
+                query in vm.get('type', '').lower() or
+                query in vm.get('status', '').lower() or
+                query in vm.get('node', '').lower()):
+                self.filtered_vm_data.append(vm)
+                
+                # Determine status tag
+                status = vm['status'].lower()
+                if status == 'running':
+                    tags = ('running',)
+                    running_count += 1
+                elif status == 'stopped':
+                    tags = ('stopped',)
+                    stopped_count += 1
+                elif status == 'paused':
+                    tags = ('paused',)
+                else:
+                    tags = ('unknown',)
+                
+                item = self.tree.insert('', 'end', values=(
+                    vm['id'], vm['type'], vm['status'], vm['name'], vm['node'],
+                    vm.get('cores', 'N/A'), vm.get('sockets', 'N/A'), vm.get('cpu', 'N/A'),
+                    vm.get('memory', 'N/A'), vm.get('disk', 'N/A'), vm.get('total_fs', 'N/A'),
+                    vm.get('free_disk', 'N/A'), vm.get('free_pct', 'N/A')
+                ), tags=tags)
+                
+                # Track the item to reselect
+                if selected_vm_id is not None and vm['id'] == selected_vm_id:
+                    item_to_select = item
+        
+        # Restore selection if found
+        if item_to_select:
+            self.tree.selection_set(item_to_select)
+            self.tree.see(item_to_select)  # Ensure visible
+        
+        # Update summary counts
+        self.running_count_label.config(text=f"Running: {running_count}")
+        self.stopped_count_label.config(text=f"Stopped: {stopped_count}")
+        
+        if query:
+            self.status_label.config(
+                text=f"Showing {len(self.filtered_vm_data)} of {len(self.vm_data)} VMs/CTs"
+            )
+        else:
+            self.status_label.config(text=f"Ready - {len(self.vm_data)} VMs/CTs across {self.node_count} node(s)")
+    
+    def format_bytes(self, bytes_val):
+        """Format bytes to human readable (binary units: GiB, MiB, etc)"""
+        if not bytes_val or bytes_val == 'N/A':
+            return 'N/A'
+        try:
+            bytes_val = float(bytes_val)
+            if bytes_val < 0:
+                return 'N/A'
+            for unit in ['B', 'KiB', 'MiB', 'GiB', 'TiB', 'PiB']:
+                if bytes_val < 1024 or unit == 'PiB':
+                    return f"{bytes_val:.1f} {unit}"  # Added space
+                bytes_val /= 1024
+        except (ValueError, TypeError) as e:
+            logger.error(f"Error formatting bytes value '{bytes_val}': {e}")
+            return 'N/A'
+    
+    def fetch_single_vm_data(self, node, vm, vm_type):
+        """Fetch basic data for a single VM/CT"""
+        try:
+            n = node['node']
+            endpoint = 'qemu' if vm_type == 'VM' else 'lxc'
+            vmid = vm['vmid']
+            
+            # Get config only
+            cfg = self.api.get(f'/nodes/{n}/{endpoint}/{vmid}/config')
+            
+            # Basic info
+            cores = cfg.get('cores', 'N/A')
+            
+            # Memory - STATIC CONFIG VALUES ONLY (not real-time)
+            if vm_type == 'VM':
+                # For VMs: Show minmem-maxmem (from balloon configuration)
+                try:
+                    memory_val = cfg.get('memory', 0)
+                    
+                    # Ensure memory_val is an integer
+                    if isinstance(memory_val, str):
+                        memory_val = int(memory_val)
+                    
+                    if 'balloon' in cfg:
+                        balloon_val = cfg.get('balloon', memory_val)
+                        if isinstance(balloon_val, str):
+                            balloon_val = int(balloon_val)
+                        
+                        minmem = int(balloon_val)
+                        maxmem = int(memory_val)
+                        
+                        if minmem > 0 and maxmem > 0:
+                            minmem_str = self.format_bytes(minmem * 1024 * 1024)
+                            maxmem_str = self.format_bytes(maxmem * 1024 * 1024)
+                            memory = f"{minmem_str}-{maxmem_str}"
+                        else:
+                            memory = self.format_bytes(memory_val * 1024 * 1024) if memory_val else 'N/A'
+                    else:
+                        memory = self.format_bytes(memory_val * 1024 * 1024) if memory_val else 'N/A'
+                except (ValueError, TypeError, KeyError) as e:
+                    logger.error(f"Error parsing memory for VM {vmid}: {e}, config: {cfg.get('memory')}, balloon: {cfg.get('balloon')}")
+                    memory = 'N/A'
+            else:  # CT
+                try:
+                    memory_mb = cfg.get('memory', 0)
+                    swap_mb = cfg.get('swap', 0)
+                    
+                    # Ensure they are integers
+                    if isinstance(memory_mb, str):
+                        memory_mb = int(memory_mb)
+                    if isinstance(swap_mb, str):
+                        swap_mb = int(swap_mb)
+                    
+                    memory_mb = int(memory_mb)
+                    swap_mb = int(swap_mb)
+                    
+                    if memory_mb > 0:
+                        mem_str = self.format_bytes(memory_mb * 1024 * 1024)
+                        if swap_mb > 0:
+                            swap_str = self.format_bytes(swap_mb * 1024 * 1024)
+                            memory = f"{mem_str}+{swap_str}"
+                        else:
+                            memory = mem_str
+                    else:
+                        memory = 'N/A'
+                except (ValueError, TypeError, KeyError) as e:
+                    logger.error(f"Error parsing memory for CT {vmid}: {e}, config: {cfg.get('memory')}, swap: {cfg.get('swap')}")
+                    memory = 'N/A'
+            
+            # Disk size
+            total_disk = 'N/A'
+            if vm_type == 'VM':
+                for key in sorted(cfg.keys()):
+                    if key.startswith(('scsi0', 'sata0', 'ide0', 'virtio0')):
+                        value = str(cfg[key])
+                        if 'size=' in value:
+                            size_str = value.split('size=')[1].split(',')[0].strip()
+                            if size_str.endswith('G'):
+                                total_disk = f"{size_str[:-1]}GiB"
+                            break
+            else:  # CT
+                rootfs = cfg.get('rootfs', '')
+                if 'size=' in str(rootfs):
+                    size_str = str(rootfs).split('size=')[1].split(',')[0].strip()
+                    if size_str.endswith('G'):
+                        total_disk = f"{size_str[:-1]}GiB"
+            
+            # Free disk and Free% - REAL-TIME DISK VALUES (only if running)
+            free_disk = 'N/A'
+            free_pct = 'N/A'
+            total_fs = 'N/A'
+            if vm['status'] == 'running':
+                try:
+                    if vm_type == 'VM':
+                        try:
+                            fsinfo = self.api.get(f'/nodes/{n}/qemu/{vmid}/agent/get-fsinfo')
+                            
+                            if 'result' in fsinfo and fsinfo['result']:
+                                filesystems = fsinfo['result']
+                                
+                                excluded_types = ['iso9660', 'udf', 'tmpfs', 'devtmpfs']
+                                included_mountpoints = ['/', '/boot', '/home', '/var', '/tmp', '/usr']
+                                
+                                total_bytes_sum = 0
+                                used_bytes_sum = 0
+                                
+                                for fs in filesystems:
+                                    fs_type = fs.get('type', '').lower()
+                                    mountpoint = fs.get('mountpoint', '')
+                                    
+                                    if fs_type in excluded_types:
+                                        continue
+                                    
+                                    if mountpoint not in included_mountpoints:
+                                        continue
+                                    
+                                    if 'total-bytes' in fs and 'used-bytes' in fs:
+                                        fs_total = fs.get('total-bytes', 0)
+                                        fs_used = fs.get('used-bytes', 0)
+                                        
+                                        if fs_total > 0:
+                                            total_bytes_sum += fs_total
+                                            used_bytes_sum += fs_used
+                                
+                                if total_bytes_sum > 0:
+                                    total_fs = self.format_bytes(total_bytes_sum)
+                                    free_bytes = total_bytes_sum - used_bytes_sum
+                                    if free_bytes >= 0:
+                                        free_disk = self.format_bytes(free_bytes)
+                                        free_pct = f"{(free_bytes / total_bytes_sum * 100):.1f}%"
+                        
+                        except Exception as e:
+                            logger.debug(f"Guest agent not available for VM {vmid}, using status method: {e}")
+                            stat = self.api.get(f'/nodes/{n}/qemu/{vmid}/status/current')
+                            disk_used = stat.get('disk', 0)
+                            disk_max = stat.get('maxdisk', 0)
+                            
+                            if disk_max > 0 and disk_used >= 0:
+                                total_fs = self.format_bytes(disk_max)
+                                free_bytes = disk_max - disk_used
+                                if free_bytes >= 0:
+                                    free_disk = self.format_bytes(free_bytes)
+                                    free_pct = f"{(free_bytes / disk_max * 100):.1f}%"
+                    
+                    else:  # CT
+                        stat = self.api.get(f'/nodes/{n}/lxc/{vmid}/status/current')
+                        disk_used = stat.get('disk', 0)
+                        disk_max = stat.get('maxdisk', 0)
+                        
+                        if disk_max > 0 and disk_used >= 0:
+                            total_fs = self.format_bytes(disk_max)
+                            free_bytes = disk_max - disk_used
+                            if free_bytes >= 0:
+                                free_disk = self.format_bytes(free_bytes)
+                                free_pct = f"{(free_bytes / disk_max * 100):.1f}%"
+                
+                except Exception as e:
+                    logger.debug(f"Error getting disk data for {vm_type} {vmid}: {e}")
+                    pass
+            
+            # Additional CPU info
+            sockets = cfg.get('sockets', 'N/A') if vm_type == 'VM' else 'N/A'
+            cpu_type = cfg.get('cpu', 'N/A') if vm_type == 'VM' else 'N/A'
+            
+            vm_info = {
+                'id': vmid,
+                'type': vm_type,
+                'status': vm['status'],
+                'name': vm['name'],
+                'node': n,
+                'cores': cores,
+                'sockets': sockets,
+                'cpu': cpu_type,
+                'memory': memory,
+                'disk': total_disk,
+                'total_fs': total_fs,
+                'free_disk': free_disk,
+                'free_pct': free_pct
+            }
+            
+            return vm_info
+            
+        except Exception as e:
+            logger.error(f"Error getting {vm_type} {vm['vmid']}: {e}")
+            return None
+    
+    def refresh_data_async(self):
+        """Refresh data asynchronously with parallel processing"""
+        if self.is_loading:
+            return
+        
+        # Check if API is available
+        if not self.api:
+            logger.warning("Refresh called but API not available - skipping")
+            self.status_label.config(text="Not connected - waiting for credentials")
+            self.connection_label.config(text="Disconnected", fg="#e74c3c")
+            self.update_led_color(self.connection_led, "#e74c3c")
+            return
+        
+        self.show_loading("Fetching data from Proxmox...")
+        
+        def fetch_data():
+            return self._fetch_vm_data_parallel()
+        
+        def update_ui(result, error):
+            self.hide_loading()
+            if error:
+                logger.error(f"Refresh failed: {str(error)}")
+                self.status_label.config(text=f"Error: {str(error)}")
+                self.connection_label.config(text="Disconnected", fg="#e74c3c")
+                self.update_led_color(self.connection_led, "#e74c3c")
+                messagebox.showerror("Error", f"Failed to refresh:\n{str(error)}")
+            else:
+                self.vm_data = result
+                self.filter_vms()
+                now = datetime.now().strftime("%H:%M:%S")
+                
+                if self.auto_refresh:
+                    refresh_rate = self.refresh_rate_var.get()
+                    self.last_update_label.config(text=f"LIVE - Updated: {now} (every {refresh_rate}s)")
+                else:
+                    self.last_update_label.config(text=f"Updated: {now} (paused)")
+                
+                self.connection_label.config(text="Connected", fg="#27ae60")
+                self.update_led_color(self.connection_led, "#27ae60")
+                
+                # Update node temperatures
+                self.update_node_temperatures()
+        
+        self.run_async(fetch_data, callback=update_ui)
+    
+    def _fetch_vm_data_parallel(self):
+        """Fetch VM data using simple serial processing"""
+        vm_data = []
+        nodes = self.api.get('/nodes')
+        self.node_count = len(nodes)
+        
+        # Update node count in UI
+        self.root.after(0, lambda: self.node_label.config(text=f"Nodes: {self.node_count}"))
+        
+        # Count total VMs/CTs first for progress
+        total_count = 0
+        for node in nodes:
+            n = node['node']
+            try:
+                vms = self.api.get(f'/nodes/{n}/qemu')
+                total_count += len(vms)
+            except Exception as e:
+                logger.error(f"Error counting VMs from node {n}: {e}")
+            
+            try:
+                cts = self.api.get(f'/nodes/{n}/lxc')
+                total_count += len(cts)
+            except Exception as e:
+                logger.error(f"Error counting CTs from node {n}: {e}")
+        
+        # Process each VM/CT sequentially
+        current = 0
+        for node in nodes:
+            n = node['node']
+            
+            # Get and process VMs
+            try:
+                vms = self.api.get(f'/nodes/{n}/qemu')
+                for vm in vms:
+                    current += 1
+                    
+                    try:
+                        vm_info = self.fetch_single_vm_data(node, vm, 'VM')
+                        if vm_info:
+                            vm_data.append(vm_info)
+                    except Exception as e:
+                        logger.error(f"Error getting VM {vm['vmid']}: {e}")
+            except Exception as e:
+                logger.error(f"Error getting VMs from node {n}: {e}")
+            
+            # Get and process Containers
+            try:
+                cts = self.api.get(f'/nodes/{n}/lxc')
+                for ct in cts:
+                    current += 1
+                    
+                    try:
+                        ct_info = self.fetch_single_vm_data(node, ct, 'CT')
+                        if ct_info:
+                            vm_data.append(ct_info)
+                    except Exception as e:
+                        logger.error(f"Error getting CT {ct['vmid']}: {e}")
+            except Exception as e:
+                logger.error(f"Error getting CTs from node {n}: {e}")
+        
+        vm_data.sort(key=lambda x: x['id'])
+        return vm_data
+    
+    def on_select(self, event):
+        """Handle tree selection"""
+        selection = self.tree.selection()
+        if not selection:
+            return
+        
+        item = self.tree.item(selection[0])
+        values = item['values']
+        
+        if not values or len(values) < 12:
+            return
+        
+        status = values[2]
+        
+        if status == 'running':
+            self.stop_btn.config(bg="#27ae60", state=tk.NORMAL)
+            self.start_btn.config(bg="#e74c3c", state=tk.DISABLED)
+        else:
+            self.start_btn.config(bg="#27ae60", state=tk.NORMAL)
+            self.stop_btn.config(bg="#e74c3c", state=tk.DISABLED)
+    
+    def get_selected_vm(self):
+        """Get selected VM/CT"""
+        selection = self.tree.selection()
+        if not selection:
+            messagebox.showwarning("Warning", "Please select a VM/CT")
+            return None
+        
+        item = self.tree.item(selection[0])
+        values = item['values']
+        
+        if not values or len(values) < 1:
+            messagebox.showerror("Error", "Invalid selection")
+            return None
+        
+        vmid = values[0]
+        
+        for vm in self.vm_data:
+            if vm.get('id') == vmid:
+                return vm
+        return None
+    
+    def start_selected(self):
+        """Start selected VM/CT"""
+        vm = self.get_selected_vm()
+        if not vm:
+            return
+        
+        self.show_loading(f"Starting {vm['type']} {vm['id']}...")
+        
+        def start_vm():
+            try:
+                endpoint = 'qemu' if vm['type'] == 'VM' else 'lxc'
+                self.api.post(f"/nodes/{vm['node']}/{endpoint}/{vm['id']}/status/start")
+                AuditLogger.log_vm_action("START", vm['id'], vm['type'], vm['name'], True)
+                return True
+            except Exception as e:
+                AuditLogger.log_vm_action("START", vm['id'], vm['type'], vm['name'], False, str(e))
+                raise
+        
+        def start_callback(success, error):
+            self.hide_loading()
+            if error:
+                messagebox.showerror("Error", f"Failed to start:\n{str(error)}")
+            else:
+                self.status_label.config(text=f"Started {vm['type']} {vm['id']} ({vm['name']})")
+                self.root.after(2000, self.refresh_data_async)
+        
+        self.run_async(start_vm, callback=start_callback)
+    
+    def stop_selected(self):
+        """Stop selected VM/CT"""
+        vm = self.get_selected_vm()
+        if not vm:
+            return
+        
+        if not messagebox.askyesno("Confirm", f"Stop {vm['type']} {vm['id']} ({vm['name']})?"):
+            return
+        
+        self.show_loading(f"Stopping {vm['type']} {vm['id']}...")
+        
+        def stop_vm():
+            try:
+                endpoint = 'qemu' if vm['type'] == 'VM' else 'lxc'
+                self.api.post(f"/nodes/{vm['node']}/{endpoint}/{vm['id']}/status/stop")
+                AuditLogger.log_vm_action("STOP", vm['id'], vm['type'], vm['name'], True)
+                return True
+            except Exception as e:
+                AuditLogger.log_vm_action("STOP", vm['id'], vm['type'], vm['name'], False, str(e))
+                raise
+        
+        def stop_callback(success, error):
+            self.hide_loading()
+            if error:
+                messagebox.showerror("Error", f"Failed to stop:\n{str(error)}")
+            else:
+                self.status_label.config(text=f"Stopped {vm['type']} {vm['id']} ({vm['name']})")
+                self.root.after(2000, self.refresh_data_async)
+        
+        self.run_async(stop_vm, callback=stop_callback)
+    
+    def change_credentials(self):
+        """Allow user to change stored credentials"""
+        response = messagebox.askyesno(
+            "Change Credentials",
+            "This will delete your current credentials and guide you through setting up new ones.\n\n"
+            "Continue?",
+            icon='warning'
+        )
+        
+        if not response:
+            return
+        
+        # Stop auto-refresh to prevent errors during credential change
+        self.auto_refresh = False
+        
+        # Delete old credentials
+        try:
+            if os.path.exists(CREDENTIALS_FILE):
+                os.remove(CREDENTIALS_FILE)
+                logger.info("Old credentials file deleted")
+        except Exception as e:
+            logger.error(f"Failed to delete credentials file: {e}")
+            messagebox.showerror("Error", f"Failed to delete credentials:\n{str(e)}")
+            self.auto_refresh = True
+            return
+        
+        # Close current API connection
+        self.api = None
+        self.connection_healthy = False
+        self.status_label.config(text="Not connected - setting up new credentials")
+        self.connection_label.config(text="Disconnected", fg="#e74c3c")
+        self.update_led_color(self.connection_led, "#e74c3c")
+        
+        # Clear temperature data
+        self.node_temp_api_available = {}
+        self.node_addresses = {}
+        self.node_temps_full_data = {}
+        
+        # Show setup flow
+        messagebox.showinfo(
+            "Setup New Credentials",
+            "You'll need to create a new API token in Proxmox.\n\n"
+            "The next screen will show you how."
+        )
+        
+        guide = TokenCreationGuide(self.root)
+        self.root.wait_window(guide)
+        
+        # Show credentials entry
+        dialog = CredentialsDialog(self.root, is_setup=True)
+        self.root.wait_window(dialog)
+        
+        if dialog.result:
+            auth_type, host, user, password, token_id, token_secret, master = dialog.result
+            try:
+                # Try to authenticate with new credentials
+                self.api = ProxmoxAPI(host, token_id=token_id, token_secret=token_secret)
+                
+                # Save credentials and verify
+                CredentialManager.save_credentials(host, master, token_id, token_secret)
+                
+                if not os.path.exists(CREDENTIALS_FILE):
+                    raise Exception(f"Credentials file was not created")
+                
+                messagebox.showinfo("Success", "New credentials saved successfully!\n\nThe dashboard will now refresh.")
+                self.status_label.config(text=f"Connected to {host}")
+                self.ssl_label.config(text=f"SSL: {self.api.ssl_status}")
+                self.connection_healthy = True
+                logger.info(f"Successfully changed credentials to {host}")
+                
+                # Re-enable auto-refresh
+                self.auto_refresh = True
+                
+                # Re-check temperature API status
+                self.root.after(1000, self.check_temperature_api_status)
+                
+                # Refresh dashboard
+                self.refresh_data_async()
+                
+            except Exception as e:
+                logger.error(f"Credential change failed: {str(e)}")
+                messagebox.showerror(
+                    "Error", 
+                    f"Failed to set up new credentials:\n\n{str(e)}\n\n"
+                    f"Please restart the dashboard and try again."
+                )
+                self.connection_healthy = False
+                self.root.quit()
+        else:
+            logger.warning("User cancelled credential change")
+            messagebox.showwarning(
+                "Cancelled",
+                "Credential change cancelled.\n\n"
+                "Your old credentials were already deleted.\n"
+                "You'll need to restart the dashboard and set up credentials to continue."
+            )
+            self.root.quit()
 
-sub run {
-    my ($self) = @_;
-    Tk::MainLoop();
-}
+    def start_all_stopped(self):
+        """Start all stopped VMs/CTs"""
+        stopped = [vm for vm in self.vm_data if vm['status'] != 'running']
+        
+        if not stopped:
+            messagebox.showinfo("Info", "All VMs/CTs are already running")
+            return
+        
+        if not messagebox.askyesno("Confirm", f"Start {len(stopped)} stopped VMs/CTs?"):
+            return
+        
+        self.show_loading(f"Starting {len(stopped)} VMs/CTs...")
+        
+        def start_all():
+            results = []
+            for vm in stopped:
+                try:
+                    endpoint = 'qemu' if vm['type'] == 'VM' else 'lxc'
+                    self.api.post(f"/nodes/{vm['node']}/{endpoint}/{vm['id']}/status/start")
+                    AuditLogger.log_vm_action("START_ALL", vm['id'], vm['type'], vm['name'], True)
+                    results.append((vm['id'], True))
+                except Exception as e:
+                    AuditLogger.log_vm_action("START_ALL", vm['id'], vm['type'], vm['name'], False, str(e))
+                    results.append((vm['id'], False))
+            return results
+        
+        def start_all_callback(results, error):
+            self.hide_loading()
+            if error:
+                messagebox.showerror("Error", f"Failed to start all:\n{str(error)}")
+            else:
+                success_count = sum(1 for _, success in results if success)
+                self.status_label.config(text=f"Started {success_count}/{len(stopped)} VMs/CTs")
+                self.root.after(3000, self.refresh_data_async)
+        
+        self.run_async(start_all, callback=start_all_callback)
+    
+    def toggle_auto_refresh(self):
+        """Toggle live feed"""
+        self.auto_refresh = not self.auto_refresh
+        self.auto_refresh_var.set(self.auto_refresh)
+        
+        if self.auto_refresh:
+            self.pause_resume_btn.config(
+                text="Pause Live",
+                bg="#e67e22"
+            )
+            self.live_indicator.config(
+                text="LIVE",
+                fg="#27ae60"
+            )
+            self.update_led_color(self.live_led, "#27ae60")
+            self.status_label.config(text="Live feed enabled")
+            logger.info("Live feed enabled")
+        else:
+            self.pause_resume_btn.config(
+                text="Resume Live",
+                bg="#27ae60"
+            )
+            self.live_indicator.config(
+                text="PAUSED",
+                fg="#95a5a6"
+            )
+            self.update_led_color(self.live_led, "#95a5a6")
+            self.status_label.config(text="Live feed paused")
+            logger.info("Live feed paused")
+    
+    def update_refresh_rate(self):
+        """Update the refresh rate"""
+        new_rate = self.refresh_rate_var.get()
+        logger.info(f"Refresh rate changed to {new_rate} seconds")
+        self.status_label.config(text=f"Update interval set to {new_rate}s")
+    
+    def start_auto_refresh(self):
+        """Start live feed auto-refresh thread"""
+        self.refresh_data_async()
+        
+        def auto_refresh_loop():
+            while True:
+                refresh_interval = self.refresh_rate_var.get()
+                time.sleep(refresh_interval)
+                
+                if self.auto_refresh:
+                    try:
+                        self.root.after(0, self.refresh_data_async)
+                    except Exception:
+                        break
+        
+        self.refresh_thread = threading.Thread(target=auto_refresh_loop, daemon=True)
+        self.refresh_thread.start()
+        logger.info(f"Live feed started with {REFRESH_INTERVAL}s refresh rate")
+    
+    def on_closing(self):
+        """Handle window close event - cleanup resources"""
+        self.auto_refresh = False
+        time.sleep(0.5)
+        self.root.destroy()
+    
+    def safe_ui_update(self, callback):
+        """Safely update UI from background thread"""
+        try:
+            if self.root.winfo_exists():
+                callback()
+        except tk.TclError:
+            pass
 
-################################################################################
-# Main Entry Point
-################################################################################
-package main;
 
-# Check for required modules
-my @required_modules = qw(
-    Tk LWP::UserAgent LWP::Protocol::https JSON MIME::Base64 
-    Digest::SHA Crypt::CBC Crypt::OpenSSL::AES
-    threads Thread::Queue Time::HiRes
-);
+def main():
+    root = tk.Tk()
+    app = ProxmoxDashboard(root)
+    root.mainloop()
 
-foreach my $module (@required_modules) {
-    eval "use $module";
-    if ($@) {
-        print STDERR "ERROR: Required Perl module '$module' not installed.\n";
-        print STDERR "Install with: cpan $module\n";
-        print STDERR "Or: apt-get install lib" . lc($module) . "-perl\n";
-        print STDERR "Or: yum/dnf install perl-" . $module . "\n\n";
-        exit 1;
-    }
-}
 
-log_message('INFO', 'All required modules loaded');
-
-# Create and run dashboard
-my $dashboard = ProxmoxDashboard->new();
-$dashboard->run() if $dashboard;
-
-log_message('INFO', 'Dashboard exiting');
+if __name__ == '__main__':
+    main()
