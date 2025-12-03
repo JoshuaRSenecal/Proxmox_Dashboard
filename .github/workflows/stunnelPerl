@@ -923,6 +923,7 @@ sub new {
         vm_data => [],
         filtered_vm_data => [],
         is_loading => 0,
+        is_closing => 0,
         connection_healthy => 0,
         node_count => 0,
         refresh_interval => $REFRESH_INTERVAL,
@@ -931,13 +932,14 @@ sub new {
         node_temps_full_data => {},
         refresh_thread => undef,
         health_thread => undef,
+        active_thread => undef,
     };
     
     bless $self, $class;
     
     # Create main window
     $self->{mw} = MainWindow->new;
-    $self->{mw}->title("Proxmox Dashboard - Live Feed (Perl Full)");
+    $self->{mw}->title("Proxmox VM/CT Dashboard - Live Feed");
     $self->{mw}->geometry("1600x900");
     
     # Center window
@@ -980,7 +982,7 @@ sub create_widgets {
     
     # Title
     $top_frame->Label(
-        -text => "Proxmox VM/Container Dashboard (Perl Full)",
+        -text => "Proxmox VM/CT Dashboard",
         -font => ['Arial', 18, 'bold'],
         -background => '#2c3e50',
         -foreground => 'white'
@@ -1670,6 +1672,7 @@ sub refresh_data_async {
     my ($self) = @_;
     
     return if $self->{is_loading};
+    return if $self->{is_closing};
     return unless $self->{api};
     
     $self->{is_loading} = 1;
@@ -1733,12 +1736,26 @@ sub refresh_data_async {
         return \@vm_data;
     });
     
-    # Wait for thread and update UI
+    # Store active thread
+    $self->{active_thread} = $thread;
+    
+    # Wait for thread with timeout
+    my $wait_count = 0;
+    my $max_wait = 300; # 30 seconds maximum wait (300 * 100ms)
+    
     $self->{mw}->after(100, sub {
+        # Check if we're closing - detach thread and exit
+        if ($self->{is_closing}) {
+            $thread->detach() if $thread && !$thread->is_joinable();
+            return;
+        }
+        
+        # Check if thread finished
         if ($thread->is_joinable()) {
             my $vm_data = $thread->join();
             $self->{vm_data} = $vm_data;
             $self->{is_loading} = 0;
+            $self->{active_thread} = undef;
             $self->{mw}->configure(-cursor => '');
             
             $self->filter_vms();
@@ -1754,8 +1771,18 @@ sub refresh_data_async {
             
             # Update temperatures
             $self->update_node_temperatures();
-        } else {
+        } elsif ($wait_count < $max_wait) {
+            # Keep waiting
+            $wait_count++;
             $self->{mw}->after(100, sub { $self->refresh_data_async() });
+        } else {
+            # Timeout - detach thread and reset
+            main::log_message('ERROR', 'Data fetch timeout - detaching thread');
+            $thread->detach();
+            $self->{is_loading} = 0;
+            $self->{active_thread} = undef;
+            $self->{mw}->configure(-cursor => '');
+            $self->{status_label}->configure(-text => "Timeout fetching data - please retry");
         }
     });
 }
@@ -2085,8 +2112,23 @@ sub start_health_check {
 
 sub on_closing {
     my ($self) = @_;
+    
+    # Set closing flag to stop any pending operations
+    $self->{is_closing} = 1;
     $self->{auto_refresh} = 0;
-    Time::HiRes::sleep(0.5);
+    
+    main::log_message('INFO', 'Dashboard closing - cleaning up threads');
+    
+    # Detach any active threads to prevent blocking
+    if ($self->{active_thread} && !$self->{active_thread}->is_joinable()) {
+        eval { $self->{active_thread}->detach() };
+    }
+    
+    # Give threads a moment to detach
+    $self->{mw}->update();
+    Time::HiRes::sleep(0.2);
+    
+    # Force destroy the window
     $self->{mw}->destroy();
 }
 
