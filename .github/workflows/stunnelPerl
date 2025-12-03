@@ -1565,14 +1565,14 @@ sub update_node_temperatures {
     # Proper polling callback
     my $poll;
     $poll = sub {
-        return if $self->{is_closing};
+        return if $self->{is_closing} || !Tk::Exists($self->{mw});
         return unless $thread;
         
         if ($thread->is_joinable()) {
             my $node_temps = $thread->join();
-            $self->update_temp_ui($node_temps) unless $self->{is_closing};
+            $self->update_temp_ui($node_temps) if Tk::Exists($self->{mw});
         } else {
-            $self->{mw}->after(100, $poll);
+            $self->{mw}->after(100, $poll) if Tk::Exists($self->{mw});
         }
     };
     
@@ -1751,8 +1751,8 @@ sub refresh_data_async {
     # Define the polling function that references itself
     my $poll_thread;
     $poll_thread = sub {
-        # Check if we're closing - detach thread and exit
-        if ($self->{is_closing}) {
+        # Check if we're closing or window destroyed
+        if ($self->{is_closing} || !Tk::Exists($self->{mw})) {
             $thread->detach() if $thread && !$thread->is_joinable();
             $self->{is_loading} = 0;
             $self->{active_thread} = undef;
@@ -1765,33 +1765,38 @@ sub refresh_data_async {
             $self->{vm_data} = $vm_data;
             $self->{is_loading} = 0;
             $self->{active_thread} = undef;
-            $self->{mw}->configure(-cursor => '');
             
+            # Only update widgets if they still exist
+            return unless Tk::Exists($self->{mw});
+            
+            $self->{mw}->configure(-cursor => '');
             $self->filter_vms();
             
             my $now = strftime("%H:%M:%S", localtime);
             my $interval = $self->{refresh_interval};
             $self->{last_update_label}->configure(
                 -text => "LIVE - Updated: $now (every ${interval}s)"
-            );
+            ) if Tk::Exists($self->{last_update_label});
             
-            $self->{connection_label}->configure(-foreground => '#27ae60');
-            $self->{node_label}->configure(-text => "Nodes: $self->{node_count}");
+            $self->{connection_label}->configure(-foreground => '#27ae60') if Tk::Exists($self->{connection_label});
+            $self->{node_label}->configure(-text => "Nodes: $self->{node_count}") if Tk::Exists($self->{node_label});
             
             # Update temperatures
             $self->update_node_temperatures();
         } elsif ($wait_count < $max_wait) {
             # Keep waiting - increment counter and schedule next poll
             $wait_count++;
-            $self->{mw}->after(100, $poll_thread);
+            $self->{mw}->after(100, $poll_thread) if Tk::Exists($self->{mw});
         } else {
             # Timeout - detach thread and reset
             main::log_message('ERROR', 'Data fetch timeout - detaching thread');
             $thread->detach();
             $self->{is_loading} = 0;
             $self->{active_thread} = undef;
+            
+            return unless Tk::Exists($self->{mw});
             $self->{mw}->configure(-cursor => '');
-            $self->{status_label}->configure(-text => "Timeout fetching data - please retry");
+            $self->{status_label}->configure(-text => "Timeout fetching data - please retry") if Tk::Exists($self->{status_label});
         }
     };
     
@@ -1898,13 +1903,15 @@ sub start_selected {
     # Proper polling callback
     my $poll;
     $poll = sub {
-        return if $self->{is_closing};
+        return if $self->{is_closing} || !Tk::Exists($self->{mw});
         
         if ($thread->is_joinable()) {
             my $result = $thread->join();
             
+            return unless Tk::Exists($self->{mw});
+            
             if ($result eq "SUCCESS") {
-                $self->{status_label}->configure(-text => "Started $vm->{type} $vm->{id} ($vm->{name})");
+                $self->{status_label}->configure(-text => "Started $vm->{type} $vm->{id} ($vm->{name})") if Tk::Exists($self->{status_label});
                 $self->{mw}->after(2000, sub { $self->refresh_data_async() unless $self->{is_closing} });
             } else {
                 $self->{mw}->messageBox(
@@ -1912,10 +1919,10 @@ sub start_selected {
                     -message => "Failed to start:\n$result",
                     -type => 'OK',
                     -icon => 'error'
-                ) unless $self->{is_closing};
+                );
             }
         } else {
-            $self->{mw}->after(100, $poll);
+            $self->{mw}->after(100, $poll) if Tk::Exists($self->{mw});
         }
     };
     
@@ -1963,13 +1970,15 @@ sub stop_selected {
     # Proper polling callback
     my $poll;
     $poll = sub {
-        return if $self->{is_closing};
+        return if $self->{is_closing} || !Tk::Exists($self->{mw});
         
         if ($thread->is_joinable()) {
             my $result = $thread->join();
             
+            return unless Tk::Exists($self->{mw});
+            
             if ($result eq "SUCCESS") {
-                $self->{status_label}->configure(-text => "Stopped $vm->{type} $vm->{id} ($vm->{name})");
+                $self->{status_label}->configure(-text => "Stopped $vm->{type} $vm->{id} ($vm->{name})") if Tk::Exists($self->{status_label});
                 $self->{mw}->after(2000, sub { $self->refresh_data_async() unless $self->{is_closing} });
             } else {
                 $self->{mw}->messageBox(
@@ -1977,10 +1986,10 @@ sub stop_selected {
                     -message => "Failed to stop:\n$result",
                     -type => 'OK',
                     -icon => 'error'
-                ) unless $self->{is_closing};
+                );
             }
         } else {
-            $self->{mw}->after(100, $poll);
+            $self->{mw}->after(100, $poll) if Tk::Exists($self->{mw});
         }
     };
     
@@ -2037,16 +2046,19 @@ sub start_all_stopped {
     # Proper polling callback
     my $poll;
     $poll = sub {
-        return if $self->{is_closing};
+        return if $self->{is_closing} || !Tk::Exists($self->{mw});
         
         if ($thread->is_joinable()) {
             my $success_count = $thread->join();
+            
+            return unless Tk::Exists($self->{mw});
+            
             $self->{status_label}->configure(
                 -text => "Started $success_count/" . scalar(@stopped) . " VMs/CTs"
-            );
+            ) if Tk::Exists($self->{status_label});
             $self->{mw}->after(3000, sub { $self->refresh_data_async() unless $self->{is_closing} });
         } else {
-            $self->{mw}->after(100, $poll);
+            $self->{mw}->after(100, $poll) if Tk::Exists($self->{mw});
         }
     };
     
@@ -2090,6 +2102,8 @@ sub start_auto_refresh {
     
     # Set up periodic refresh
     $self->{mw}->repeat($self->{refresh_interval} * 1000, sub {
+        return if $self->{is_closing};
+        return unless Tk::Exists($self->{mw});
         $self->refresh_data_async() if $self->{auto_refresh};
     });
     
@@ -2101,17 +2115,23 @@ sub start_health_check {
     
     # Periodic health check
     $self->{mw}->repeat(60000, sub {
+        return if $self->{is_closing};
+        return unless Tk::Exists($self->{mw});
         return unless $self->{api};
         
         eval {
             $self->{api}->get('/version');
             $self->{connection_healthy} = 1;
-            $self->{connection_label}->configure(-foreground => '#27ae60');
+            $self->{connection_label}->configure(-foreground => '#27ae60') if Tk::Exists($self->{connection_label});
         };
         
         if ($@) {
             $self->{connection_healthy} = 0;
-            $self->{connection_label}->configure(-foreground => '#e74c3c');
+            return if $self->{is_closing};
+            
+            $self->{connection_label}->configure(-foreground => '#e74c3c') if Tk::Exists($self->{connection_label});
+            
+            return if $self->{is_closing};
             
             my $response = $self->{mw}->messageBox(
                 -title => "Connection Lost",
@@ -2120,26 +2140,30 @@ sub start_health_check {
                 -icon => 'warning'
             );
             
+            return if $self->{is_closing};
+            
             if ($response eq 'Yes') {
                 eval {
                     $self->{api}->get('/version');
                     $self->{connection_healthy} = 1;
+                    return if $self->{is_closing};
                     $self->{mw}->messageBox(
                         -title => "Success",
                         -message => "Reconnected successfully!",
                         -type => 'OK',
                         -icon => 'info'
-                    );
-                    $self->refresh_data_async();
+                    ) if Tk::Exists($self->{mw});
+                    $self->refresh_data_async() unless $self->{is_closing};
                 };
                 
                 if ($@) {
+                    return if $self->{is_closing};
                     $self->{mw}->messageBox(
                         -title => "Error",
                         -message => "Reconnection failed. Please restart the application.",
                         -type => 'OK',
                         -icon => 'error'
-                    );
+                    ) if Tk::Exists($self->{mw});
                 }
             }
         }
@@ -2154,20 +2178,19 @@ sub on_closing {
     $self->{auto_refresh} = 0;
     $self->{is_loading} = 0;
     
-    main::log_message('INFO', 'Dashboard closing - forcing immediate exit');
+    main::log_message('INFO', 'Dashboard closing');
     
-    # Detach any active threads without waiting
+    # Detach any active threads
     if ($self->{active_thread}) {
         eval { 
             $self->{active_thread}->detach() if !$self->{active_thread}->is_joinable();
         };
     }
     
-    # Don't wait - destroy immediately
-    eval { $self->{mw}->destroy() };
-    
-    # Force exit if window didn't destroy
-    exit(0);
+    # Just destroy - callbacks will check is_closing and exit naturally
+    if ($self->{mw} && Tk::Exists($self->{mw})) {
+        $self->{mw}->destroy();
+    }
 }
 
 sub run {
