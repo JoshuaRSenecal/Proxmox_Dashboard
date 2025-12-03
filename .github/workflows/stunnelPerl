@@ -1556,22 +1556,27 @@ sub update_node_temperatures {
     my ($self) = @_;
     
     return unless $self->{api};
+    return if $self->{is_closing};
     
     my $thread = threads->create(sub {
         return $self->get_all_node_temperatures();
     });
     
-    # Check if thread finished, update UI
-    $self->{mw}->after(100, sub {
+    # Proper polling callback
+    my $poll;
+    $poll = sub {
+        return if $self->{is_closing};
         return unless $thread;
         
         if ($thread->is_joinable()) {
             my $node_temps = $thread->join();
-            $self->update_temp_ui($node_temps);
+            $self->update_temp_ui($node_temps) unless $self->{is_closing};
         } else {
-            $self->{mw}->after(100, sub { $self->update_node_temperatures() });
+            $self->{mw}->after(100, $poll);
         }
-    });
+    };
+    
+    $self->{mw}->after(100, $poll);
 }
 
 sub update_temp_ui {
@@ -1739,14 +1744,18 @@ sub refresh_data_async {
     # Store active thread
     $self->{active_thread} = $thread;
     
-    # Wait for thread with timeout
+    # Create polling callback with proper closure
     my $wait_count = 0;
     my $max_wait = 300; # 30 seconds maximum wait (300 * 100ms)
     
-    $self->{mw}->after(100, sub {
+    # Define the polling function that references itself
+    my $poll_thread;
+    $poll_thread = sub {
         # Check if we're closing - detach thread and exit
         if ($self->{is_closing}) {
             $thread->detach() if $thread && !$thread->is_joinable();
+            $self->{is_loading} = 0;
+            $self->{active_thread} = undef;
             return;
         }
         
@@ -1772,9 +1781,9 @@ sub refresh_data_async {
             # Update temperatures
             $self->update_node_temperatures();
         } elsif ($wait_count < $max_wait) {
-            # Keep waiting
+            # Keep waiting - increment counter and schedule next poll
             $wait_count++;
-            $self->{mw}->after(100, sub { $self->refresh_data_async() });
+            $self->{mw}->after(100, $poll_thread);
         } else {
             # Timeout - detach thread and reset
             main::log_message('ERROR', 'Data fetch timeout - detaching thread');
@@ -1784,7 +1793,10 @@ sub refresh_data_async {
             $self->{mw}->configure(-cursor => '');
             $self->{status_label}->configure(-text => "Timeout fetching data - please retry");
         }
-    });
+    };
+    
+    # Start polling
+    $self->{mw}->after(100, $poll_thread);
 }
 
 sub format_memory {
@@ -1857,6 +1869,8 @@ sub filter_vms {
 sub start_selected {
     my ($self) = @_;
     
+    return if $self->{is_closing};
+    
     my @selection = $self->{tree}->info('selection');
     return unless @selection;
     
@@ -1881,29 +1895,37 @@ sub start_selected {
         return "SUCCESS";
     });
     
-    $self->{mw}->after(100, sub {
+    # Proper polling callback
+    my $poll;
+    $poll = sub {
+        return if $self->{is_closing};
+        
         if ($thread->is_joinable()) {
             my $result = $thread->join();
             
             if ($result eq "SUCCESS") {
                 $self->{status_label}->configure(-text => "Started $vm->{type} $vm->{id} ($vm->{name})");
-                $self->{mw}->after(2000, sub { $self->refresh_data_async() });
+                $self->{mw}->after(2000, sub { $self->refresh_data_async() unless $self->{is_closing} });
             } else {
                 $self->{mw}->messageBox(
                     -title => "Error",
                     -message => "Failed to start:\n$result",
                     -type => 'OK',
                     -icon => 'error'
-                );
+                ) unless $self->{is_closing};
             }
         } else {
-            $self->{mw}->after(100, sub { $self->start_selected() });
+            $self->{mw}->after(100, $poll);
         }
-    });
+    };
+    
+    $self->{mw}->after(100, $poll);
 }
 
 sub stop_selected {
     my ($self) = @_;
+    
+    return if $self->{is_closing};
     
     my @selection = $self->{tree}->info('selection');
     return unless @selection;
@@ -1938,29 +1960,37 @@ sub stop_selected {
         return "SUCCESS";
     });
     
-    $self->{mw}->after(100, sub {
+    # Proper polling callback
+    my $poll;
+    $poll = sub {
+        return if $self->{is_closing};
+        
         if ($thread->is_joinable()) {
             my $result = $thread->join();
             
             if ($result eq "SUCCESS") {
                 $self->{status_label}->configure(-text => "Stopped $vm->{type} $vm->{id} ($vm->{name})");
-                $self->{mw}->after(2000, sub { $self->refresh_data_async() });
+                $self->{mw}->after(2000, sub { $self->refresh_data_async() unless $self->{is_closing} });
             } else {
                 $self->{mw}->messageBox(
                     -title => "Error",
                     -message => "Failed to stop:\n$result",
                     -type => 'OK',
                     -icon => 'error'
-                );
+                ) unless $self->{is_closing};
             }
         } else {
-            $self->{mw}->after(100, sub { $self->stop_selected() });
+            $self->{mw}->after(100, $poll);
         }
-    });
+    };
+    
+    $self->{mw}->after(100, $poll);
 }
 
 sub start_all_stopped {
     my ($self) = @_;
+    
+    return if $self->{is_closing};
     
     my @stopped = grep { lc($_->{status}) ne 'running' } @{$self->{vm_data}};
     
@@ -1970,7 +2000,7 @@ sub start_all_stopped {
             -message => "All VMs/CTs are already running",
             -type => 'OK',
             -icon => 'info'
-        );
+        ) unless $self->{is_closing};
         return;
     }
     
@@ -2004,17 +2034,23 @@ sub start_all_stopped {
         return $success_count;
     });
     
-    $self->{mw}->after(100, sub {
+    # Proper polling callback
+    my $poll;
+    $poll = sub {
+        return if $self->{is_closing};
+        
         if ($thread->is_joinable()) {
             my $success_count = $thread->join();
             $self->{status_label}->configure(
                 -text => "Started $success_count/" . scalar(@stopped) . " VMs/CTs"
             );
-            $self->{mw}->after(3000, sub { $self->refresh_data_async() });
+            $self->{mw}->after(3000, sub { $self->refresh_data_async() unless $self->{is_closing} });
         } else {
-            $self->{mw}->after(100, sub { $self->start_all_stopped() });
+            $self->{mw}->after(100, $poll);
         }
-    });
+    };
+    
+    $self->{mw}->after(100, $poll);
 }
 
 sub toggle_auto_refresh {
@@ -2113,23 +2149,25 @@ sub start_health_check {
 sub on_closing {
     my ($self) = @_;
     
-    # Set closing flag to stop any pending operations
+    # Set closing flag immediately to stop all operations
     $self->{is_closing} = 1;
     $self->{auto_refresh} = 0;
+    $self->{is_loading} = 0;
     
-    main::log_message('INFO', 'Dashboard closing - cleaning up threads');
+    main::log_message('INFO', 'Dashboard closing - forcing immediate exit');
     
-    # Detach any active threads to prevent blocking
-    if ($self->{active_thread} && !$self->{active_thread}->is_joinable()) {
-        eval { $self->{active_thread}->detach() };
+    # Detach any active threads without waiting
+    if ($self->{active_thread}) {
+        eval { 
+            $self->{active_thread}->detach() if !$self->{active_thread}->is_joinable();
+        };
     }
     
-    # Give threads a moment to detach
-    $self->{mw}->update();
-    Time::HiRes::sleep(0.2);
+    # Don't wait - destroy immediately
+    eval { $self->{mw}->destroy() };
     
-    # Force destroy the window
-    $self->{mw}->destroy();
+    # Force exit if window didn't destroy
+    exit(0);
 }
 
 sub run {
