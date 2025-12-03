@@ -1493,29 +1493,25 @@ sub check_temperature_api_status {
     
     return unless $self->{api};
     
-    # Run in background thread
-    my $thread = threads->create(sub {
-        my $nodes = eval { $self->{api}->get('/nodes') };
-        return unless $nodes;
-        
-        foreach my $node (@$nodes) {
-            my $node_name = $node->{node};
-            my $node_ip = $self->{api}{host};
-            
-            $self->{node_addresses}{$node_name} = $node_ip;
-            
-            eval {
-                my $ua = LWP::UserAgent->new(timeout => 2, ssl_opts => { verify_hostname => 0 });
-                my $response = $ua->get("https://$node_ip:8898/health");
-                
-                $self->{node_temp_api_available}{$node_name} = $response->is_success ? 1 : 0;
-            };
-            
-            $self->{node_temp_api_available}{$node_name} = 0 if $@;
-        }
-    });
+    # Check temperature API availability SYNCHRONOUSLY
+    my $nodes = eval { $self->{api}->get('/nodes') };
+    return unless $nodes;
     
-    $thread->detach();
+    foreach my $node (@$nodes) {
+        my $node_name = $node->{node};
+        my $node_ip = $self->{api}{host};
+        
+        $self->{node_addresses}{$node_name} = $node_ip;
+        
+        eval {
+            my $ua = LWP::UserAgent->new(timeout => 2, ssl_opts => { verify_hostname => 0 });
+            my $response = $ua->get("https://$node_ip:8898/health");
+            
+            $self->{node_temp_api_available}{$node_name} = $response->is_success ? 1 : 0;
+        };
+        
+        $self->{node_temp_api_available}{$node_name} = 0 if $@;
+    }
 }
 
 sub get_all_node_temperatures {
@@ -1558,25 +1554,9 @@ sub update_node_temperatures {
     return unless $self->{api};
     return if $self->{is_closing};
     
-    my $thread = threads->create(sub {
-        return $self->get_all_node_temperatures();
-    });
-    
-    # Proper polling callback
-    my $poll;
-    $poll = sub {
-        return if $self->{is_closing} || !Tk::Exists($self->{mw});
-        return unless $thread;
-        
-        if ($thread->is_joinable()) {
-            my $node_temps = $thread->join();
-            $self->update_temp_ui($node_temps) if Tk::Exists($self->{mw});
-        } else {
-            $self->{mw}->after(100, $poll) if Tk::Exists($self->{mw});
-        }
-    };
-    
-    $self->{mw}->after(100, $poll);
+    # Get temperatures SYNCHRONOUSLY
+    my $node_temps = $self->get_all_node_temperatures();
+    $self->update_temp_ui($node_temps);
 }
 
 sub update_temp_ui {
@@ -1683,127 +1663,87 @@ sub refresh_data_async {
     $self->{is_loading} = 1;
     $self->{status_label}->configure(-text => "[Loading] Fetching data from Proxmox...");
     $self->{mw}->configure(-cursor => 'watch');
+    $self->{mw}->update();  # Process events so UI updates
     
-    # Fetch data in background
-    my $thread = threads->create(sub {
-        my @vm_data;
+    # Fetch data SYNCHRONOUSLY - no threading to avoid Tk crashes
+    my @vm_data;
+    
+    eval {
+        my $nodes = $self->{api}->get('/nodes');
+        $self->{node_count} = scalar(@$nodes);
         
-        eval {
-            my $nodes = $self->{api}->get('/nodes');
-            $self->{node_count} = scalar(@$nodes);
+        foreach my $node (@$nodes) {
+            my $n = $node->{node};
             
-            foreach my $node (@$nodes) {
-                my $n = $node->{node};
+            # Get VMs
+            my $vms = eval { $self->{api}->get("/nodes/$n/qemu") } || [];
+            foreach my $vm (@$vms) {
+                my $cfg = eval { $self->{api}->get("/nodes/$n/qemu/$vm->{vmid}/config") } || {};
                 
-                # Get VMs
-                my $vms = eval { $self->{api}->get("/nodes/$n/qemu") } || [];
-                foreach my $vm (@$vms) {
-                    my $cfg = eval { $self->{api}->get("/nodes/$n/qemu/$vm->{vmid}/config") } || {};
-                    
-                    push @vm_data, {
-                        id => $vm->{vmid},
-                        type => 'VM',
-                        status => $vm->{status},
-                        name => $vm->{name},
-                        node => $n,
-                        cores => $cfg->{cores} || 'N/A',
-                        cpu => $cfg->{cpu} || 'N/A',
-                        memory => $self->format_memory($cfg, 'VM'),
-                        disk => 'N/A',
-                        free_disk => 'N/A',
-                        free_pct => 'N/A'
-                    };
-                }
-                
-                # Get Containers
-                my $cts = eval { $self->{api}->get("/nodes/$n/lxc") } || [];
-                foreach my $ct (@$cts) {
-                    my $cfg = eval { $self->{api}->get("/nodes/$n/lxc/$ct->{vmid}/config") } || {};
-                    
-                    push @vm_data, {
-                        id => $ct->{vmid},
-                        type => 'CT',
-                        status => $ct->{status},
-                        name => $ct->{name},
-                        node => $n,
-                        cores => $cfg->{cores} || 'N/A',
-                        cpu => 'N/A',
-                        memory => $self->format_memory($cfg, 'CT'),
-                        disk => 'N/A',
-                        free_disk => 'N/A',
-                        free_pct => 'N/A'
-                    };
-                }
+                push @vm_data, {
+                    id => $vm->{vmid},
+                    type => 'VM',
+                    status => $vm->{status},
+                    name => $vm->{name},
+                    node => $n,
+                    cores => $cfg->{cores} || 'N/A',
+                    cpu => $cfg->{cpu} || 'N/A',
+                    memory => $self->format_memory($cfg, 'VM'),
+                    disk => 'N/A',
+                    free_disk => 'N/A',
+                    free_pct => 'N/A'
+                };
             }
-        };
-        
-        @vm_data = sort { $a->{id} <=> $b->{id} } @vm_data;
-        return \@vm_data;
-    });
-    
-    # Store active thread
-    $self->{active_thread} = $thread;
-    
-    # Create polling callback with proper closure
-    my $wait_count = 0;
-    my $max_wait = 300; # 30 seconds maximum wait (300 * 100ms)
-    
-    # Define the polling function that references itself
-    my $poll_thread;
-    $poll_thread = sub {
-        # Check if we're closing or window destroyed
-        if ($self->{is_closing} || !Tk::Exists($self->{mw})) {
-            $thread->detach() if $thread && !$thread->is_joinable();
-            $self->{is_loading} = 0;
-            $self->{active_thread} = undef;
-            return;
-        }
-        
-        # Check if thread finished
-        if ($thread->is_joinable()) {
-            my $vm_data = $thread->join();
-            $self->{vm_data} = $vm_data;
-            $self->{is_loading} = 0;
-            $self->{active_thread} = undef;
             
-            # Only update widgets if they still exist
-            return unless Tk::Exists($self->{mw});
-            
-            $self->{mw}->configure(-cursor => '');
-            $self->filter_vms();
-            
-            my $now = strftime("%H:%M:%S", localtime);
-            my $interval = $self->{refresh_interval};
-            $self->{last_update_label}->configure(
-                -text => "LIVE - Updated: $now (every ${interval}s)"
-            ) if Tk::Exists($self->{last_update_label});
-            
-            $self->{connection_label}->configure(-foreground => '#27ae60') if Tk::Exists($self->{connection_label});
-            $self->{node_label}->configure(-text => "Nodes: $self->{node_count}") if Tk::Exists($self->{node_label});
-            
-            # Update temperatures
-            $self->update_node_temperatures();
-        } elsif ($wait_count < $max_wait) {
-            # Keep waiting - increment counter and schedule next poll
-            $wait_count++;
-            $self->{mw}->after(100, $poll_thread) if Tk::Exists($self->{mw});
-        } else {
-            # Timeout - detach thread and reset
-            main::log_message('ERROR', 'Data fetch timeout - detaching thread');
-            $thread->detach();
-            $self->{is_loading} = 0;
-            $self->{active_thread} = undef;
-            
-            return unless Tk::Exists($self->{mw});
-            $self->{mw}->configure(-cursor => '');
-            $self->{status_label}->configure(-text => "Timeout fetching data - please retry") if Tk::Exists($self->{status_label});
+            # Get Containers
+            my $cts = eval { $self->{api}->get("/nodes/$n/lxc") } || [];
+            foreach my $ct (@$cts) {
+                my $cfg = eval { $self->{api}->get("/nodes/$n/lxc/$ct->{vmid}/config") } || {};
+                
+                push @vm_data, {
+                    id => $ct->{vmid},
+                    type => 'CT',
+                    status => $ct->{status},
+                    name => $ct->{name},
+                    node => $n,
+                    cores => $cfg->{cores} || 'N/A',
+                    cpu => 'N/A',
+                    memory => $self->format_memory($cfg, 'CT'),
+                    disk => 'N/A',
+                    free_disk => 'N/A',
+                    free_pct => 'N/A'
+                };
+            }
         }
     };
     
-    # Start polling
-    $self->{mw}->after(100, $poll_thread);
+    if ($@) {
+        main::log_message('ERROR', "Failed to fetch data: $@");
+        $self->{is_loading} = 0;
+        $self->{mw}->configure(-cursor => '');
+        $self->{status_label}->configure(-text => "Error fetching data");
+        return;
+    }
+    
+    @vm_data = sort { $a->{id} <=> $b->{id} } @vm_data;
+    $self->{vm_data} = \@vm_data;
+    $self->{is_loading} = 0;
+    
+    $self->{mw}->configure(-cursor => '');
+    $self->filter_vms();
+    
+    my $now = strftime("%H:%M:%S", localtime);
+    my $interval = $self->{refresh_interval};
+    $self->{last_update_label}->configure(
+        -text => "LIVE - Updated: $now (every ${interval}s)"
+    );
+    
+    $self->{connection_label}->configure(-foreground => '#27ae60');
+    $self->{node_label}->configure(-text => "Nodes: $self->{node_count}");
+    
+    # Update temperatures
+    $self->update_node_temperatures();
 }
-
 sub format_memory {
     my ($self, $cfg, $type) = @_;
     
@@ -1884,49 +1824,33 @@ sub start_selected {
     return unless $vm;
     
     $self->{status_label}->configure(-text => "Starting $vm->{type} $vm->{id}...");
+    $self->{mw}->update();  # Update UI
     
-    my $thread = threads->create(sub {
-        eval {
-            my $endpoint = $vm->{type} eq 'VM' ? 'qemu' : 'lxc';
-            $self->{api}->post("/nodes/$vm->{node}/$endpoint/$vm->{id}/status/start");
-            AuditLogger::log_vm_action("START", $vm->{id}, $vm->{type}, $vm->{name}, 1);
-        };
-        
-        if ($@) {
-            AuditLogger::log_vm_action("START", $vm->{id}, $vm->{type}, $vm->{name}, 0, "$@");
-            return "Error: $@";
-        }
-        
-        return "SUCCESS";
-    });
-    
-    # Proper polling callback
-    my $poll;
-    $poll = sub {
-        return if $self->{is_closing} || !Tk::Exists($self->{mw});
-        
-        if ($thread->is_joinable()) {
-            my $result = $thread->join();
-            
-            return unless Tk::Exists($self->{mw});
-            
-            if ($result eq "SUCCESS") {
-                $self->{status_label}->configure(-text => "Started $vm->{type} $vm->{id} ($vm->{name})") if Tk::Exists($self->{status_label});
-                $self->{mw}->after(2000, sub { $self->refresh_data_async() unless $self->{is_closing} });
-            } else {
-                $self->{mw}->messageBox(
-                    -title => "Error",
-                    -message => "Failed to start:\n$result",
-                    -type => 'OK',
-                    -icon => 'error'
-                );
-            }
-        } else {
-            $self->{mw}->after(100, $poll) if Tk::Exists($self->{mw});
-        }
+    # Start VM SYNCHRONOUSLY
+    my $result;
+    eval {
+        my $endpoint = $vm->{type} eq 'VM' ? 'qemu' : 'lxc';
+        $self->{api}->post("/nodes/$vm->{node}/$endpoint/$vm->{id}/status/start");
+        AuditLogger::log_vm_action("START", $vm->{id}, $vm->{type}, $vm->{name}, 1);
+        $result = "SUCCESS";
     };
     
-    $self->{mw}->after(100, $poll);
+    if ($@) {
+        AuditLogger::log_vm_action("START", $vm->{id}, $vm->{type}, $vm->{name}, 0, "$@");
+        $result = "Error: $@";
+    }
+    
+    if ($result eq "SUCCESS") {
+        $self->{status_label}->configure(-text => "Started $vm->{type} $vm->{id} ($vm->{name})");
+        $self->{mw}->after(2000, sub { $self->refresh_data_async() unless $self->{is_closing} });
+    } else {
+        $self->{mw}->messageBox(
+            -title => "Error",
+            -message => "Failed to start:\n$result",
+            -type => 'OK',
+            -icon => 'error'
+        );
+    }
 }
 
 sub stop_selected {
@@ -1951,49 +1875,33 @@ sub stop_selected {
     return unless $answer eq 'Yes';
     
     $self->{status_label}->configure(-text => "Stopping $vm->{type} $vm->{id}...");
+    $self->{mw}->update();  # Update UI
     
-    my $thread = threads->create(sub {
-        eval {
-            my $endpoint = $vm->{type} eq 'VM' ? 'qemu' : 'lxc';
-            $self->{api}->post("/nodes/$vm->{node}/$endpoint/$vm->{id}/status/stop");
-            AuditLogger::log_vm_action("STOP", $vm->{id}, $vm->{type}, $vm->{name}, 1);
-        };
-        
-        if ($@) {
-            AuditLogger::log_vm_action("STOP", $vm->{id}, $vm->{type}, $vm->{name}, 0, "$@");
-            return "Error: $@";
-        }
-        
-        return "SUCCESS";
-    });
-    
-    # Proper polling callback
-    my $poll;
-    $poll = sub {
-        return if $self->{is_closing} || !Tk::Exists($self->{mw});
-        
-        if ($thread->is_joinable()) {
-            my $result = $thread->join();
-            
-            return unless Tk::Exists($self->{mw});
-            
-            if ($result eq "SUCCESS") {
-                $self->{status_label}->configure(-text => "Stopped $vm->{type} $vm->{id} ($vm->{name})") if Tk::Exists($self->{status_label});
-                $self->{mw}->after(2000, sub { $self->refresh_data_async() unless $self->{is_closing} });
-            } else {
-                $self->{mw}->messageBox(
-                    -title => "Error",
-                    -message => "Failed to stop:\n$result",
-                    -type => 'OK',
-                    -icon => 'error'
-                );
-            }
-        } else {
-            $self->{mw}->after(100, $poll) if Tk::Exists($self->{mw});
-        }
+    # Stop VM SYNCHRONOUSLY
+    my $result;
+    eval {
+        my $endpoint = $vm->{type} eq 'VM' ? 'qemu' : 'lxc';
+        $self->{api}->post("/nodes/$vm->{node}/$endpoint/$vm->{id}/status/stop");
+        AuditLogger::log_vm_action("STOP", $vm->{id}, $vm->{type}, $vm->{name}, 1);
+        $result = "SUCCESS";
     };
     
-    $self->{mw}->after(100, $poll);
+    if ($@) {
+        AuditLogger::log_vm_action("STOP", $vm->{id}, $vm->{type}, $vm->{name}, 0, "$@");
+        $result = "Error: $@";
+    }
+    
+    if ($result eq "SUCCESS") {
+        $self->{status_label}->configure(-text => "Stopped $vm->{type} $vm->{id} ($vm->{name})");
+        $self->{mw}->after(2000, sub { $self->refresh_data_async() unless $self->{is_closing} });
+    } else {
+        $self->{mw}->messageBox(
+            -title => "Error",
+            -message => "Failed to stop:\n$result",
+            -type => 'OK',
+            -icon => 'error'
+        );
+    }
 }
 
 sub start_all_stopped {
@@ -2009,7 +1917,7 @@ sub start_all_stopped {
             -message => "All VMs/CTs are already running",
             -type => 'OK',
             -icon => 'info'
-        ) unless $self->{is_closing};
+        );
         return;
     }
     
@@ -2023,46 +1931,31 @@ sub start_all_stopped {
     return unless $answer eq 'Yes';
     
     $self->{status_label}->configure(-text => "Starting " . scalar(@stopped) . " VMs/CTs...");
+    $self->{mw}->update();  # Update UI
     
-    my $thread = threads->create(sub {
-        my $success_count = 0;
+    # Start all VMs SYNCHRONOUSLY
+    my $success_count = 0;
+    
+    foreach my $vm (@stopped) {
+        eval {
+            my $endpoint = $vm->{type} eq 'VM' ? 'qemu' : 'lxc';
+            $self->{api}->post("/nodes/$vm->{node}/$endpoint/$vm->{id}/status/start");
+            AuditLogger::log_vm_action("START_ALL", $vm->{id}, $vm->{type}, $vm->{name}, 1);
+            $success_count++;
+        };
         
-        foreach my $vm (@stopped) {
-            eval {
-                my $endpoint = $vm->{type} eq 'VM' ? 'qemu' : 'lxc';
-                $self->{api}->post("/nodes/$vm->{node}/$endpoint/$vm->{id}/status/start");
-                AuditLogger::log_vm_action("START_ALL", $vm->{id}, $vm->{type}, $vm->{name}, 1);
-                $success_count++;
-            };
-            
-            if ($@) {
-                AuditLogger::log_vm_action("START_ALL", $vm->{id}, $vm->{type}, $vm->{name}, 0, "$@");
-            }
+        if ($@) {
+            AuditLogger::log_vm_action("START_ALL", $vm->{id}, $vm->{type}, $vm->{name}, 0, "$@");
         }
         
-        return $success_count;
-    });
+        # Update UI between VMs so it doesn't appear frozen
+        $self->{mw}->update();
+    }
     
-    # Proper polling callback
-    my $poll;
-    $poll = sub {
-        return if $self->{is_closing} || !Tk::Exists($self->{mw});
-        
-        if ($thread->is_joinable()) {
-            my $success_count = $thread->join();
-            
-            return unless Tk::Exists($self->{mw});
-            
-            $self->{status_label}->configure(
-                -text => "Started $success_count/" . scalar(@stopped) . " VMs/CTs"
-            ) if Tk::Exists($self->{status_label});
-            $self->{mw}->after(3000, sub { $self->refresh_data_async() unless $self->{is_closing} });
-        } else {
-            $self->{mw}->after(100, $poll) if Tk::Exists($self->{mw});
-        }
-    };
-    
-    $self->{mw}->after(100, $poll);
+    $self->{status_label}->configure(
+        -text => "Started $success_count/" . scalar(@stopped) . " VMs/CTs"
+    );
+    $self->{mw}->after(3000, sub { $self->refresh_data_async() unless $self->{is_closing} });
 }
 
 sub toggle_auto_refresh {
@@ -2180,17 +2073,8 @@ sub on_closing {
     
     main::log_message('INFO', 'Dashboard closing');
     
-    # Detach any active threads
-    if ($self->{active_thread}) {
-        eval { 
-            $self->{active_thread}->detach() if !$self->{active_thread}->is_joinable();
-        };
-    }
-    
-    # Destroy window - let DESTROY method handle widget cleanup
-    if ($self->{mw} && Tk::Exists($self->{mw})) {
-        $self->{mw}->destroy();
-    }
+    # Destroy window
+    $self->{mw}->destroy() if $self->{mw} && Tk::Exists($self->{mw});
 }
 
 sub DESTROY {
@@ -2248,27 +2132,8 @@ foreach my $module (@required_modules) {
 
 log_message('INFO', 'All required modules loaded');
 
-# END block runs before global destruction
-# Silence Tk cleanup warnings that are harmless but annoying
-END {
-    local $SIG{__WARN__} = sub {
-        my $msg = shift;
-        # Suppress known Tk cleanup warnings
-        return if $msg =~ /attempt to free nonexistent shared string/;
-        return if $msg =~ /unbalanced string table refcount/;
-        return if $msg =~ /Scalars leaked/;
-        return if $msg =~ /during global destruction/;
-        # Print other warnings
-        warn $msg;
-    };
-}
-
 # Create and run dashboard
 my $dashboard = ProxmoxDashboard->new();
-if ($dashboard) {
-    $dashboard->run();
-    # Explicitly undef to trigger DESTROY before END block
-    undef $dashboard;
-}
+$dashboard->run() if $dashboard;
 
 log_message('INFO', 'Dashboard exiting');
