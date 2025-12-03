@@ -138,7 +138,7 @@ sub save_credentials {
     my $cipher = Crypt::CBC->new(
         -key => $key,
         -cipher => 'Crypt::OpenSSL::AES',
-        -header => 'randomiv',
+        -header => 'salt',
         -padding => 'standard'
     );
     
@@ -172,7 +172,7 @@ sub load_credentials {
     my $cipher = Crypt::CBC->new(
         -key => $key,
         -cipher => 'Crypt::OpenSSL::AES',
-        -header => 'randomiv',
+        -header => 'salt',
         -padding => 'standard'
     );
     
