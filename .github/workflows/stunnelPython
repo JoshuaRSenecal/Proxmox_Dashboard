@@ -1493,7 +1493,7 @@ class ProxmoxDashboard:
         # Left section: Title
         title_label = tk.Label(
             top_frame,
-            text="Proxmox VM/Container Dashboard",
+            text="Proxmox VM/CT Dashboard",
             font=("Arial", 18, "bold"),
             bg="#2c3e50",
             fg="white"
