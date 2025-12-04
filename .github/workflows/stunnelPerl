@@ -235,14 +235,44 @@ sub _api_request {
                 }
                 main::log_message('ERROR', $error_msg);
                 die $error_msg;
-            } elsif ($response->code >= 500 && $attempt < $retries) {
-                # Server error - retry with backoff
-                main::log_message('WARN', "Server error, retrying...");
-                my $delay = $main::RETRY_DELAY * (2 ** ($attempt - 1));
-                sleep($delay);
-                die "Server error, will retry";  # Trigger retry
+            } elsif ($response->code >= 500) {
+                # Check if this is an expected operational error (not a real server error)
+                my $content = $response->content || '';
+                my $is_operational_error = (
+                    $content =~ /guest agent/i ||
+                    $content =~ /not running/i ||
+                    $content =~ /VM is stopped/i ||
+                    $content =~ /CT is stopped/i ||
+                    $content =~ /is not running/i ||
+                    $path =~ m{/agent/}  # Any guest agent endpoint
+                );
+                
+                if ($is_operational_error) {
+                    # This is an expected error (VM stopped, agent not installed, etc.)
+                    # Don't retry, just fail with the error
+                    my $error_msg = "Operational condition: " . $response->status_line;
+                    if ($content) {
+                        $error_msg .= " - " . substr($content, 0, 200);
+                    }
+                    main::log_message('DEBUG', $error_msg);
+                    die $error_msg;
+                } elsif ($attempt < $retries) {
+                    # Real server error - retry with backoff
+                    main::log_message('WARN', "Server error, retrying...");
+                    my $delay = $main::RETRY_DELAY * (2 ** ($attempt - 1));
+                    sleep($delay);
+                    die "Server error, will retry";  # Trigger retry
+                } else {
+                    # Out of retries
+                    my $error_msg = "HTTP error: " . $response->status_line;
+                    if ($content) {
+                        $error_msg .= " - Response: " . substr($content, 0, 200);
+                    }
+                    main::log_message('ERROR', $error_msg);
+                    die $error_msg;
+                }
             } else {
-                # Other errors - fail immediately
+                # Other errors (4xx) - fail immediately
                 my $error_msg = "HTTP error: " . $response->status_line;
                 if ($response->content) {
                     $error_msg .= " - Response: " . substr($response->content, 0, 200);
@@ -2457,18 +2487,35 @@ sub format_bytes {
 sub fetch_single_vm_data {
     my ($self, $node, $vm, $vm_type) = @_;
     
+    my $n = $node->{node};
+    my $endpoint = $vm_type eq 'VM' ? 'qemu' : 'lxc';
+    my $vmid = $vm->{vmid};
+    
+    # Initialize with defaults
+    my $cores = 'N/A';
+    my $memory = 'N/A';
+    my $total_disk = 'N/A';
+    my $sockets = 'N/A';
+    my $cpu_type = 'N/A';
+    
+    # Get config - this is critical, if it fails we can't show the VM
+    my $cfg;
     eval {
-        my $n = $node->{node};
-        my $endpoint = $vm_type eq 'VM' ? 'qemu' : 'lxc';
-        my $vmid = $vm->{vmid};
-        
-        # Get config
-        my $cfg = $self->{api}->get("/nodes/$n/$endpoint/$vmid/config");
-        
-        my $cores = $cfg->{cores} || 'N/A';
-        
-        # Memory
-        my $memory;
+        $cfg = $self->{api}->get("/nodes/$n/$endpoint/$vmid/config");
+    };
+    
+    if ($@) {
+        main::log_message('ERROR', "Failed to get config for $vm_type $vmid: $@");
+        return undef;  # Can't show VM without config
+    }
+    
+    # Extract cores (safely)
+    eval {
+        $cores = $cfg->{cores} || 'N/A';
+    };
+    
+    # Memory (safely)
+    eval {
         if ($vm_type eq 'VM') {
             my $memory_val = $cfg->{memory} || 0;
             $memory_val = int($memory_val) if $memory_val;
@@ -2504,9 +2551,14 @@ sub fetch_single_vm_data {
                 $memory = 'N/A';
             }
         }
-        
-        # Disk size
-        my $total_disk = 'N/A';
+    };
+    
+    if ($@) {
+        main::log_message('DEBUG', "Error parsing memory for $vm_type $vmid: $@");
+    }
+    
+    # Disk size (safely)
+    eval {
         if ($vm_type eq 'VM') {
             foreach my $key (sort keys %$cfg) {
                 if ($key =~ /^(scsi0|sata0|ide0|virtio0)$/) {
@@ -2529,57 +2581,66 @@ sub fetch_single_vm_data {
                 }
             }
         }
-        
-        # Free disk - only if running
-        my ($free_disk, $free_pct, $total_fs) = ('N/A', 'N/A', 'N/A');
+    };
+    
+    if ($@) {
+        main::log_message('DEBUG', "Error parsing disk size for $vm_type $vmid: $@");
+    }
+    
+    # Free disk - only if running
+    my ($free_disk, $free_pct, $total_fs) = ('N/A', 'N/A', 'N/A');
         
         if ($vm->{status} eq 'running') {
-            eval {
-                if ($vm_type eq 'VM') {
-                    # Try guest agent first
-                    eval {
-                        my $fsinfo = $self->{api}->get("/nodes/$n/qemu/$vmid/agent/get-fsinfo");
+            if ($vm_type eq 'VM') {
+                # Try guest agent first (may fail if not installed/running)
+                eval {
+                    my $fsinfo = $self->{api}->get("/nodes/$n/qemu/$vmid/agent/get-fsinfo");
+                    
+                    if ($fsinfo && $fsinfo->{result}) {
+                        my @filesystems = @{$fsinfo->{result}};
                         
-                        if ($fsinfo && $fsinfo->{result}) {
-                            my @filesystems = @{$fsinfo->{result}};
+                        my %excluded_types = map { $_ => 1 } qw(iso9660 udf tmpfs devtmpfs);
+                        my %included_mountpoints = map { $_ => 1 } qw(/ /boot /home /var /tmp /usr);
+                        
+                        my $total_bytes_sum = 0;
+                        my $used_bytes_sum = 0;
+                        
+                        foreach my $fs (@filesystems) {
+                            my $fs_type = lc($fs->{type} || '');
+                            my $mountpoint = $fs->{mountpoint} || '';
                             
-                            my %excluded_types = map { $_ => 1 } qw(iso9660 udf tmpfs devtmpfs);
-                            my %included_mountpoints = map { $_ => 1 } qw(/ /boot /home /var /tmp /usr);
+                            next if $excluded_types{$fs_type};
+                            next unless $included_mountpoints{$mountpoint};
                             
-                            my $total_bytes_sum = 0;
-                            my $used_bytes_sum = 0;
-                            
-                            foreach my $fs (@filesystems) {
-                                my $fs_type = lc($fs->{type} || '');
-                                my $mountpoint = $fs->{mountpoint} || '';
+                            if (exists $fs->{'total-bytes'} && exists $fs->{'used-bytes'}) {
+                                my $fs_total = $fs->{'total-bytes'};
+                                my $fs_used = $fs->{'used-bytes'};
                                 
-                                next if $excluded_types{$fs_type};
-                                next unless $included_mountpoints{$mountpoint};
-                                
-                                if (exists $fs->{'total-bytes'} && exists $fs->{'used-bytes'}) {
-                                    my $fs_total = $fs->{'total-bytes'};
-                                    my $fs_used = $fs->{'used-bytes'};
-                                    
-                                    if ($fs_total > 0) {
-                                        $total_bytes_sum += $fs_total;
-                                        $used_bytes_sum += $fs_used;
-                                    }
-                                }
-                            }
-                            
-                            if ($total_bytes_sum > 0) {
-                                $total_fs = $self->format_bytes($total_bytes_sum);
-                                my $free_bytes = $total_bytes_sum - $used_bytes_sum;
-                                if ($free_bytes >= 0) {
-                                    $free_disk = $self->format_bytes($free_bytes);
-                                    $free_pct = sprintf("%.1f%%", ($free_bytes / $total_bytes_sum * 100));
+                                if ($fs_total > 0) {
+                                    $total_bytes_sum += $fs_total;
+                                    $used_bytes_sum += $fs_used;
                                 }
                             }
                         }
-                    };
-                    
-                    # Fallback to status if guest agent fails
-                    if ($total_fs eq 'N/A') {
+                        
+                        if ($total_bytes_sum > 0) {
+                            $total_fs = $self->format_bytes($total_bytes_sum);
+                            my $free_bytes = $total_bytes_sum - $used_bytes_sum;
+                            if ($free_bytes >= 0) {
+                                $free_disk = $self->format_bytes($free_bytes);
+                                $free_pct = sprintf("%.1f%%", ($free_bytes / $total_bytes_sum * 100));
+                            }
+                        }
+                    }
+                };
+                
+                if ($@) {
+                    main::log_message('DEBUG', "Guest agent not available for VM $vmid: $@");
+                }
+                
+                # Fallback to status if guest agent fails or returns no data
+                if ($total_fs eq 'N/A') {
+                    eval {
                         my $stat = $self->{api}->get("/nodes/$n/qemu/$vmid/status/current");
                         my $disk_used = $stat->{disk} || 0;
                         my $disk_max = $stat->{maxdisk} || 0;
@@ -2592,9 +2653,15 @@ sub fetch_single_vm_data {
                                 $free_pct = sprintf("%.1f%%", ($free_bytes / $disk_max * 100));
                             }
                         }
+                    };
+                    
+                    if ($@) {
+                        main::log_message('DEBUG', "Status API failed for VM $vmid: $@");
                     }
-                } else {
-                    # CT
+                }
+            } else {
+                # CT - use status API
+                eval {
                     my $stat = $self->{api}->get("/nodes/$n/lxc/$vmid/status/current");
                     my $disk_used = $stat->{disk} || 0;
                     my $disk_max = $stat->{maxdisk} || 0;
@@ -2607,13 +2674,25 @@ sub fetch_single_vm_data {
                             $free_pct = sprintf("%.1f%%", ($free_bytes / $disk_max * 100));
                         }
                     }
+                };
+                
+                if ($@) {
+                    main::log_message('DEBUG', "Status API failed for CT $vmid: $@");
                 }
-            };
+            }
         }
         
-        my $sockets = ($vm_type eq 'VM') ? ($cfg->{sockets} || 'N/A') : 'N/A';
-        my $cpu_type = ($vm_type eq 'VM') ? ($cfg->{cpu} || 'N/A') : 'N/A';
+        # Extract sockets and CPU type safely
+        eval {
+            $sockets = ($vm_type eq 'VM') ? ($cfg->{sockets} || 'N/A') : 'N/A';
+            $cpu_type = ($vm_type eq 'VM') ? ($cfg->{cpu} || 'N/A') : 'N/A';
+        };
         
+        if ($@) {
+            main::log_message('DEBUG', "Error parsing sockets/cpu for $vm_type $vmid: $@");
+        }
+        
+        # Return VM data
         return {
             id => $vmid,
             type => $vm_type,
@@ -2629,12 +2708,6 @@ sub fetch_single_vm_data {
             free_disk => $free_disk,
             free_pct => $free_pct,
         };
-    };
-    
-    if ($@) {
-        main::log_message('ERROR', "Error getting $vm_type $vm->{vmid}: $@");
-        return undef;
-    }
 }
 
 sub refresh_data_async {
