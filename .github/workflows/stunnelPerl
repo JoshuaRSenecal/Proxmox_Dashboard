@@ -333,6 +333,20 @@ sub get_key_from_password {
     # Correct parameter order: generate($salt, $password)
     my $key = $pbkdf2->generate($main::SALT, $password);
     
+    # Ensure key is exactly 32 bytes
+    my $key_len = length($key);
+    main::log_message('DEBUG', "PBKDF2 generated key length: $key_len bytes");
+    
+    if ($key_len < 32) {
+        # Pad with zeros if too short
+        $key .= "\0" x (32 - $key_len);
+        main::log_message('DEBUG', "Padded key to 32 bytes");
+    } elsif ($key_len > 32) {
+        # Truncate if too long
+        $key = substr($key, 0, 32);
+        main::log_message('DEBUG', "Truncated key to 32 bytes");
+    }
+    
     return $key;
 }
 
@@ -353,10 +367,11 @@ sub save_credentials {
         my $key = get_key_from_password($master_password);
         main::log_message('DEBUG', "Derived key for encryption, length: " . length($key));
         
-        # Use Crypt::CBC with AES
+        # Use Crypt::CBC with AES-256
         my $cipher = Crypt::CBC->new(
             -key => $key,
             -cipher => 'Cipher::AES',
+            -keysize => 32,  # Explicitly set 256-bit key size
             -header => 'none',
             -iv => substr($key, 0, 16),
             -literal_key => 1,
@@ -413,6 +428,7 @@ sub load_credentials {
         my $cipher = Crypt::CBC->new(
             -key => $key,
             -cipher => 'Cipher::AES',
+            -keysize => 32,  # Explicitly set 256-bit key size
             -header => 'none',
             -iv => substr($key, 0, 16),
             -literal_key => 1,
