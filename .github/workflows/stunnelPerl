@@ -1958,8 +1958,8 @@ sub create_widgets {
             -value => $value,
             -command => sub { $self->update_refresh_rate() },
             -font => ['Arial', 9],
-            -background => '#ecf0f1',
-            -selectcolor => '#3498db',
+            -bg => '#ecf0f1',
+            -activebackground => '#ecf0f1',
         )->pack(-side => 'left', -padx => 2);
     }
     
@@ -2008,16 +2008,47 @@ sub create_widgets {
         -selectmode => 'single',
         -background => '#ecf0f1',
         -foreground => 'black',
+        -separator => '/',
+        -itemtype => 'text',
     )->pack(-fill => 'both', -expand => 1);
     
-    # Configure columns
-    my @columns = qw(ID Type Status Name Node Cores Sockets CPU Memory Disk TotalFS FreeDisk Free%);
+    # Configure columns with widths
+    my @columns = (
+        ['ID', 8],
+        ['Type', 6],
+        ['Status', 10],
+        ['Name', 25],
+        ['Node', 12],
+        ['Cores', 7],
+        ['Sockets', 8],
+        ['CPU', 12],
+        ['Memory', 15],
+        ['Disk', 12],
+        ['TotalFS', 12],
+        ['FreeDisk', 12],
+        ['Free%', 8],
+    );
     
     for my $i (0..$#columns) {
+        my ($col_name, $col_width) = @{$columns[$i]};
         $self->{tree}->header('create', $i, 
-            -text => $columns[$i],
+            -text => $col_name,
             -headerbackground => '#34495e',
+            -borderwidth => 2,
         );
+        $self->{tree}->column('width', $i, -char => $col_width);
+    }
+    
+    # Create item styles for status colors
+    eval {
+        $self->{tree}->ItemStyle('text', -stylename => 'running',
+            -background => '#d5f4e6', -foreground => 'black');
+        $self->{tree}->ItemStyle('text', -stylename => 'stopped',
+            -background => '#fadbd8', -foreground => 'black');
+    };
+    
+    if ($@) {
+        main::log_message('DEBUG', "Could not create HList styles (not critical): $@");
     }
     
     # Status bar
@@ -2422,25 +2453,30 @@ sub filter_vms {
             
             # Add to tree
             my $entry = $self->{tree}->add($vm->{id});
-            $self->{tree}->itemCreate($entry, 0, -text => $vm->{id});
-            $self->{tree}->itemCreate($entry, 1, -text => $vm->{type});
-            $self->{tree}->itemCreate($entry, 2, -text => $vm->{status});
-            $self->{tree}->itemCreate($entry, 3, -text => $vm->{name});
-            $self->{tree}->itemCreate($entry, 4, -text => $vm->{node});
-            $self->{tree}->itemCreate($entry, 5, -text => $vm->{cores} || 'N/A');
-            $self->{tree}->itemCreate($entry, 6, -text => $vm->{sockets} || 'N/A');
-            $self->{tree}->itemCreate($entry, 7, -text => $vm->{cpu} || 'N/A');
-            $self->{tree}->itemCreate($entry, 8, -text => $vm->{memory} || 'N/A');
-            $self->{tree}->itemCreate($entry, 9, -text => $vm->{disk} || 'N/A');
-            $self->{tree}->itemCreate($entry, 10, -text => $vm->{total_fs} || 'N/A');
-            $self->{tree}->itemCreate($entry, 11, -text => $vm->{free_disk} || 'N/A');
-            $self->{tree}->itemCreate($entry, 12, -text => $vm->{free_pct} || 'N/A');
+            $self->{tree}->itemCreate($entry, 0, -itemtype => 'text', -text => $vm->{id});
+            $self->{tree}->itemCreate($entry, 1, -itemtype => 'text', -text => $vm->{type});
+            $self->{tree}->itemCreate($entry, 2, -itemtype => 'text', -text => $vm->{status});
+            $self->{tree}->itemCreate($entry, 3, -itemtype => 'text', -text => $vm->{name});
+            $self->{tree}->itemCreate($entry, 4, -itemtype => 'text', -text => $vm->{node});
+            $self->{tree}->itemCreate($entry, 5, -itemtype => 'text', -text => $vm->{cores} || 'N/A');
+            $self->{tree}->itemCreate($entry, 6, -itemtype => 'text', -text => $vm->{sockets} || 'N/A');
+            $self->{tree}->itemCreate($entry, 7, -itemtype => 'text', -text => $vm->{cpu} || 'N/A');
+            $self->{tree}->itemCreate($entry, 8, -itemtype => 'text', -text => $vm->{memory} || 'N/A');
+            $self->{tree}->itemCreate($entry, 9, -itemtype => 'text', -text => $vm->{disk} || 'N/A');
+            $self->{tree}->itemCreate($entry, 10, -itemtype => 'text', -text => $vm->{total_fs} || 'N/A');
+            $self->{tree}->itemCreate($entry, 11, -itemtype => 'text', -text => $vm->{free_disk} || 'N/A');
+            $self->{tree}->itemCreate($entry, 12, -itemtype => 'text', -text => $vm->{free_pct} || 'N/A');
             
-            # Set colors based on status
+            # Set row colors based on status (only configure first column for visual indicator)
+            my $status = lc($vm->{status});
             if ($status eq 'running') {
-                $self->{tree}->itemConfigure($entry, 0, -background => '#d5f4e6');
+                eval {
+                    $self->{tree}->itemConfigure($entry, 0, -style => 'running');
+                };
             } elsif ($status eq 'stopped') {
-                $self->{tree}->itemConfigure($entry, 0, -background => '#fadbd8');
+                eval {
+                    $self->{tree}->itemConfigure($entry, 0, -style => 'stopped');
+                };
             }
         }
     }
