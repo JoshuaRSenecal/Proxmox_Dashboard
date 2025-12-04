@@ -969,7 +969,21 @@ sub new {
     # Add cleanup handler for window close
     $self->{root}->protocol('WM_DELETE_WINDOW', sub { $self->on_closing() });
     
-    unless ($self->authenticate()) {
+    main::log_message('INFO', "Calling authenticate()...");
+    my $auth_result;
+    eval {
+        $auth_result = $self->authenticate();
+        main::log_message('INFO', "authenticate() returned: " . ($auth_result ? "success" : "failure"));
+    };
+    
+    if ($@) {
+        main::log_message('CRITICAL', "authenticate() threw exception: $@");
+        $self->{root}->destroy();
+        return undef;
+    }
+    
+    unless ($auth_result) {
+        main::log_message('INFO', "Authentication failed or cancelled, destroying window");
         $self->{root}->destroy();
         return undef;
     }
@@ -980,43 +994,60 @@ sub new {
     eval {
         main::log_message('DEBUG', "Starting task processor...");
         $self->start_task_processor();
-        main::log_message('DEBUG', "Task processor started");
+        main::log_message('DEBUG', "Task processor started successfully");
     };
     if ($@) {
         main::log_message('ERROR', "Failed to start task processor: $@");
+        # Non-fatal, continue
     }
     
     # Delay temperature check
     eval {
         main::log_message('DEBUG', "Scheduling temperature check...");
-        $self->{root}->after(2000, sub { $self->check_temperature_api_status() });
-        main::log_message('DEBUG', "Temperature check scheduled");
+        $self->{root}->after(2000, sub {
+            eval {
+                $self->check_temperature_api_status();
+            };
+            if ($@) {
+                main::log_message('ERROR', "Temperature check failed: $@");
+            }
+        });
+        main::log_message('DEBUG', "Temperature check scheduled successfully");
     };
     if ($@) {
         main::log_message('ERROR', "Failed to schedule temperature check: $@");
+        # Non-fatal, continue
     }
     
-    # Start auto-refresh and health check
+    # Start auto-refresh
     eval {
         main::log_message('DEBUG', "Starting auto-refresh...");
         $self->start_auto_refresh();
-        main::log_message('DEBUG', "Auto-refresh started");
+        main::log_message('DEBUG', "Auto-refresh started successfully");
     };
     if ($@) {
-        main::log_message('ERROR', "Failed to start auto-refresh: $@");
-        die "Failed to start auto-refresh: $@";
+        main::log_message('CRITICAL', "Failed to start auto-refresh: $@");
+        $self->{root}->messageBox(
+            -title => "Initialization Error",
+            -message => "Failed to start auto-refresh:\n\n$@\n\nThe dashboard may not work correctly.",
+            -type => 'OK',
+            -icon => 'warning',
+        );
+        # Continue anyway
     }
     
+    # Start health check
     eval {
         main::log_message('DEBUG', "Starting health check...");
         $self->start_health_check();
-        main::log_message('DEBUG', "Health check started");
+        main::log_message('DEBUG', "Health check started successfully");
     };
     if ($@) {
         main::log_message('ERROR', "Failed to start health check: $@");
+        # Non-fatal, continue
     }
     
-    main::log_message('INFO', "Dashboard initialization complete");
+    main::log_message('INFO', "Dashboard initialization complete - returning to MainLoop");
     
     return $self;
 }
@@ -1958,128 +1989,153 @@ sub create_widgets {
 sub authenticate {
     my ($self) = @_;
     
-    if (-e $main::CREDENTIALS_FILE) {
-        while (1) {
-            my $dialog = $self->{root}->DialogBox(
-                -title => "Master Password",
-                -buttons => ["OK", "Cancel"],
-            );
+    main::log_message('INFO', "=== Starting authentication process ===");
+    
+    eval {
+        if (-e $main::CREDENTIALS_FILE) {
+            main::log_message('INFO', "Credentials file exists, attempting to load...");
             
-            $dialog->add('Label', -text => "Enter your master password:")->pack();
-            my $entry = $dialog->add('Entry', -show => '*', -width => 30)->pack();
-            $entry->focus();
-            
-            my $answer = $dialog->Show();
-            
-            return 0 if $answer eq "Cancel";
-            
-            my $master_password = $entry->get();
-            
-            # Try to decrypt credentials
-            my $creds;
-            eval {
-                $creds = CredentialManager::load_credentials($master_password);
-            };
-            
-            if ($@) {
-                main::log_message('ERROR', "Failed to decrypt credentials: $@");
-                $self->{root}->messageBox(
-                    -title => "Decryption Error",
-                    -message => "Failed to decrypt credentials:\n$@\n\nPlease check your master password.",
-                    -type => 'OK',
-                    -icon => 'error',
-                );
-                next;
-            }
-            
-            unless ($creds) {
-                $self->{root}->messageBox(
-                    -title => "Error",
-                    -message => "No credentials found in file.",
-                    -type => 'OK',
-                    -icon => 'error',
-                );
-                next;
-            }
-            
-            # Try to authenticate
-            eval {
-                $self->{api} = ProxmoxAPI->new(
-                    $creds->{host},
-                    $creds->{token_id},
-                    $creds->{token_secret},
+            while (1) {
+                my $dialog = $self->{root}->DialogBox(
+                    -title => "Master Password",
+                    -buttons => ["OK", "Cancel"],
                 );
                 
-                $self->{status_label}->configure(-text => "Connected to $creds->{host}");
-                $self->{ssl_label}->configure(-text => "SSL: " . $self->{api}->{ssl_status});
-                $self->{connection_healthy} = 1;
-                main::log_message('INFO', "Successfully authenticated to $creds->{host}");
-                return 1;
-            };
-            
-            if ($@) {
-                main::log_message('ERROR', "Authentication failed with stored credentials: $@");
+                $dialog->add('Label', -text => "Enter your master password:")->pack();
+                my $entry = $dialog->add('Entry', -show => '*', -width => 30)->pack();
+                $entry->focus();
                 
-                my $response = $self->{root}->messageBox(
-                    -title => "Authentication Failed",
-                    -message => "Failed to authenticate with stored credentials:\n\n$@\n\n" .
-                               "The API token may have been revoked or is invalid.\n\n" .
-                               "Would you like to delete the old credentials and set up new ones?",
-                    -type => 'YesNo',
-                    -icon => 'warning',
-                );
+                my $answer = $dialog->Show();
                 
-                if ($response eq 'Yes') {
-                    eval {
-                        unlink $main::CREDENTIALS_FILE;
-                        main::log_message('INFO', "Deleted invalid credentials file");
-                    };
-                    
-                    if ($@) {
-                        main::log_message('ERROR', "Failed to delete credentials file: $@");
-                    }
-                    
+                if ($answer eq "Cancel") {
+                    main::log_message('INFO', "User cancelled authentication");
+                    return 0;
+                }
+                
+                my $master_password = $entry->get();
+                
+                main::log_message('DEBUG', "Attempting to load credentials...");
+                
+                # Try to decrypt credentials
+                my $creds;
+                eval {
+                    $creds = CredentialManager::load_credentials($master_password);
+                };
+                
+                if ($@) {
+                    main::log_message('ERROR', "Failed to decrypt credentials: $@");
                     $self->{root}->messageBox(
-                        -title => "Credentials Deleted",
-                        -message => "Old credentials have been deleted.\n\n" .
-                                   "You will now be guided through setting up new credentials.",
+                        -title => "Decryption Error",
+                        -message => "Failed to decrypt credentials:\n$@\n\nPlease check your master password.",
                         -type => 'OK',
-                        -icon => 'info',
+                        -icon => 'error',
                     );
-                    last;
-                } else {
                     next;
+                }
+                
+                unless ($creds) {
+                    main::log_message('ERROR', "No credentials returned from load");
+                    $self->{root}->messageBox(
+                        -title => "Error",
+                        -message => "No credentials found in file.",
+                        -type => 'OK',
+                        -icon => 'error',
+                    );
+                    next;
+                }
+                
+                main::log_message('INFO', "Credentials loaded successfully, attempting API connection...");
+                
+                # Try to authenticate
+                eval {
+                    $self->{api} = ProxmoxAPI->new(
+                        $creds->{host},
+                        $creds->{token_id},
+                        $creds->{token_secret},
+                    );
+                    
+                    main::log_message('INFO', "ProxmoxAPI object created successfully");
+                    
+                    $self->{status_label}->configure(-text => "Connected to $creds->{host}");
+                    $self->{ssl_label}->configure(-text => "SSL: " . $self->{api}->{ssl_status});
+                    $self->{connection_healthy} = 1;
+                    main::log_message('INFO', "Successfully authenticated to $creds->{host}");
+                };
+                
+                if ($@) {
+                    main::log_message('ERROR', "Authentication failed with stored credentials: $@");
+                    
+                    my $response = $self->{root}->messageBox(
+                        -title => "Authentication Failed",
+                        -message => "Failed to authenticate with stored credentials:\n\n$@\n\n" .
+                                   "The API token may have been revoked or is invalid.\n\n" .
+                                   "Would you like to delete the old credentials and set up new ones?",
+                        -type => 'YesNo',
+                        -icon => 'warning',
+                    );
+                    
+                    if ($response eq 'Yes') {
+                        eval {
+                            unlink $main::CREDENTIALS_FILE;
+                            main::log_message('INFO', "Deleted invalid credentials file");
+                        };
+                        
+                        if ($@) {
+                            main::log_message('ERROR', "Failed to delete credentials file: $@");
+                        }
+                        
+                        $self->{root}->messageBox(
+                            -title => "Credentials Deleted",
+                            -message => "Old credentials have been deleted.\n\n" .
+                                       "You will now be guided through setting up new credentials.",
+                            -type => 'OK',
+                            -icon => 'info',
+                        );
+                        last;
+                    } else {
+                        next;
+                    }
+                } else {
+                    # Authentication successful
+                    main::log_message('INFO', "=== Authentication with stored credentials successful ===");
+                    return 1;
                 }
             }
         }
-    }
-    
-    # No credentials file - setup flow
-    $self->{root}->messageBox(
-        -title => "Setup Required",
-        -message => "No credentials found.\n\n" .
-                   "You'll need to create an API token in Proxmox first.\n\n" .
-                   "The next screen will show you how.",
-        -type => 'OK',
-        -icon => 'info',
-    );
-    
-    my $guide = TokenCreationGuide->new($self->{root});
-    $guide->wait_window();
-    
-    my $dialog = CredentialsDialog->new($self->{root}, 1);
-    $dialog->wait_window();
-    
-    if ($dialog->{result}) {
-        my $result = $dialog->{result};
         
-        eval {
+        # No credentials file - setup flow
+        main::log_message('INFO', "No credentials file, starting setup flow...");
+        
+        $self->{root}->messageBox(
+            -title => "Setup Required",
+            -message => "No credentials found.\n\n" .
+                       "You'll need to create an API token in Proxmox first.\n\n" .
+                       "The next screen will show you how.",
+            -type => 'OK',
+            -icon => 'info',
+        );
+        
+        my $guide = TokenCreationGuide->new($self->{root});
+        $guide->wait_window();
+        
+        my $dialog = CredentialsDialog->new($self->{root}, 1);
+        $dialog->wait_window();
+        
+        if ($dialog->{result}) {
+            my $result = $dialog->{result};
+            
+            main::log_message('INFO', "User provided new credentials, attempting connection...");
+            
+            # First authenticate with API
             $self->{api} = ProxmoxAPI->new(
                 $result->{host},
                 $result->{token_id},
                 $result->{token_secret},
             );
             
+            main::log_message('INFO', "API authentication successful, saving credentials...");
+            
+            # Then save credentials
             CredentialManager::save_credentials(
                 $result->{host},
                 $result->{master},
@@ -2124,22 +2180,24 @@ sub authenticate {
             $self->{ssl_label}->configure(-text => "SSL: " . $self->{api}->{ssl_status});
             $self->{connection_healthy} = 1;
             main::log_message('INFO', "Successfully set up connection to $result->{host}");
+            main::log_message('INFO', "=== Authentication with new credentials successful ===");
             return 1;
-        };
-        
-        if ($@) {
-            main::log_message('ERROR', "Connection setup failed: $@");
-            $self->{root}->messageBox(
-                -title => "Error",
-                -message => "Connection failed:\n$@",
-                -type => 'OK',
-                -icon => 'error',
-            );
-            return 0;
         }
-    }
+        
+        main::log_message('INFO', "User cancelled credential setup");
+        return 0;
+    };
     
-    return 0;
+    if ($@) {
+        main::log_message('CRITICAL', "FATAL ERROR in authenticate(): $@");
+        $self->{root}->messageBox(
+            -title => "Critical Error",
+            -message => "Authentication failed with critical error:\n\n$@",
+            -type => 'OK',
+            -icon => 'error',
+        );
+        return 0;
+    }
 }
 
 sub start_task_processor {
@@ -3002,10 +3060,40 @@ sub on_closing {
 package main;
 
 sub main {
-    my $mw = MainWindow->new();
-    my $app = ProxmoxDashboard->new($mw);
+    eval {
+        log_message('INFO', "========================================");
+        log_message('INFO', "Starting Proxmox Dashboard");
+        log_message('INFO', "========================================");
+        
+        log_message('DEBUG', "Creating main window...");
+        my $mw = MainWindow->new();
+        log_message('DEBUG', "Main window created");
+        
+        log_message('DEBUG', "Creating ProxmoxDashboard object...");
+        my $app = ProxmoxDashboard->new($mw);
+        
+        if ($app) {
+            log_message('INFO', "Dashboard initialized successfully");
+            log_message('INFO', "Entering Tk MainLoop...");
+            MainLoop();
+            log_message('INFO', "MainLoop exited normally");
+        } else {
+            log_message('ERROR', "ProxmoxDashboard->new() returned undef");
+            die "Dashboard initialization returned undef";
+        }
+    };
     
-    MainLoop();
+    if ($@) {
+        log_message('CRITICAL', "FATAL ERROR in main(): $@");
+        print STDERR "\n\n";
+        print STDERR "========================================\n";
+        print STDERR "FATAL ERROR\n";
+        print STDERR "========================================\n";
+        print STDERR "$@\n";
+        print STDERR "\nCheck the log file for details: $LOG_FILE\n";
+        print STDERR "========================================\n\n";
+        exit 1;
+    }
 }
 
 main() unless caller;
