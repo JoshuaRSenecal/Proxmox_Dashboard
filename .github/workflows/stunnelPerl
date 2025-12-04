@@ -1395,6 +1395,16 @@ sub _update_temp_ui {
             $sensor_label->pack(-side => 'left', -padx => 10);
             
             $sensor_label->bind('<Button-1>', sub { $self->show_temperature_details($node_name) });
+        } else {
+            # No suitable sensor found
+            my $label = $self->{node_temp_frame}->Label(
+                -text => "$node_name: N/A",
+                -font => ['Arial', 9, 'bold'],
+                -background => '#34495e',
+                -foreground => '#95a5a6',
+            );
+            $label->{is_temp_label} = 1;
+            $label->pack(-side => 'left', -padx => 8);
         }
     }
 }
@@ -2003,30 +2013,36 @@ sub create_widgets {
         -header => 1,
         -columns => 13,
         -scrollbars => 'se',
-        -width => 150,
+        -width => 200,
         -height => 12,
         -selectmode => 'single',
-        -background => '#ecf0f1',
-        -foreground => 'black',
+        -background => '#2c3e50',
+        -foreground => 'white',
         -separator => '/',
         -itemtype => 'text',
+        -selectbackground => '#3498db',
+        -selectforeground => 'white',
+        -indent => 10,
+        -gap => 5,
+        -padx => 5,
+        -pady => 3,
     )->pack(-fill => 'both', -expand => 1);
     
-    # Configure columns with widths
+    # Configure columns with larger widths to require scrolling
     my @columns = (
-        ['ID', 8],
-        ['Type', 6],
-        ['Status', 10],
-        ['Name', 25],
-        ['Node', 12],
-        ['Cores', 7],
-        ['Sockets', 8],
-        ['CPU', 12],
-        ['Memory', 15],
-        ['Disk', 12],
-        ['TotalFS', 12],
-        ['FreeDisk', 12],
-        ['Free%', 8],
+        ['ID', 10],
+        ['Type', 10],
+        ['Status', 12],
+        ['Name', 35],
+        ['Node', 18],
+        ['Cores', 10],
+        ['Sockets', 10],
+        ['CPU', 20],
+        ['Memory', 25],
+        ['Disk', 18],
+        ['TotalFS', 18],
+        ['FreeDisk', 18],
+        ['Free%', 12],
     );
     
     for my $i (0..$#columns) {
@@ -2034,22 +2050,62 @@ sub create_widgets {
         $self->{tree}->header('create', $i, 
             -text => $col_name,
             -headerbackground => '#34495e',
+            -headerforeground => 'white',
             -borderwidth => 2,
         );
         $self->{tree}->column('width', $i, -char => $col_width);
     }
     
-    # Create item styles for status colors
+    # Create item styles for status colors with spacing
     eval {
         $self->{tree}->ItemStyle('text', -stylename => 'running',
-            -background => '#d5f4e6', -foreground => 'black');
+            -background => '#27ae60', -foreground => 'white',
+            -selectbackground => '#3498db', -selectforeground => 'white');
         $self->{tree}->ItemStyle('text', -stylename => 'stopped',
-            -background => '#fadbd8', -foreground => 'black');
+            -background => '#e74c3c', -foreground => 'white',
+            -selectbackground => '#3498db', -selectforeground => 'white');
+        $self->{tree}->ItemStyle('text', -stylename => 'normal',
+            -background => '#2c3e50', -foreground => 'white',
+            -selectbackground => '#3498db', -selectforeground => 'white');
+        $self->{tree}->ItemStyle('text', -stylename => 'hover',
+            -background => '#5dade2', -foreground => 'white',
+            -selectbackground => '#3498db', -selectforeground => 'white');
     };
     
     if ($@) {
         main::log_message('DEBUG', "Could not create HList styles (not critical): $@");
     }
+    
+    # Add hover bindings for mouse over effect
+    $self->{tree}->bind('<Motion>', sub {
+        my $w = shift;
+        my $e = $w->XEvent;
+        my $entry = $w->nearest($e->y);
+        
+        # Store current hover entry
+        if ($entry && (!$self->{hover_entry} || $self->{hover_entry} ne $entry)) {
+            # Restore previous hover entry to normal style
+            if ($self->{hover_entry}) {
+                $self->restore_row_style($self->{hover_entry});
+            }
+            
+            # Apply hover style to new entry (all columns)
+            for my $col (0..12) {
+                eval { $w->itemConfigure($entry, $col, -style => 'hover'); };
+            }
+            
+            $self->{hover_entry} = $entry;
+        }
+    });
+    
+    $self->{tree}->bind('<Leave>', sub {
+        my $w = shift;
+        # Restore hover entry when leaving the widget
+        if ($self->{hover_entry}) {
+            $self->restore_row_style($self->{hover_entry});
+            $self->{hover_entry} = undef;
+        }
+    });
     
     # Status bar
     my $status_bar = $self->{root}->Frame(
@@ -2453,31 +2509,30 @@ sub filter_vms {
             
             # Add to tree
             my $entry = $self->{tree}->add($vm->{id});
-            $self->{tree}->itemCreate($entry, 0, -itemtype => 'text', -text => $vm->{id});
-            $self->{tree}->itemCreate($entry, 1, -itemtype => 'text', -text => $vm->{type});
-            $self->{tree}->itemCreate($entry, 2, -itemtype => 'text', -text => $vm->{status});
-            $self->{tree}->itemCreate($entry, 3, -itemtype => 'text', -text => $vm->{name});
-            $self->{tree}->itemCreate($entry, 4, -itemtype => 'text', -text => $vm->{node});
-            $self->{tree}->itemCreate($entry, 5, -itemtype => 'text', -text => $vm->{cores} || 'N/A');
-            $self->{tree}->itemCreate($entry, 6, -itemtype => 'text', -text => $vm->{sockets} || 'N/A');
-            $self->{tree}->itemCreate($entry, 7, -itemtype => 'text', -text => $vm->{cpu} || 'N/A');
-            $self->{tree}->itemCreate($entry, 8, -itemtype => 'text', -text => $vm->{memory} || 'N/A');
-            $self->{tree}->itemCreate($entry, 9, -itemtype => 'text', -text => $vm->{disk} || 'N/A');
-            $self->{tree}->itemCreate($entry, 10, -itemtype => 'text', -text => $vm->{total_fs} || 'N/A');
-            $self->{tree}->itemCreate($entry, 11, -itemtype => 'text', -text => $vm->{free_disk} || 'N/A');
-            $self->{tree}->itemCreate($entry, 12, -itemtype => 'text', -text => $vm->{free_pct} || 'N/A');
             
-            # Set row colors based on status (only configure first column for visual indicator)
+            # Determine which style to use based on status
             my $status = lc($vm->{status});
+            my $style = 'normal';
             if ($status eq 'running') {
-                eval {
-                    $self->{tree}->itemConfigure($entry, 0, -style => 'running');
-                };
+                $style = 'running';
             } elsif ($status eq 'stopped') {
-                eval {
-                    $self->{tree}->itemConfigure($entry, 0, -style => 'stopped');
-                };
+                $style = 'stopped';
             }
+            
+            # Create all items with the appropriate style
+            $self->{tree}->itemCreate($entry, 0, -itemtype => 'text', -text => $vm->{id}, -style => $style);
+            $self->{tree}->itemCreate($entry, 1, -itemtype => 'text', -text => $vm->{type}, -style => $style);
+            $self->{tree}->itemCreate($entry, 2, -itemtype => 'text', -text => $vm->{status}, -style => $style);
+            $self->{tree}->itemCreate($entry, 3, -itemtype => 'text', -text => $vm->{name}, -style => $style);
+            $self->{tree}->itemCreate($entry, 4, -itemtype => 'text', -text => $vm->{node}, -style => $style);
+            $self->{tree}->itemCreate($entry, 5, -itemtype => 'text', -text => $vm->{cores} || 'N/A', -style => $style);
+            $self->{tree}->itemCreate($entry, 6, -itemtype => 'text', -text => $vm->{sockets} || 'N/A', -style => $style);
+            $self->{tree}->itemCreate($entry, 7, -itemtype => 'text', -text => $vm->{cpu} || 'N/A', -style => $style);
+            $self->{tree}->itemCreate($entry, 8, -itemtype => 'text', -text => $vm->{memory} || 'N/A', -style => $style);
+            $self->{tree}->itemCreate($entry, 9, -itemtype => 'text', -text => $vm->{disk} || 'N/A', -style => $style);
+            $self->{tree}->itemCreate($entry, 10, -itemtype => 'text', -text => $vm->{total_fs} || 'N/A', -style => $style);
+            $self->{tree}->itemCreate($entry, 11, -itemtype => 'text', -text => $vm->{free_disk} || 'N/A', -style => $style);
+            $self->{tree}->itemCreate($entry, 12, -itemtype => 'text', -text => $vm->{free_pct} || 'N/A', -style => $style);
         }
     }
     
@@ -2495,6 +2550,33 @@ sub filter_vms {
     }
 }
 
+sub restore_row_style {
+    my ($self, $entry) = @_;
+    
+    return unless $entry;
+    
+    # Find the VM data for this entry to determine proper style
+    my $vmid = $entry;
+    my $style = 'normal';
+    
+    foreach my $vm (@{$self->{vm_data}}) {
+        if ($vm->{id} eq $vmid) {
+            my $status = lc($vm->{status});
+            if ($status eq 'running') {
+                $style = 'running';
+            } elsif ($status eq 'stopped') {
+                $style = 'stopped';
+            }
+            last;
+        }
+    }
+    
+    # Apply style to all columns
+    for my $col (0..12) {
+        eval { $self->{tree}->itemConfigure($entry, $col, -style => $style); };
+    }
+}
+
 sub format_bytes {
     my ($self, $bytes_val) = @_;
     
@@ -2502,7 +2584,11 @@ sub format_bytes {
     
     eval {
         $bytes_val = 0 + $bytes_val;  # Force numeric
-        return 'N/A' if $bytes_val < 0;
+        
+        if ($bytes_val < 0) {
+            main::log_message('DEBUG', "format_bytes: negative value $bytes_val, returning N/A");
+            return 'N/A';
+        }
         
         my @units = ('B', 'KiB', 'MiB', 'GiB', 'TiB', 'PiB');
         
@@ -2556,6 +2642,8 @@ sub fetch_single_vm_data {
             my $memory_val = $cfg->{memory} || 0;
             $memory_val = int($memory_val) if $memory_val;
             
+            main::log_message('DEBUG', "VM $vmid: memory_val=$memory_val, balloon=" . ($cfg->{balloon} // 'undef'));
+            
             if (exists $cfg->{balloon}) {
                 my $balloon_val = int($cfg->{balloon} || $memory_val);
                 my $minmem = int($balloon_val);
@@ -2565,6 +2653,7 @@ sub fetch_single_vm_data {
                     my $minmem_str = $self->format_bytes($minmem * 1024 * 1024);
                     my $maxmem_str = $self->format_bytes($maxmem * 1024 * 1024);
                     $memory = "$minmem_str-$maxmem_str";
+                    main::log_message('DEBUG', "VM $vmid: Memory formatted as $memory");
                 } else {
                     $memory = $memory_val ? $self->format_bytes($memory_val * 1024 * 1024) : 'N/A';
                 }
@@ -2575,6 +2664,8 @@ sub fetch_single_vm_data {
             my $memory_mb = int($cfg->{memory} || 0);
             my $swap_mb = int($cfg->{swap} || 0);
             
+            main::log_message('DEBUG', "CT $vmid: memory=$memory_mb MB, swap=$swap_mb MB");
+            
             if ($memory_mb > 0) {
                 my $mem_str = $self->format_bytes($memory_mb * 1024 * 1024);
                 if ($swap_mb > 0) {
@@ -2583,6 +2674,7 @@ sub fetch_single_vm_data {
                 } else {
                     $memory = $mem_str;
                 }
+                main::log_message('DEBUG', "CT $vmid: Memory formatted as $memory");
             } else {
                 $memory = 'N/A';
             }
@@ -2590,7 +2682,7 @@ sub fetch_single_vm_data {
     };
     
     if ($@) {
-        main::log_message('DEBUG', "Error parsing memory for $vm_type $vmid: $@");
+        main::log_message('ERROR', "Error parsing memory for $vm_type $vmid: $@");
     }
     
     # Disk size (safely)
@@ -2681,6 +2773,8 @@ sub fetch_single_vm_data {
                         my $disk_used = $stat->{disk} || 0;
                         my $disk_max = $stat->{maxdisk} || 0;
                         
+                        main::log_message('DEBUG', "VM $vmid status: disk_used=$disk_used, disk_max=$disk_max");
+                        
                         if ($disk_max > 0 && $disk_used >= 0) {
                             $total_fs = $self->format_bytes($disk_max);
                             my $free_bytes = $disk_max - $disk_used;
@@ -2688,6 +2782,7 @@ sub fetch_single_vm_data {
                                 $free_disk = $self->format_bytes($free_bytes);
                                 $free_pct = sprintf("%.1f%%", ($free_bytes / $disk_max * 100));
                             }
+                            main::log_message('DEBUG', "VM $vmid: total_fs=$total_fs, free_disk=$free_disk, free_pct=$free_pct");
                         }
                     };
                     
@@ -2702,6 +2797,8 @@ sub fetch_single_vm_data {
                     my $disk_used = $stat->{disk} || 0;
                     my $disk_max = $stat->{maxdisk} || 0;
                     
+                    main::log_message('DEBUG', "CT $vmid status: disk_used=$disk_used, disk_max=$disk_max");
+                    
                     if ($disk_max > 0 && $disk_used >= 0) {
                         $total_fs = $self->format_bytes($disk_max);
                         my $free_bytes = $disk_max - $disk_used;
@@ -2709,6 +2806,7 @@ sub fetch_single_vm_data {
                             $free_disk = $self->format_bytes($free_bytes);
                             $free_pct = sprintf("%.1f%%", ($free_bytes / $disk_max * 100));
                         }
+                        main::log_message('DEBUG', "CT $vmid: total_fs=$total_fs, free_disk=$free_disk, free_pct=$free_pct");
                     }
                 };
                 
