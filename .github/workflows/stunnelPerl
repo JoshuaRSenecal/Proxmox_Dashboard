@@ -22,8 +22,8 @@ use threads::shared;
 use Thread::Queue;
 use Digest::SHA;
 use Crypt::PBKDF2;
-use Crypt::CBC;
-use Crypt::Cipher::AES;
+use Crypt::AuthEnc::GCM;
+use Crypt::Random qw(makerandom_octet);
 use IO::Socket::SSL;
 
 # Configure logging
@@ -317,27 +317,34 @@ sub post {
 ################################################################################
 package CredentialManager;
 
-use Digest::SHA qw(hmac_sha256);
+use Crypt::PBKDF2;
+use Crypt::AuthEnc::GCM qw(gcm_encrypt_authenticate gcm_decrypt_verify);
+use MIME::Base64 qw(encode_base64 decode_base64);
+use Crypt::Random qw(makerandom_octet);
 
 sub get_key_from_password {
     my ($password) = @_;
     
-    # Use a simple but reliable key derivation
-    # Multiple rounds of HMAC-SHA256 to derive 32-byte key
-    my $key = $password . $main::SALT;
+    # Use PBKDF2 exactly like Python's cryptography library
+    # Python: PBKDF2HMAC(algorithm=hashes.SHA256(), length=32, salt=SALT, iterations=100000)
+    my $pbkdf2 = Crypt::PBKDF2->new(
+        hash_class => 'HMACSHA2',
+        hash_args => {
+            sha_size => 256,
+        },
+        iterations => 100000,
+        output_len => 32,
+    );
     
-    # Apply HMAC-SHA256 multiple times for key stretching (100000 iterations)
-    for (my $i = 0; $i < 100000; $i++) {
-        $key = hmac_sha256($key, $main::SALT);
-    }
+    # Generate raw key bytes
+    my $key = $pbkdf2->PBKDF2($main::SALT, $password);
     
     my $key_len = length($key);
-    main::log_message('DEBUG', "Derived key length: $key_len bytes");
+    main::log_message('DEBUG', "PBKDF2 generated key length: $key_len bytes");
     
-    # hmac_sha256 returns 32 bytes, but verify
     if ($key_len != 32) {
-        main::log_message('ERROR', "Key derivation returned wrong length: $key_len bytes");
-        die "Key derivation failed";
+        main::log_message('ERROR', "PBKDF2 generated wrong key length: $key_len");
+        die "Key derivation failed - got $key_len bytes instead of 32";
     }
     
     return $key;
@@ -355,24 +362,23 @@ sub save_credentials {
         };
         
         my $json = JSON::encode_json($credentials);
-        main::log_message('DEBUG', "JSON to encrypt: " . substr($json, 0, 50) . "...");
+        main::log_message('DEBUG', "JSON to encrypt length: " . length($json));
         
         my $key = get_key_from_password($master_password);
         main::log_message('DEBUG', "Derived key for encryption, length: " . length($key));
         
-        # Use Crypt::CBC with AES-256
-        my $cipher = Crypt::CBC->new(
-            -key => $key,
-            -cipher => 'Cipher::AES',
-            -keysize => 32,  # Explicitly set 256-bit key size
-            -header => 'none',
-            -iv => substr($key, 0, 16),
-            -literal_key => 1,
-            -padding => 'standard',
-        );
+        # Use AES-256-GCM for authenticated encryption (more reliable than CBC)
+        # Generate random 12-byte IV
+        my $iv = makerandom_octet(Length => 12);
         
-        my $encrypted = $cipher->encrypt($json);
+        # Encrypt using GCM mode
+        my ($ciphertext, $tag) = gcm_encrypt_authenticate('AES', $key, $iv, '', $json);
+        
+        # Store: IV (12 bytes) + tag (16 bytes) + ciphertext
+        my $encrypted = $iv . $tag . $ciphertext;
+        
         main::log_message('DEBUG', "Encrypted data length: " . length($encrypted));
+        main::log_message('DEBUG', "  IV: 12 bytes, Tag: 16 bytes, Ciphertext: " . length($ciphertext) . " bytes");
         
         # Write to temporary file first, then rename (atomic operation)
         my $temp_file = $main::CREDENTIALS_FILE . '.tmp';
@@ -422,34 +428,32 @@ sub load_credentials {
         my $encrypted_len = length($encrypted);
         main::log_message('DEBUG', "Loaded encrypted data, length: $encrypted_len bytes");
         
-        if ($encrypted_len == 0) {
-            die "Credentials file is empty";
+        if ($encrypted_len < 28) {  # Minimum: 12 (IV) + 16 (tag) + some data
+            die "Credentials file is too small or corrupted";
         }
         
         my $key = get_key_from_password($master_password);
         main::log_message('DEBUG', "Derived key for decryption, length: " . length($key));
         
-        my $cipher = Crypt::CBC->new(
-            -key => $key,
-            -cipher => 'Cipher::AES',
-            -keysize => 32,  # Explicitly set 256-bit key size
-            -header => 'none',
-            -iv => substr($key, 0, 16),
-            -literal_key => 1,
-            -padding => 'standard',
-        );
+        # Extract: IV (12 bytes) + tag (16 bytes) + ciphertext
+        my $iv = substr($encrypted, 0, 12);
+        my $tag = substr($encrypted, 12, 16);
+        my $ciphertext = substr($encrypted, 28);
         
-        main::log_message('DEBUG', "Starting decryption...");
-        my $decrypted = $cipher->decrypt($encrypted);
+        main::log_message('DEBUG', "Extracting: IV(12) + Tag(16) + Ciphertext(" . length($ciphertext) . ")");
+        
+        # Decrypt using GCM mode
+        my $decrypted = gcm_decrypt_verify('AES', $key, $iv, '', $ciphertext, $tag);
+        
+        unless (defined $decrypted) {
+            die "Decryption failed - wrong password or corrupted data";
+        }
+        
         main::log_message('DEBUG', "Decrypted data length: " . length($decrypted));
         
-        # Show hex dump of first 32 bytes for debugging
-        my $hex_preview = unpack('H*', substr($decrypted, 0, 32));
-        main::log_message('DEBUG', "Decrypted hex (first 32 bytes): $hex_preview");
-        
-        # Show printable characters
+        # Show preview
         my $preview = substr($decrypted, 0, 100);
-        $preview =~ s/[^[:print:]]/?/g;  # Replace non-printable with ?
+        $preview =~ s/[^[:print:]]/?/g;
         main::log_message('DEBUG', "Decrypted preview: $preview");
         
         main::log_message('DEBUG', "Attempting JSON decode...");
@@ -461,11 +465,10 @@ sub load_credentials {
         my $error = $@;
         main::log_message('ERROR', "Credential decryption failed: $error");
         
-        # Provide specific error guidance
-        if ($error =~ /empty/i) {
-            die "Credentials file is empty or corrupted. Please delete it and set up again.";
-        } elsif ($error =~ /padding/i || $error =~ /decrypt/i) {
-            die "Invalid master password or corrupted credentials file.\n\nIf you forgot your password, delete: $main::CREDENTIALS_FILE\nThen restart and set up new credentials.";
+        if ($error =~ /wrong password/i) {
+            die "Invalid master password.\n\nIf you forgot your password, delete: $main::CREDENTIALS_FILE\nThen restart and set up new credentials.";
+        } elsif ($error =~ /corrupted/i || $error =~ /too small/i) {
+            die "Credentials file is corrupted. Please delete: $main::CREDENTIALS_FILE\nThen restart and set up new credentials.";
         } elsif ($error =~ /JSON/i) {
             die "Credentials file contains invalid data. Please delete: $main::CREDENTIALS_FILE\nThen restart and set up new credentials.";
         } else {
