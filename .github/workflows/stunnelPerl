@@ -139,6 +139,10 @@ package ProxmoxAPI;
 sub new {
     my ($class, $host, $token_id, $token_secret) = @_;
     
+    main::log_message('INFO', "Creating ProxmoxAPI connection to $host");
+    main::log_message('DEBUG', "Token ID: $token_id");
+    main::log_message('DEBUG', "SSL CA cert: $main::PROXMOX_CA_CERT");
+    
     my $self = {
         base => "https://$host:8006/api2/json",
         host => $host,
@@ -150,6 +154,8 @@ sub new {
     
     bless $self, $class;
     
+    main::log_message('DEBUG', "Base URL: $self->{base}");
+    
     # Create LWP UserAgent with SSL verification
     $self->{ua} = LWP::UserAgent->new(
         ssl_opts => {
@@ -160,8 +166,11 @@ sub new {
         timeout => 10,
     );
     
+    main::log_message('DEBUG', "LWP UserAgent created with SSL verification");
+    
     # Test authentication
     eval {
+        main::log_message('INFO', "Testing authentication with /version endpoint...");
         $self->_api_request('GET', '/version');
         AuditLogger::log_authentication($host, $token_id, 1);
         main::log_message('INFO', "Successfully authenticated with token: $token_id");
@@ -170,7 +179,12 @@ sub new {
     if ($@) {
         AuditLogger::log_authentication($host, $token_id, 0);
         main::log_message('ERROR', "API authentication failed: $@");
-        die $@;
+        die "API authentication failed. Please check:\n" .
+            "1. Token ID format: should be 'user\@realm!tokenname' (e.g., 'root\@pam!dashboard')\n" .
+            "2. Token secret is correct\n" .
+            "3. Proxmox host '$host' is reachable\n" .
+            "4. SSL certificate is valid\n" .
+            "Error details: $@";
     }
     
     return $self;
@@ -185,6 +199,8 @@ sub _api_request {
             my $url = $self->{base} . $path;
             my $req;
             
+            main::log_message('DEBUG', "API Request: $method $url (attempt $attempt/$retries)");
+            
             if ($method eq 'GET') {
                 $req = HTTP::Request->new(GET => $url);
             } elsif ($method eq 'POST') {
@@ -196,23 +212,38 @@ sub _api_request {
             }
             
             # Add API token authentication header
-            $req->header('Authorization' => "PVEAPIToken=$self->{token_id}=$self->{token_secret}");
+            my $auth_header = "PVEAPIToken=$self->{token_id}=$self->{token_secret}";
+            main::log_message('DEBUG', "Auth header: PVEAPIToken=$self->{token_id}=<secret>");
+            $req->header('Authorization' => $auth_header);
             
             my $response = $self->{ua}->request($req);
+            
+            main::log_message('DEBUG', "Response code: " . $response->code . " - " . $response->status_line);
             
             if ($response->is_success || $response->code == 201) {
                 return $response;
             } elsif ($response->code == 401) {
                 # Authentication failure - don't retry, fail immediately
-                die "Authentication failed: " . $response->status_line;
+                my $error_msg = "Authentication failed: " . $response->status_line;
+                if ($response->content) {
+                    $error_msg .= " - Response: " . substr($response->content, 0, 200);
+                }
+                main::log_message('ERROR', $error_msg);
+                die $error_msg;
             } elsif ($response->code >= 500 && $attempt < $retries) {
                 # Server error - retry with backoff
+                main::log_message('WARN', "Server error, retrying...");
                 my $delay = $main::RETRY_DELAY * (2 ** ($attempt - 1));
                 sleep($delay);
                 next;
             } else {
                 # Other errors - fail immediately
-                die "HTTP error: " . $response->status_line;
+                my $error_msg = "HTTP error: " . $response->status_line;
+                if ($response->content) {
+                    $error_msg .= " - Response: " . substr($response->content, 0, 200);
+                }
+                main::log_message('ERROR', $error_msg);
+                die $error_msg;
             }
         };
         
@@ -222,9 +253,11 @@ sub _api_request {
             }
             
             if ($attempt == $retries) {
+                main::log_message('ERROR', "All retry attempts exhausted: $@");
                 die $@;
             }
             
+            main::log_message('WARN', "Request failed, will retry: $@");
             my $delay = $main::RETRY_DELAY * (2 ** ($attempt - 1));
             sleep($delay);
         } else {
