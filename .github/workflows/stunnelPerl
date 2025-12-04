@@ -3078,8 +3078,10 @@ sub main {
             MainLoop();
             log_message('INFO', "MainLoop exited normally");
         } else {
-            log_message('ERROR', "ProxmoxDashboard->new() returned undef");
-            die "Dashboard initialization returned undef";
+            # This is expected when user cancels credential setup or authentication fails
+            log_message('INFO', "Dashboard initialization cancelled or failed - exiting cleanly");
+            log_message('INFO', "========================================");
+            exit 0;
         }
     };
     
