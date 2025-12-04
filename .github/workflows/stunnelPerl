@@ -317,34 +317,27 @@ sub post {
 ################################################################################
 package CredentialManager;
 
+use Digest::SHA qw(hmac_sha256);
+
 sub get_key_from_password {
     my ($password) = @_;
     
-    # Use PBKDF2 to derive key from password
-    my $pbkdf2 = Crypt::PBKDF2->new(
-        hash_class => 'HMACSHA2',
-        hash_args => {
-            sha_size => 256,
-        },
-        iterations => 100000,
-        output_len => 32,  # 32 bytes for AES-256
-    );
+    # Use a simple but reliable key derivation
+    # Multiple rounds of HMAC-SHA256 to derive 32-byte key
+    my $key = $password . $main::SALT;
     
-    # Correct parameter order: generate($salt, $password)
-    my $key = $pbkdf2->generate($main::SALT, $password);
+    # Apply HMAC-SHA256 multiple times for key stretching (100000 iterations)
+    for (my $i = 0; $i < 100000; $i++) {
+        $key = hmac_sha256($key, $main::SALT);
+    }
     
-    # Ensure key is exactly 32 bytes
     my $key_len = length($key);
-    main::log_message('DEBUG', "PBKDF2 generated key length: $key_len bytes");
+    main::log_message('DEBUG', "Derived key length: $key_len bytes");
     
-    if ($key_len < 32) {
-        # Pad with zeros if too short
-        $key .= "\0" x (32 - $key_len);
-        main::log_message('DEBUG', "Padded key to 32 bytes");
-    } elsif ($key_len > 32) {
-        # Truncate if too long
-        $key = substr($key, 0, 32);
-        main::log_message('DEBUG', "Truncated key to 32 bytes");
+    # hmac_sha256 returns 32 bytes, but verify
+    if ($key_len != 32) {
+        main::log_message('ERROR', "Key derivation returned wrong length: $key_len bytes");
+        die "Key derivation failed";
     }
     
     return $key;
@@ -449,8 +442,17 @@ sub load_credentials {
         main::log_message('DEBUG', "Starting decryption...");
         my $decrypted = $cipher->decrypt($encrypted);
         main::log_message('DEBUG', "Decrypted data length: " . length($decrypted));
-        main::log_message('DEBUG', "Decrypted data preview: " . substr($decrypted, 0, 100) . "...");
         
+        # Show hex dump of first 32 bytes for debugging
+        my $hex_preview = unpack('H*', substr($decrypted, 0, 32));
+        main::log_message('DEBUG', "Decrypted hex (first 32 bytes): $hex_preview");
+        
+        # Show printable characters
+        my $preview = substr($decrypted, 0, 100);
+        $preview =~ s/[^[:print:]]/?/g;  # Replace non-printable with ?
+        main::log_message('DEBUG', "Decrypted preview: $preview");
+        
+        main::log_message('DEBUG', "Attempting JSON decode...");
         $creds = JSON::decode_json($decrypted);
         main::log_message('INFO', "Successfully decoded credentials for host: " . ($creds->{host} || 'unknown'));
     };
