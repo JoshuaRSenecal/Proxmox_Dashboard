@@ -16,6 +16,7 @@ use File::Path qw(make_path);
 use File::Spec;
 use POSIX qw(strftime);
 use Time::HiRes qw(sleep time);
+use List::Util qw(min);
 use threads;
 use threads::shared;
 use Thread::Queue;
@@ -26,10 +27,10 @@ use Crypt::Cipher::AES;
 use IO::Socket::SSL;
 
 # Configure logging
-my $LOG_FILE = File::Spec->catfile($ENV{HOME}, '.proxmox_dashboard.log');
-my $CREDENTIALS_FILE = File::Spec->catfile($ENV{HOME}, '.proxmox_credentials.enc');
-my $PROXMOX_CA_CERT = File::Spec->catfile($ENV{HOME}, 'proxmox-ca.pem');
-my $AUDIT_LOG_FILE = File::Spec->catfile($ENV{HOME}, '.proxmox_dashboard_audit.log');
+our $LOG_FILE = File::Spec->catfile($ENV{HOME}, '.proxmox_dashboard.log');
+our $CREDENTIALS_FILE = File::Spec->catfile($ENV{HOME}, '.proxmox_credentials.enc');
+our $PROXMOX_CA_CERT = File::Spec->catfile($ENV{HOME}, 'proxmox-ca.pem');
+our $AUDIT_LOG_FILE = File::Spec->catfile($ENV{HOME}, '.proxmox_dashboard_audit.log');
 
 # Secure log file permissions (owner read/write only)
 if (-e $LOG_FILE) {
@@ -37,18 +38,19 @@ if (-e $LOG_FILE) {
 }
 
 # Configuration
-my $SALT = 'proxmox_dashboard_salt_v1';
-my $REFRESH_INTERVAL = 3;  # seconds - Live data feed (near-constant updates)
-my $MAX_RETRIES = 3;
-my $RETRY_DELAY = 2;
+our $SALT = 'proxmox_dashboard_salt_v1';
+our $REFRESH_INTERVAL = 3;  # seconds - Live data feed (near-constant updates)
+our $MAX_RETRIES = 3;
+our $RETRY_DELAY = 2;
 
 # Initialize logger
-open(my $LOG_FH, '>>', $LOG_FILE) or die "Cannot open log file: $!";
+our $LOG_FH;
+open($LOG_FH, '>>', $LOG_FILE) or die "Cannot open log file: $!";
 $LOG_FH->autoflush(1);
 
 sub log_message {
     my ($level, $message) = @_;
-    my $timestamp = strftime("%Y-%m-%d %H:%M:%S", localtime);
+    my $timestamp = main::strftime("%Y-%m-%d %H:%M:%S", localtime);
     print $LOG_FH "$timestamp - ProxmoxDashboard - $level - $message\n";
 }
 
@@ -92,7 +94,7 @@ sub log_entry {
     my ($action, $target, $result, $details) = @_;
     
     eval {
-        my $timestamp = strftime("%Y-%m-%d %H:%M:%S", localtime);
+        my $timestamp = main::strftime("%Y-%m-%d %H:%M:%S", localtime);
         my $log_entry = sprintf("%s | %-20s | %-20s | %-10s", 
                                $timestamp, $action, $target, $result);
         
@@ -176,7 +178,7 @@ sub new {
 
 sub _api_request {
     my ($self, $method, $path, $retries, %params) = @_;
-    $retries //= $main::MAX_RETRIES;
+    $retries = $main::MAX_RETRIES unless defined $retries;
     
     for my $attempt (1..$retries) {
         eval {
@@ -886,8 +888,8 @@ sub setup_styles {
 
 sub create_led_indicator {
     my ($self, $parent, $color, $size) = @_;
-    $color //= 'green';
-    $size //= 12;
+    $color = 'green' unless defined $color;
+    $size = 12 unless defined $size;
     
     my $canvas = $parent->Canvas(
         -width => $size,
@@ -1052,7 +1054,7 @@ sub get_all_node_temperatures {
 
 sub _get_node_temperature_direct {
     my ($self, $node_name, $timeout) = @_;
-    $timeout //= 2;
+    $timeout = 2 unless defined $timeout;
     
     eval {
         my $node_ip = $self->{node_addresses}->{$node_name} || $self->{api}->{host};
@@ -2015,7 +2017,7 @@ sub run_async {
 
 sub show_loading {
     my ($self, $message) = @_;
-    $message //= "Loading...";
+    $message = "Loading..." unless defined $message;
     
     $self->{is_loading} = 1;
     $self->{status_label}->configure(-text => "[Loading] $message");
@@ -2426,7 +2428,7 @@ sub refresh_data_async {
         $self->{vm_data} = $result;
         $self->filter_vms();
         
-        my $now = strftime("%H:%M:%S", localtime);
+        my $now = main::strftime("%H:%M:%S", localtime);
         
         if ($self->{auto_refresh}) {
             my $refresh_rate = $self->{refresh_rate};
