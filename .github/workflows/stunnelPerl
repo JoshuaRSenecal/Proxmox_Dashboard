@@ -289,7 +289,7 @@ sub get {
     my $response = $self->_api_request('GET', $path);
     
     eval {
-        my $data = decode_json($response->content);
+        my $data = JSON::decode_json($response->content);
         
         if (exists $data->{data}) {
             return $data->{data};
@@ -347,7 +347,7 @@ sub save_credentials {
             token_secret => $token_secret,
         };
         
-        my $json = encode_json($credentials);
+        my $json = JSON::encode_json($credentials);
         main::log_message('DEBUG', "JSON to encrypt: " . substr($json, 0, 50) . "...");
         
         my $key = get_key_from_password($master_password);
@@ -422,7 +422,7 @@ sub load_credentials {
         my $decrypted = $cipher->decrypt($encrypted);
         main::log_message('DEBUG', "Decrypted data: " . substr($decrypted, 0, 50) . "...");
         
-        my $creds = decode_json($decrypted);
+        my $creds = JSON::decode_json($decrypted);
         main::log_message('DEBUG', "Successfully decoded credentials for host: " . ($creds->{host} || 'unknown'));
         
         return $creds;
@@ -1051,12 +1051,12 @@ sub check_temperature_api_status {
             # For now, just return empty results
             # The parent thread will handle this differently
             
-            return encode_json(\@results);
+            return JSON::encode_json(\@results);
         };
         
         if ($@) {
             main::log_message('ERROR', "Failed to check temperature API status: $@");
-            return encode_json([]);
+            return JSON::encode_json([]);
         }
     }, $self->{api}->{host});
     
@@ -1133,7 +1133,7 @@ sub _get_node_temperature_direct {
         my $response = $ua->get($url);
         
         if ($response->is_success) {
-            my $data = decode_json($response->content);
+            my $data = JSON::decode_json($response->content);
             return $data->{data};
         } else {
             main::log_message('DEBUG', "Temperature API returned status " . $response->code . " for $node_name");
