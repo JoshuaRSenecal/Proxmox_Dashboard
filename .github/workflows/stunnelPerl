@@ -1991,6 +1991,9 @@ sub authenticate {
     
     main::log_message('INFO', "=== Starting authentication process ===");
     
+    # Track authentication result outside eval
+    my $auth_result = 0;
+    
     eval {
         if (-e $main::CREDENTIALS_FILE) {
             main::log_message('INFO', "Credentials file exists, attempting to load...");
@@ -2009,7 +2012,8 @@ sub authenticate {
                 
                 if ($answer eq "Cancel") {
                     main::log_message('INFO', "User cancelled authentication");
-                    return 0;
+                    $auth_result = 0;
+                    return;  # Exit eval - user cancelled
                 }
                 
                 my $master_password = $entry->get();
@@ -2098,7 +2102,8 @@ sub authenticate {
                 } else {
                     # Authentication successful
                     main::log_message('INFO', "=== Authentication with stored credentials successful ===");
-                    return 1;
+                    $auth_result = 1;
+                    return;  # Exit eval successfully
                 }
             }
         }
@@ -2181,12 +2186,20 @@ sub authenticate {
             $self->{connection_healthy} = 1;
             main::log_message('INFO', "Successfully set up connection to $result->{host}");
             main::log_message('INFO', "=== Authentication with new credentials successful ===");
-            return 1;
+            $auth_result = 1;
+            return;  # Exit eval successfully
         }
         
         main::log_message('INFO', "User cancelled credential setup");
-        return 0;
+        $auth_result = 0;
+        return;  # Exit eval - user cancelled
     };
+    
+    # Handle Tk exit specially - this is normal when dialogs close
+    if ($@ && $@ =~ /_TK_EXIT_/) {
+        main::log_message('DEBUG', "Tk window exit detected, checking auth result");
+        return $auth_result;
+    }
     
     if ($@) {
         main::log_message('CRITICAL', "FATAL ERROR in authenticate(): $@");
@@ -2198,6 +2211,8 @@ sub authenticate {
         );
         return 0;
     }
+    
+    return $auth_result;
 }
 
 sub start_task_processor {
@@ -2838,6 +2853,15 @@ sub change_credentials {
         }
     };
     
+    if ($@ && $@ =~ /_TK_EXIT_/) {
+        # Tk window exit during deletion dialog - check if deletion succeeded
+        main::log_message('DEBUG', "Tk window exit during credential deletion");
+        if (! -e $main::CREDENTIALS_FILE) {
+            main::log_message('INFO', "Credentials deleted successfully despite Tk exit");
+            $@ = undef;  # Clear the error
+        }
+    }
+    
     if ($@) {
         main::log_message('ERROR', "Failed to delete credentials file: $@");
         $self->{root}->messageBox(
@@ -2921,6 +2945,15 @@ sub change_credentials {
             # Refresh
             $self->refresh_data_async();
         };
+        
+        if ($@ && $@ =~ /_TK_EXIT_/) {
+            # Tk window exit - ignore this, check if we succeeded
+            main::log_message('DEBUG', "Tk window exit detected in credential change");
+            if ($self->{api} && $self->{connection_healthy}) {
+                main::log_message('INFO', "Credential change completed successfully despite Tk exit");
+                return;
+            }
+        }
         
         if ($@) {
             main::log_message('ERROR', "Credential change failed: $@");
@@ -3084,6 +3117,13 @@ sub main {
             exit 0;
         }
     };
+    
+    # Handle Tk exit - this is normal when the main window closes
+    if ($@ && $@ =~ /_TK_EXIT_/) {
+        log_message('INFO', "Application closed normally (Tk exit)");
+        log_message('INFO', "========================================");
+        exit 0;
+    }
     
     if ($@) {
         log_message('CRITICAL', "FATAL ERROR in main(): $@");
