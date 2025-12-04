@@ -412,18 +412,29 @@ sub save_credentials {
 sub load_credentials {
     my ($master_password) = @_;
     
-    return undef unless -e $main::CREDENTIALS_FILE;
+    unless (-e $main::CREDENTIALS_FILE) {
+        main::log_message('INFO', "Credentials file does not exist: $main::CREDENTIALS_FILE");
+        return undef;
+    }
     
+    main::log_message('INFO', "Loading credentials from: $main::CREDENTIALS_FILE");
+    
+    my $creds;
     eval {
         open(my $fh, '<', $main::CREDENTIALS_FILE) or die "Cannot read credentials: $!";
         binmode($fh);
         my $encrypted = do { local $/; <$fh> };
         close($fh);
         
-        main::log_message('DEBUG', "Loaded encrypted data, length: " . length($encrypted));
+        my $encrypted_len = length($encrypted);
+        main::log_message('DEBUG', "Loaded encrypted data, length: $encrypted_len bytes");
+        
+        if ($encrypted_len == 0) {
+            die "Credentials file is empty";
+        }
         
         my $key = get_key_from_password($master_password);
-        main::log_message('DEBUG', "Derived key, length: " . length($key));
+        main::log_message('DEBUG', "Derived key for decryption, length: " . length($key));
         
         my $cipher = Crypt::CBC->new(
             -key => $key,
@@ -435,19 +446,32 @@ sub load_credentials {
             -padding => 'standard',
         );
         
+        main::log_message('DEBUG', "Starting decryption...");
         my $decrypted = $cipher->decrypt($encrypted);
-        main::log_message('DEBUG', "Decrypted data: " . substr($decrypted, 0, 50) . "...");
+        main::log_message('DEBUG', "Decrypted data length: " . length($decrypted));
+        main::log_message('DEBUG', "Decrypted data preview: " . substr($decrypted, 0, 100) . "...");
         
-        my $creds = JSON::decode_json($decrypted);
-        main::log_message('DEBUG', "Successfully decoded credentials for host: " . ($creds->{host} || 'unknown'));
-        
-        return $creds;
+        $creds = JSON::decode_json($decrypted);
+        main::log_message('INFO', "Successfully decoded credentials for host: " . ($creds->{host} || 'unknown'));
     };
     
     if ($@) {
-        main::log_message('ERROR', "Credential decryption failed: $@");
-        die "Invalid master password or corrupted credentials file";
+        my $error = $@;
+        main::log_message('ERROR', "Credential decryption failed: $error");
+        
+        # Provide specific error guidance
+        if ($error =~ /empty/i) {
+            die "Credentials file is empty or corrupted. Please delete it and set up again.";
+        } elsif ($error =~ /padding/i || $error =~ /decrypt/i) {
+            die "Invalid master password or corrupted credentials file.\n\nIf you forgot your password, delete: $main::CREDENTIALS_FILE\nThen restart and set up new credentials.";
+        } elsif ($error =~ /JSON/i) {
+            die "Credentials file contains invalid data. Please delete: $main::CREDENTIALS_FILE\nThen restart and set up new credentials.";
+        } else {
+            die "Failed to load credentials: $error";
+        }
     }
+    
+    return $creds;
 }
 
 sub extract_hostname_from_certificate {
@@ -945,15 +969,49 @@ sub new {
         return undef;
     }
     
+    main::log_message('INFO', "Authentication completed successfully, starting dashboard services...");
+    
     # Start task processor FIRST
-    $self->start_task_processor();
+    eval {
+        main::log_message('DEBUG', "Starting task processor...");
+        $self->start_task_processor();
+        main::log_message('DEBUG', "Task processor started");
+    };
+    if ($@) {
+        main::log_message('ERROR', "Failed to start task processor: $@");
+    }
     
     # Delay temperature check
-    $self->{root}->after(2000, sub { $self->check_temperature_api_status() });
+    eval {
+        main::log_message('DEBUG', "Scheduling temperature check...");
+        $self->{root}->after(2000, sub { $self->check_temperature_api_status() });
+        main::log_message('DEBUG', "Temperature check scheduled");
+    };
+    if ($@) {
+        main::log_message('ERROR', "Failed to schedule temperature check: $@");
+    }
     
     # Start auto-refresh and health check
-    $self->start_auto_refresh();
-    $self->start_health_check();
+    eval {
+        main::log_message('DEBUG', "Starting auto-refresh...");
+        $self->start_auto_refresh();
+        main::log_message('DEBUG', "Auto-refresh started");
+    };
+    if ($@) {
+        main::log_message('ERROR', "Failed to start auto-refresh: $@");
+        die "Failed to start auto-refresh: $@";
+    }
+    
+    eval {
+        main::log_message('DEBUG', "Starting health check...");
+        $self->start_health_check();
+        main::log_message('DEBUG', "Health check started");
+    };
+    if ($@) {
+        main::log_message('ERROR', "Failed to start health check: $@");
+    }
+    
+    main::log_message('INFO', "Dashboard initialization complete");
     
     return $self;
 }
@@ -2023,6 +2081,32 @@ sub authenticate {
                 $result->{token_id},
                 $result->{token_secret},
             );
+            
+            # Verify the file was actually created
+            unless (-e $main::CREDENTIALS_FILE) {
+                die "Credentials file was not created at $main::CREDENTIALS_FILE";
+            }
+            
+            my $file_size = -s $main::CREDENTIALS_FILE;
+            main::log_message('INFO', "Credentials file created, size: $file_size bytes");
+            
+            if ($file_size == 0) {
+                die "Credentials file is empty";
+            }
+            
+            # Try to read it back immediately to verify it works
+            main::log_message('DEBUG', "Verifying credentials can be decrypted...");
+            my $verify_creds = CredentialManager::load_credentials($result->{master});
+            
+            unless ($verify_creds) {
+                die "Failed to verify saved credentials - could not decrypt";
+            }
+            
+            unless ($verify_creds->{host} eq $result->{host}) {
+                die "Credential verification failed - host mismatch";
+            }
+            
+            main::log_message('INFO', "Credentials verified successfully");
             
             $self->{root}->messageBox(
                 -title => "Success",
