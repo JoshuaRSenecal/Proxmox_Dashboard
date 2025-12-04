@@ -194,6 +194,9 @@ sub _api_request {
     my ($self, $method, $path, $retries, %params) = @_;
     $retries = $main::MAX_RETRIES unless defined $retries;
     
+    my $last_error;
+    my $result;
+    
     for my $attempt (1..$retries) {
         eval {
             my $url = $self->{base} . $path;
@@ -221,7 +224,9 @@ sub _api_request {
             main::log_message('DEBUG', "Response code: " . $response->code . " - " . $response->status_line);
             
             if ($response->is_success || $response->code == 201) {
-                return $response;
+                main::log_message('DEBUG', "Request succeeded, storing response");
+                $result = $response;  # Store result instead of returning
+                return;  # Exit eval successfully
             } elsif ($response->code == 401) {
                 # Authentication failure - don't retry, fail immediately
                 my $error_msg = "Authentication failed: " . $response->status_line;
@@ -235,7 +240,7 @@ sub _api_request {
                 main::log_message('WARN', "Server error, retrying...");
                 my $delay = $main::RETRY_DELAY * (2 ** ($attempt - 1));
                 sleep($delay);
-                next;
+                die "Server error, will retry";  # Trigger retry
             } else {
                 # Other errors - fail immediately
                 my $error_msg = "HTTP error: " . $response->status_line;
@@ -247,25 +252,35 @@ sub _api_request {
             }
         };
         
-        if ($@) {
-            if ($@ =~ /Authentication failed/) {
-                die $@;  # Don't retry auth failures
+        $last_error = $@;
+        
+        if ($last_error) {
+            if ($last_error =~ /Authentication failed/) {
+                die $last_error;  # Don't retry auth failures
             }
             
             if ($attempt == $retries) {
-                main::log_message('ERROR', "All retry attempts exhausted: $@");
-                die $@;
+                main::log_message('ERROR', "All retry attempts exhausted: $last_error");
+                die $last_error;
             }
             
-            main::log_message('WARN', "Request failed, will retry: $@");
+            main::log_message('WARN', "Request failed, will retry: $last_error");
             my $delay = $main::RETRY_DELAY * (2 ** ($attempt - 1));
             sleep($delay);
         } else {
+            # Success - exit loop
             last;
         }
     }
     
-    die "API request failed after $retries attempts";
+    # If we have a result, return it
+    if ($result) {
+        main::log_message('DEBUG', "Returning successful response");
+        return $result;
+    }
+    
+    # Otherwise, something went wrong
+    die "API request failed after $retries attempts" . ($last_error ? ": $last_error" : "");
 }
 
 sub get {
