@@ -3,7 +3,7 @@ use strict;
 use warnings;
 use utf8;
 use Tk;
-use Tk::Tree;
+use Tk::HList;
 use Tk::DialogBox;
 use Tk::Toplevel;
 use Tk::Canvas;
@@ -19,7 +19,8 @@ use Time::HiRes qw(sleep time);
 use threads;
 use threads::shared;
 use Thread::Queue;
-use Digest::SHA qw(pbkdf2_hex);
+use Digest::SHA;
+use Crypt::PBKDF2;
 use Crypt::CBC;
 use Crypt::Cipher::AES;
 use IO::Socket::SSL;
@@ -270,9 +271,18 @@ sub get_key_from_password {
     my ($password) = @_;
     
     # Use PBKDF2 to derive key from password
-    my $key = pbkdf2_hex('SHA256', $password, $main::SALT, 100000, 32);
+    my $pbkdf2 = Crypt::PBKDF2->new(
+        hash_class => 'HMACSHA2',
+        hash_args => {
+            sha_size => 256,
+        },
+        iterations => 100000,
+        output_len => 32,  # 32 bytes for AES-256
+    );
     
-    return pack('H*', $key);
+    my $key = $pbkdf2->PBKDF2($main::SALT, $password);
+    
+    return $key;
 }
 
 sub save_credentials {
