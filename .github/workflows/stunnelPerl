@@ -282,7 +282,8 @@ sub get_key_from_password {
         output_len => 32,  # 32 bytes for AES-256
     );
     
-    my $key = $pbkdf2->PBKDF2($main::SALT, $password);
+    # Correct parameter order: generate($salt, $password)
+    my $key = $pbkdf2->generate($main::SALT, $password);
     
     return $key;
 }
@@ -299,7 +300,10 @@ sub save_credentials {
         };
         
         my $json = encode_json($credentials);
+        main::log_message('DEBUG', "JSON to encrypt: " . substr($json, 0, 50) . "...");
+        
         my $key = get_key_from_password($master_password);
+        main::log_message('DEBUG', "Derived key for encryption, length: " . length($key));
         
         # Use Crypt::CBC with AES
         my $cipher = Crypt::CBC->new(
@@ -312,6 +316,7 @@ sub save_credentials {
         );
         
         my $encrypted = $cipher->encrypt($json);
+        main::log_message('DEBUG', "Encrypted data length: " . length($encrypted));
         
         # Write to temporary file first, then rename (atomic operation)
         my $temp_file = $main::CREDENTIALS_FILE . '.tmp';
@@ -352,7 +357,10 @@ sub load_credentials {
         my $encrypted = do { local $/; <$fh> };
         close($fh);
         
+        main::log_message('DEBUG', "Loaded encrypted data, length: " . length($encrypted));
+        
         my $key = get_key_from_password($master_password);
+        main::log_message('DEBUG', "Derived key, length: " . length($key));
         
         my $cipher = Crypt::CBC->new(
             -key => $key,
@@ -364,10 +372,16 @@ sub load_credentials {
         );
         
         my $decrypted = $cipher->decrypt($encrypted);
-        return decode_json($decrypted);
+        main::log_message('DEBUG', "Decrypted data: " . substr($decrypted, 0, 50) . "...");
+        
+        my $creds = decode_json($decrypted);
+        main::log_message('DEBUG', "Successfully decoded credentials for host: " . ($creds->{host} || 'unknown'));
+        
+        return $creds;
     };
     
     if ($@) {
+        main::log_message('ERROR', "Credential decryption failed: $@");
         die "Invalid master password or corrupted credentials file";
     }
 }
