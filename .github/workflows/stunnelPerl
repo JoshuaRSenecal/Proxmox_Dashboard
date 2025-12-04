@@ -288,19 +288,30 @@ sub get {
     
     my $response = $self->_api_request('GET', $path);
     
+    my $data;
     eval {
-        my $data = JSON::decode_json($response->content);
+        $data = JSON::decode_json($response->content);
         
         if (exists $data->{data}) {
-            return $data->{data};
-        } else {
-            return $data;
+            $data = $data->{data};
         }
     };
     
     if ($@) {
-        die "Invalid API response from $path: $@";
+        my $error = $@;
+        my $content_preview = substr($response->content, 0, 200);
+        main::log_message('ERROR', "Invalid API response from $path: $error");
+        main::log_message('ERROR', "Response content preview: $content_preview");
+        die "Invalid API response from $path: $error";
     }
+    
+    # Ensure we return something valid (at minimum an empty hash or array)
+    unless (defined $data) {
+        main::log_message('WARNING', "API returned undefined data for $path, returning empty hash");
+        return {};
+    }
+    
+    return $data;
 }
 
 sub post {
@@ -1184,6 +1195,14 @@ sub get_all_node_temperatures {
     
     eval {
         my $nodes = $self->{api}->get('/nodes');
+        
+        # Validate that nodes is an array ref
+        unless (ref($nodes) eq 'ARRAY') {
+            my $type = ref($nodes) || 'scalar';
+            main::log_message('WARNING', "Expected array ref from /nodes in temperature check, got $type");
+            return {};  # Return empty hash
+        }
+        
         main::log_message('DEBUG', "get_all_node_temperatures: Fetching temps for " . scalar(@$nodes) . " nodes");
         
         # For single-node setups, use the API host
@@ -2694,7 +2713,25 @@ sub _fetch_vm_data_serial {
     my ($self) = @_;
     
     my @vm_data;
-    my $nodes = $self->{api}->get('/nodes');
+    
+    my $nodes;
+    eval {
+        $nodes = $self->{api}->get('/nodes');
+    };
+    
+    if ($@) {
+        main::log_message('ERROR', "Failed to get nodes list: $@");
+        die "Failed to get nodes list: $@";
+    }
+    
+    # Validate that $nodes is an array reference
+    unless (ref($nodes) eq 'ARRAY') {
+        my $type = ref($nodes) || 'scalar';
+        main::log_message('ERROR', "Expected array ref from /nodes, got $type");
+        main::log_message('ERROR', "Nodes data: " . (defined $nodes ? substr("$nodes", 0, 200) : 'undef'));
+        die "API /nodes did not return an array (got $type)";
+    }
+    
     $self->{node_count} = scalar(@$nodes);
     
     # Update node count
@@ -2706,6 +2743,14 @@ sub _fetch_vm_data_serial {
         # Get VMs
         eval {
             my $vms = $self->{api}->get("/nodes/$n/qemu");
+            
+            # Validate VMs is an array ref
+            unless (ref($vms) eq 'ARRAY') {
+                my $type = ref($vms) || 'scalar';
+                main::log_message('WARNING', "Expected array ref from /nodes/$n/qemu, got $type - skipping");
+                $vms = [];  # Use empty array
+            }
+            
             foreach my $vm (@$vms) {
                 my $vm_info = $self->fetch_single_vm_data($node, $vm, 'VM');
                 push @vm_data, $vm_info if $vm_info;
@@ -2719,6 +2764,14 @@ sub _fetch_vm_data_serial {
         # Get CTs
         eval {
             my $cts = $self->{api}->get("/nodes/$n/lxc");
+            
+            # Validate CTs is an array ref
+            unless (ref($cts) eq 'ARRAY') {
+                my $type = ref($cts) || 'scalar';
+                main::log_message('WARNING', "Expected array ref from /nodes/$n/lxc, got $type - skipping");
+                $cts = [];  # Use empty array
+            }
+            
             foreach my $ct (@$cts) {
                 my $ct_info = $self->fetch_single_vm_data($node, $ct, 'CT');
                 push @vm_data, $ct_info if $ct_info;
