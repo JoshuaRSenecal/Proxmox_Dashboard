@@ -2052,25 +2052,16 @@ sub create_widgets {
         $self->{tree}->column('width', $i, -char => $col_width);
     }
     
-    # Create item styles for status colors with spacing
-    eval {
-        $self->{tree}->ItemStyle('text', -stylename => 'running',
-            -background => '#27ae60', -foreground => 'white',
-            -selectbackground => '#3498db', -selectforeground => 'white');
-        $self->{tree}->ItemStyle('text', -stylename => 'stopped',
-            -background => '#e74c3c', -foreground => 'white',
-            -selectbackground => '#3498db', -selectforeground => 'white');
-        $self->{tree}->ItemStyle('text', -stylename => 'normal',
-            -background => '#2c3e50', -foreground => 'white',
-            -selectbackground => '#3498db', -selectforeground => 'white');
-        $self->{tree}->ItemStyle('text', -stylename => 'hover',
-            -background => '#5dade2', -foreground => 'white',
-            -selectbackground => '#3498db', -selectforeground => 'white');
+    # HList doesn't support ItemStyle reliably, so we'll use direct color configuration
+    # Store color mappings for direct application
+    $self->{status_colors} = {
+        running => { bg => '#27ae60', fg => 'white' },
+        stopped => { bg => '#e74c3c', fg => 'white' },
+        normal => { bg => '#2c3e50', fg => 'white' },
+        hover => { bg => '#5dade2', fg => 'white' },
     };
     
-    if ($@) {
-        main::log_message('DEBUG', "Could not create HList styles (not critical): $@");
-    }
+    main::log_message('INFO', "Using direct color configuration for HList rows");
     
     # Add hover bindings for mouse over effect
     $self->{tree}->bind('<Motion>', sub {
@@ -2086,9 +2077,7 @@ sub create_widgets {
             }
             
             # Apply hover style to new entry (all columns)
-            for my $col (0..12) {
-                eval { $w->itemConfigure($entry, $col, -style => 'hover'); };
-            }
+            $self->apply_row_style($entry, 'hover');
             
             $self->{hover_entry} = $entry;
         }
@@ -2506,7 +2495,22 @@ sub filter_vms {
             # Add to tree
             my $entry = $self->{tree}->add($vm->{id});
             
-            # Determine which style to use based on status (reuse $status from above)
+            # Create all items WITHOUT styles first (styles don't work in itemCreate)
+            $self->{tree}->itemCreate($entry, 0, -itemtype => 'text', -text => $vm->{id});
+            $self->{tree}->itemCreate($entry, 1, -itemtype => 'text', -text => $vm->{type});
+            $self->{tree}->itemCreate($entry, 2, -itemtype => 'text', -text => $vm->{status});
+            $self->{tree}->itemCreate($entry, 3, -itemtype => 'text', -text => $vm->{name});
+            $self->{tree}->itemCreate($entry, 4, -itemtype => 'text', -text => $vm->{node});
+            $self->{tree}->itemCreate($entry, 5, -itemtype => 'text', -text => $vm->{cores} || 'N/A');
+            $self->{tree}->itemCreate($entry, 6, -itemtype => 'text', -text => $vm->{sockets} || 'N/A');
+            $self->{tree}->itemCreate($entry, 7, -itemtype => 'text', -text => $vm->{cpu} || 'N/A');
+            $self->{tree}->itemCreate($entry, 8, -itemtype => 'text', -text => $vm->{memory} || 'N/A');
+            $self->{tree}->itemCreate($entry, 9, -itemtype => 'text', -text => $vm->{disk} || 'N/A');
+            $self->{tree}->itemCreate($entry, 10, -itemtype => 'text', -text => $vm->{total_fs} || 'N/A');
+            $self->{tree}->itemCreate($entry, 11, -itemtype => 'text', -text => $vm->{free_disk} || 'N/A');
+            $self->{tree}->itemCreate($entry, 12, -itemtype => 'text', -text => $vm->{free_pct} || 'N/A');
+            
+            # Now apply the appropriate colors based on status
             my $style = 'normal';
             if ($status eq 'running') {
                 $style = 'running';
@@ -2514,20 +2518,8 @@ sub filter_vms {
                 $style = 'stopped';
             }
             
-            # Create all items with the appropriate style
-            $self->{tree}->itemCreate($entry, 0, -itemtype => 'text', -text => $vm->{id}, -style => $style);
-            $self->{tree}->itemCreate($entry, 1, -itemtype => 'text', -text => $vm->{type}, -style => $style);
-            $self->{tree}->itemCreate($entry, 2, -itemtype => 'text', -text => $vm->{status}, -style => $style);
-            $self->{tree}->itemCreate($entry, 3, -itemtype => 'text', -text => $vm->{name}, -style => $style);
-            $self->{tree}->itemCreate($entry, 4, -itemtype => 'text', -text => $vm->{node}, -style => $style);
-            $self->{tree}->itemCreate($entry, 5, -itemtype => 'text', -text => $vm->{cores} || 'N/A', -style => $style);
-            $self->{tree}->itemCreate($entry, 6, -itemtype => 'text', -text => $vm->{sockets} || 'N/A', -style => $style);
-            $self->{tree}->itemCreate($entry, 7, -itemtype => 'text', -text => $vm->{cpu} || 'N/A', -style => $style);
-            $self->{tree}->itemCreate($entry, 8, -itemtype => 'text', -text => $vm->{memory} || 'N/A', -style => $style);
-            $self->{tree}->itemCreate($entry, 9, -itemtype => 'text', -text => $vm->{disk} || 'N/A', -style => $style);
-            $self->{tree}->itemCreate($entry, 10, -itemtype => 'text', -text => $vm->{total_fs} || 'N/A', -style => $style);
-            $self->{tree}->itemCreate($entry, 11, -itemtype => 'text', -text => $vm->{free_disk} || 'N/A', -style => $style);
-            $self->{tree}->itemCreate($entry, 12, -itemtype => 'text', -text => $vm->{free_pct} || 'N/A', -style => $style);
+            # Apply style/colors to the row
+            $self->apply_row_style($entry, $style);
         }
     }
     
@@ -2542,6 +2534,28 @@ sub filter_vms {
     } else {
         my $total = scalar(@{$self->{vm_data}});
         $self->{status_label}->configure(-text => "Ready - $total VMs/CTs across $self->{node_count} node(s)");
+    }
+}
+
+sub apply_row_style {
+    my ($self, $entry, $style_name) = @_;
+    
+    return unless $entry && $style_name;
+    
+    # Use direct color configuration
+    my $colors = $self->{status_colors}->{$style_name};
+    if ($colors) {
+        for my $col (0..12) {
+            eval { 
+                $self->{tree}->itemConfigure($entry, $col, 
+                    -background => $colors->{bg},
+                    -foreground => $colors->{fg}
+                ); 
+            };
+            if ($@) {
+                main::log_message('DEBUG', "Failed to apply colors to $entry col $col: $@");
+            }
+        }
     }
 }
 
@@ -2566,10 +2580,8 @@ sub restore_row_style {
         }
     }
     
-    # Apply style to all columns
-    for my $col (0..12) {
-        eval { $self->{tree}->itemConfigure($entry, $col, -style => $style); };
-    }
+    # Use apply_row_style to handle both style and direct color approaches
+    $self->apply_row_style($entry, $style);
 }
 
 sub format_bytes {
