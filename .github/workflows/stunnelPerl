@@ -77,8 +77,6 @@ EOF
     exit 1;
 }
 
-log_message('INFO', "SSL Verification: Enabled (using $PROXMOX_CA_CERT)");
-
 # Suppress SSL warnings for temperature API (uses self-signed certs via stunnel)
 $ENV{PERL_LWP_SSL_VERIFY_HOSTNAME} = 0;
 
@@ -2376,16 +2374,20 @@ sub attempt_reconnect {
 sub filter_vms {
     my ($self) = @_;
     
+    main::log_message('ERROR', "DIAGNOSTIC: filter_vms() called, vm_data has " . scalar(@{$self->{vm_data}}) . " items");
+    
     my $query = lc($self->{search_entry}->get() || '');
     
     # Clear tree
     $self->{tree}->delete('all');
+    main::log_message('ERROR', "DIAGNOSTIC: Tree cleared");
     
     my $running_count = 0;
     my $stopped_count = 0;
     
     $self->{filtered_vm_data} = [];
     
+    my $added_count = 0;
     foreach my $vm (@{$self->{vm_data}}) {
         if ($query eq '' ||
             index(lc($vm->{id} || ''), $query) >= 0 ||
@@ -2431,8 +2433,12 @@ sub filter_vms {
             
             # Apply style/colors to the row
             $self->apply_row_style($entry, $style);
+            
+            $added_count++;
         }
     }
+    
+    main::log_message('ERROR', "DIAGNOSTIC: Added $added_count entries to tree");
     
     # Update counts
     $self->{running_count_label}->configure(-text => "Running: $running_count");
@@ -2762,39 +2768,74 @@ sub refresh_data_async {
     
     eval {
         my $nodes = $self->{api}->get('/nodes');
+sub refresh_data_async {
+    my ($self) = @_;
+    
+    return if $self->{is_loading};
+    
+    unless ($self->{api}) {
+        $self->{status_label}->configure(-text => "Not connected");
+        $self->{connection_label}->configure(-text => "Disconnected", -foreground => '#e74c3c');
+        $self->update_led_color($self->{connection_led}, '#e74c3c');
+        return;
+    }
+    
+    $self->{is_loading} = 1;
+    $self->{status_label}->configure(-text => "Fetching data...");
+    
+    # Fetch data immediately (blocks briefly but necessary)
+    my @vm_data;
+    my $error;
+    
+    eval {
+        my $nodes = $self->{api}->get('/nodes');
         
-        if ($nodes && ref($nodes) eq 'ARRAY') {
-            $self->{node_count} = scalar(@$nodes);
-            $self->{node_label}->configure(-text => "Nodes: $self->{node_count}");
+        unless ($nodes && ref($nodes) eq 'ARRAY') {
+            main::log_message('ERROR', "API /nodes did not return array: " . (ref($nodes) || 'undef'));
+            die "Failed to get nodes list - invalid response";
+        }
+        
+        main::log_message('ERROR', "DIAGNOSTIC: Got " . scalar(@$nodes) . " nodes from API");
+        $self->{node_count} = scalar(@$nodes);
+        $self->{node_label}->configure(-text => "Nodes: $self->{node_count}");
+        
+        foreach my $node (@$nodes) {
+            my $n = $node->{node};
+            main::log_message('ERROR', "DIAGNOSTIC: Processing node: $n");
             
-            foreach my $node (@$nodes) {
-                my $n = $node->{node};
-                
-                # Get VMs
-                my $vms = $self->{api}->get("/nodes/$n/qemu");
-                if ($vms && ref($vms) eq 'ARRAY') {
-                    foreach my $vm (@$vms) {
-                        my $vm_data = $self->fetch_single_vm_data($node, $vm, 'VM');
-                        push @vm_data, $vm_data if $vm_data;
-                    }
-                }
-                
-                # Get containers
-                my $cts = $self->{api}->get("/nodes/$n/lxc");
-                if ($cts && ref($cts) eq 'ARRAY') {
-                    foreach my $ct (@$cts) {
-                        my $ct_data = $self->fetch_single_vm_data($node, $ct, 'CT');
-                        push @vm_data, $ct_data if $ct_data;
+            # Get VMs
+            my $vms = $self->{api}->get("/nodes/$n/qemu");
+            if ($vms && ref($vms) eq 'ARRAY') {
+                main::log_message('ERROR', "DIAGNOSTIC: Got " . scalar(@$vms) . " VMs on node $n");
+                foreach my $vm (@$vms) {
+                    my $vm_data = $self->fetch_single_vm_data($node, $vm, 'VM');
+                    if ($vm_data) {
+                        push @vm_data, $vm_data;
+                        main::log_message('ERROR', "DIAGNOSTIC: Added VM " . $vm_data->{id});
                     }
                 }
             }
-        } else {
-            die "Failed to get nodes list";
+            
+            # Get containers
+            my $cts = $self->{api}->get("/nodes/$n/lxc");
+            if ($cts && ref($cts) eq 'ARRAY') {
+                main::log_message('ERROR', "DIAGNOSTIC: Got " . scalar(@$cts) . " CTs on node $n");
+                foreach my $ct (@$cts) {
+                    my $ct_data = $self->fetch_single_vm_data($node, $ct, 'CT');
+                    if ($ct_data) {
+                        push @vm_data, $ct_data;
+                        main::log_message('ERROR', "DIAGNOSTIC: Added CT " . $ct_data->{id});
+                    }
+                }
+            }
         }
+        
+        main::log_message('ERROR', "DIAGNOSTIC: Total VM/CT data collected: " . scalar(@vm_data));
     };
     
     if ($@) {
         $error = $@;
+        main::log_message('ERROR', "Data fetch failed: $error");
     }
     
     $self->{is_loading} = 0;
@@ -2804,8 +2845,13 @@ sub refresh_data_async {
         $self->{connection_label}->configure(-text => "Error", -foreground => '#e74c3c');
         $self->update_led_color($self->{connection_led}, '#e74c3c');
     } else {
+        main::log_message('ERROR', "DIAGNOSTIC: Setting vm_data with " . scalar(@vm_data) . " items");
         $self->{vm_data} = \@vm_data;
+        
+        main::log_message('ERROR', "DIAGNOSTIC: Calling filter_vms()");
         $self->filter_vms();
+        
+        main::log_message('ERROR', "DIAGNOSTIC: After filter, filtered_vm_data has " . scalar(@{$self->{filtered_vm_data}}) . " items");
         
         my $now = main::strftime("%H:%M:%S", localtime);
         if ($self->{auto_refresh}) {
@@ -2821,9 +2867,6 @@ sub refresh_data_async {
         # Update temperatures
         $self->update_node_temperatures();
     }
-}
-
-    return 'N/A';
 }
 
 sub get_selected_vm {
