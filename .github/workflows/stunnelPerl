@@ -1994,14 +1994,17 @@ sub create_widgets {
         ['Free%', 12],
     );
     
+    # Configure column headers
+    # NOTE: Tk::HList header() has limited styling support compared to modern widgets
+    # Supported options: -text, -headerbackground, -borderwidth
+    # NOT supported: -foreground (text color), -font, -anchor (centering)
+    # The blue background distinguishes headers, but text remains default color
     for my $i (0..$#columns) {
         my ($col_name, $col_width) = @{$columns[$i]};
         $self->{tree}->header('create', $i, 
             -text => $col_name,
             -headerbackground => '#3498db',
-            -foreground => 'white',
             -borderwidth => 2,
-            -anchor => 'center',
         );
         $self->{tree}->column('width', $i, -char => $col_width);
     }
