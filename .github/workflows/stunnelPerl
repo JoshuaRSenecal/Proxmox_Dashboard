@@ -14,7 +14,7 @@ use JSON;
 use MIME::Base64;
 use File::Path qw(make_path);
 use File::Spec;
-use POSIX qw(strftime);
+use POSIX qw(strftime WNOHANG);
 use Time::HiRes qw(sleep time);
 use List::Util qw(min);
 use threads;
@@ -1281,6 +1281,8 @@ sub _get_node_temperature_direct {
         my $node_ip = $self->{node_addresses}->{$node_name} || $self->{api}->{host};
         my $url = "https://$node_ip:8898/temperature";
         
+        main::log_message('DEBUG', "Fetching temperature from $url for node $node_name");
+        
         my $ua = LWP::UserAgent->new(
             ssl_opts => {
                 verify_hostname => 0,
@@ -1292,8 +1294,17 @@ sub _get_node_temperature_direct {
         my $response = $ua->get($url);
         
         if ($response->is_success) {
-            my $data = JSON::decode_json($response->content);
-            return $data->{data};
+            my $content = $response->content;
+            main::log_message('DEBUG', "Temperature API response for $node_name: $content");
+            my $data = JSON::decode_json($content);
+            
+            if ($data && ref($data) eq 'HASH') {
+                main::log_message('DEBUG', "Decoded temperature data for $node_name has keys: " . join(", ", keys %$data));
+                return $data;
+            } else {
+                main::log_message('ERROR', "Temperature API returned non-hash data for $node_name");
+                return undef;
+            }
         } else {
             main::log_message('DEBUG', "Temperature API returned status " . $response->code . " for $node_name");
             return undef;
@@ -1338,6 +1349,8 @@ sub _update_temp_ui {
         my $temp_info = $node_temps->{$node_name};
         my $status = $temp_info->{status};
         
+        main::log_message('DEBUG', "Node $node_name temp status: $status");
+        
         if ($status ne 'ok') {
             my $label = $self->{node_temp_frame}->Label(
                 -text => "$node_name: N/A",
@@ -1351,6 +1364,7 @@ sub _update_temp_ui {
         }
         
         my $sensors = $temp_info->{sensors} || [];
+        main::log_message('DEBUG', "Node $node_name has " . scalar(@$sensors) . " sensors");
         next unless @$sensors;
         
         # COMPACT VIEW: Show only CPU Package
@@ -1358,7 +1372,10 @@ sub _update_temp_ui {
         my @cpu_cores;
         
         foreach my $sensor (@$sensors) {
-            my $sensor_type = $sensor->{type};
+            my $sensor_type = $sensor->{type} || 'unknown';
+            my $sensor_temp = $sensor->{temperature} || 'N/A';
+            main::log_message('DEBUG', "Node $node_name sensor: type=$sensor_type, temp=$sensor_temp");
+            
             if ($sensor_type eq 'cpu_package') {
                 $cpu_package = $sensor;
                 last;
@@ -1967,9 +1984,10 @@ sub create_widgets {
             -variable => \$self->{refresh_rate},
             -value => $value,
             -command => sub { $self->update_refresh_rate() },
-            -font => ['Arial', 9],
+            -font => ['Arial', 10],
             -bg => '#ecf0f1',
             -activebackground => '#ecf0f1',
+            -indicatoron => 1,
         )->pack(-side => 'left', -padx => 2);
     }
     
@@ -2016,13 +2034,14 @@ sub create_widgets {
         -width => 200,
         -height => 12,
         -selectmode => 'single',
-        -background => '#2c3e50',
-        -foreground => 'white',
+        -background => 'white',
+        -foreground => 'black',
         -separator => '/',
         -itemtype => 'text',
         -selectbackground => '#3498db',
         -selectforeground => 'white',
         -indent => 10,
+        -font => ['Arial', 11],
     )->pack(-fill => 'both', -expand => 1);
     
     # Configure columns with larger widths to require scrolling
@@ -2046,7 +2065,7 @@ sub create_widgets {
         my ($col_name, $col_width) = @{$columns[$i]};
         $self->{tree}->header('create', $i, 
             -text => $col_name,
-            -headerbackground => '#34495e',
+            -headerbackground => '#3498db',
             -borderwidth => 2,
         );
         $self->{tree}->column('width', $i, -char => $col_width);
@@ -2055,10 +2074,10 @@ sub create_widgets {
     # HList doesn't support ItemStyle reliably, so we'll use direct color configuration
     # Store color mappings for direct application
     $self->{status_colors} = {
-        running => { bg => '#27ae60', fg => 'white' },
-        stopped => { bg => '#e74c3c', fg => 'white' },
-        normal => { bg => '#2c3e50', fg => 'white' },
-        hover => { bg => '#5dade2', fg => 'white' },
+        running => { bg => '#27ae60', fg => 'white' },      # Green background, white text
+        stopped => { bg => '#e74c3c', fg => 'white' },      # Red background, white text
+        normal => { bg => 'white', fg => 'black' },         # White background, black text
+        hover => { bg => '#5dade2', fg => 'white' },        # Light blue hover
     };
     
     main::log_message('INFO', "Using direct color configuration for HList rows");
@@ -2867,60 +2886,56 @@ sub refresh_data_async {
         return;
     }
     
-    $self->show_loading("Fetching data from Proxmox...");
+    $self->{is_loading} = 1;
+    $self->{status_label}->configure(-text => "Fetching data...");
     
-    # Fetch data directly (threading is complex with Tk)
-    my $result;
-    my $error;
-    
-    eval {
-        $result = $self->_fetch_vm_data_serial();
-    };
-    
-    if ($@) {
-        $error = $@;
-    }
-    
-    $self->hide_loading();
-    
-    if ($error) {
-        main::log_message('ERROR', "Refresh failed: $error");
-        $self->{status_label}->configure(-text => "Error: $error");
-        $self->{connection_label}->configure(
-            -text => "Disconnected",
-            -foreground => '#e74c3c',
-        );
-        $self->update_led_color($self->{connection_led}, '#e74c3c');
-        $self->{root}->messageBox(
-            -title => "Error",
-            -message => "Failed to refresh:\n$error",
-            -type => 'OK',
-            -icon => 'error',
-        );
-    } else {
-        $self->{vm_data} = $result;
-        $self->filter_vms();
+    # Use Tk's after to defer the blocking work, allowing UI to update first
+    $self->{root}->after(10, sub {
+        my $result;
+        my $error;
         
-        my $now = main::strftime("%H:%M:%S", localtime);
+        eval {
+            $result = $self->_fetch_vm_data_serial();
+        };
         
-        if ($self->{auto_refresh}) {
-            my $refresh_rate = $self->{refresh_rate};
-            $self->{last_update_label}->configure(
-                -text => "LIVE - Updated: $now (every ${refresh_rate}s)"
-            );
-        } else {
-            $self->{last_update_label}->configure(-text => "Updated: $now (paused)");
+        if ($@) {
+            $error = $@;
         }
         
-        $self->{connection_label}->configure(
-            -text => "Connected",
-            -foreground => '#27ae60',
-        );
-        $self->update_led_color($self->{connection_led}, '#27ae60');
+        $self->{is_loading} = 0;
         
-        # Update temperatures
-        $self->update_node_temperatures();
-    }
+        if ($error) {
+            main::log_message('ERROR', "Refresh failed: $error");
+            $self->{status_label}->configure(-text => "Error: $error");
+            $self->{connection_label}->configure(
+                -text => "Error",
+                -foreground => '#e74c3c',
+            );
+            $self->update_led_color($self->{connection_led}, '#e74c3c');
+        } else {
+            $self->{vm_data} = $result;
+            $self->filter_vms();
+            
+            my $now = main::strftime("%H:%M:%S", localtime);
+            if ($self->{auto_refresh}) {
+                my $refresh_rate = $self->{refresh_rate};
+                $self->{last_update_label}->configure(
+                    -text => "LIVE - Updated: $now (every ${refresh_rate}s)"
+                );
+            } else {
+                $self->{last_update_label}->configure(-text => "Updated: $now (paused)");
+            }
+            
+            $self->{connection_label}->configure(
+                -text => "Connected",
+                -foreground => '#27ae60',
+            );
+            $self->update_led_color($self->{connection_led}, '#27ae60');
+            
+            # Update temperatures
+            $self->update_node_temperatures();
+        }
+    });
 }
 
 sub _fetch_vm_data_serial {
