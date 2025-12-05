@@ -1329,6 +1329,94 @@ sub update_node_temperatures {
     $self->_update_temp_ui($node_temps);
 }
 
+sub update_node_temperatures_async {
+    my ($self) = @_;
+    
+    return unless $self->{api};
+    
+    # Don't spawn another thread if one is already running
+    return if $self->{temp_loading};
+    
+    $self->{temp_loading} = 1;
+    
+    # Create temp queue if needed
+    unless ($self->{temp_queue}) {
+        $self->{temp_queue} = Thread::Queue->new();
+    }
+    
+    # Get data needed for thread
+    my $host = $self->{api}->{host};
+    my $token_id = $self->{api}->{token_id};
+    my $token_secret = $self->{api}->{token_secret};
+    my $queue = $self->{temp_queue};
+    
+    # Spawn thread to fetch temperatures
+    my $worker = threads->create(sub {
+        my $thread_api = ProxmoxAPI->new($host, $token_id, $token_secret);
+        
+        my %node_temps;
+        my $nodes;
+        
+        eval {
+            $nodes = $thread_api->get('/nodes');
+        };
+        
+        return { success => 0, error => "$@" } if $@;
+        
+        # Store node addresses
+        foreach my $node (@$nodes) {
+            my $node_name = $node->{node};
+            my $node_ip = $host;
+            my $url = "https://$node_ip:8898/temperature";
+            
+            my $ua = LWP::UserAgent->new(
+                ssl_opts => {
+                    verify_hostname => 0,
+                    SSL_verify_mode => 0,
+                },
+                timeout => 1.5,
+            );
+            
+            my $response = $ua->get($url);
+            
+            if ($response->is_success) {
+                my $data = eval { JSON::decode_json($response->content); };
+                if ($data && ref($data) eq 'HASH') {
+                    $node_temps{$node_name} = $data;
+                } else {
+                    $node_temps{$node_name} = { status => 'error', sensors => [] };
+                }
+            } else {
+                $node_temps{$node_name} = { status => 'not_installed', sensors => [] };
+            }
+        }
+        
+        # Send result
+        $queue->enqueue({ success => 1, data => \%node_temps });
+    });
+    
+    $worker->detach();
+    
+    # Poll for temperature results
+    my $temp_check_count = 0;
+    $self->{temp_poll_timer} = $self->{root}->repeat(100, sub {
+        $temp_check_count++;
+        
+        if (my $result = $queue->dequeue_nb()) {
+            $self->{temp_poll_timer}->cancel() if $self->{temp_poll_timer};
+            $self->{temp_loading} = 0;
+            
+            if ($result->{success}) {
+                $self->_update_temp_ui($result->{data});
+            }
+        } elsif ($temp_check_count >= 30) {
+            # 3 second timeout for temps
+            $self->{temp_poll_timer}->cancel() if $self->{temp_poll_timer};
+            $self->{temp_loading} = 0;
+        }
+    });
+}
+
 sub _update_temp_ui {
     my ($self, $node_temps) = @_;
     
@@ -2889,53 +2977,311 @@ sub refresh_data_async {
     $self->{is_loading} = 1;
     $self->{status_label}->configure(-text => "Fetching data...");
     
-    # Use Tk's after to defer the blocking work, allowing UI to update first
-    $self->{root}->after(10, sub {
+    # Create a result queue if it doesn't exist
+    unless ($self->{result_queue}) {
+        $self->{result_queue} = Thread::Queue->new();
+    }
+    
+    # Get API credentials for the thread
+    my $host = $self->{api}->{host};
+    my $token_id = $self->{api}->{token_id};
+    my $token_secret = $self->{api}->{token_secret};
+    my $queue = $self->{result_queue};
+    
+    # Spawn worker thread
+    my $worker = threads->create(sub {
+        # Thread-local API object
+        my $thread_api = ProxmoxAPI->new($host, $token_id, $token_secret);
+        
         my $result;
         my $error;
         
         eval {
-            $result = $self->_fetch_vm_data_serial();
+            # Fetch all VM data
+            my @vm_data;
+            my $nodes = $thread_api->get('/nodes');
+            
+            unless ($nodes && ref($nodes) eq 'ARRAY') {
+                die "Failed to get nodes list or invalid response";
+            }
+            
+            foreach my $node (@$nodes) {
+                my $n = $node->{node};
+                
+                # Get VMs
+                my $vms = $thread_api->get("/nodes/$n/qemu");
+                if ($vms && ref($vms) eq 'ARRAY') {
+                    foreach my $vm (@$vms) {
+                        my $vm_data = fetch_single_vm_data_threaded($thread_api, $node, $vm, 'VM');
+                        push @vm_data, $vm_data if $vm_data;
+                    }
+                }
+                
+                # Get containers
+                my $cts = $thread_api->get("/nodes/$n/lxc");
+                if ($cts && ref($cts) eq 'ARRAY') {
+                    foreach my $ct (@$cts) {
+                        my $ct_data = fetch_single_vm_data_threaded($thread_api, $node, $ct, 'CT');
+                        push @vm_data, $ct_data if $ct_data;
+                    }
+                }
+            }
+            
+            $result = \@vm_data;
         };
         
         if ($@) {
-            $error = $@;
+            $error = "$@";
         }
         
-        $self->{is_loading} = 0;
+        # Send result through queue
+        $queue->enqueue({ success => !$error, data => $result, error => $error });
+    });
+    
+    # Detach thread so it cleans up automatically
+    $worker->detach();
+    
+    # Set up polling to check for results in queue
+    my $check_count = 0;
+    my $max_checks = 300; # 30 seconds max (300 * 100ms)
+    
+    $self->{poll_timer} = $self->{root}->repeat(100, sub {
+        $check_count++;
         
-        if ($error) {
-            main::log_message('ERROR', "Refresh failed: $error");
-            $self->{status_label}->configure(-text => "Error: $error");
-            $self->{connection_label}->configure(
-                -text => "Error",
-                -foreground => '#e74c3c',
-            );
-            $self->update_led_color($self->{connection_led}, '#e74c3c');
-        } else {
-            $self->{vm_data} = $result;
-            $self->filter_vms();
+        # Check queue for results (non-blocking)
+        if (my $result = $queue->dequeue_nb()) {
+            # Stop polling
+            $self->{poll_timer}->cancel() if $self->{poll_timer};
+            $self->{is_loading} = 0;
             
-            my $now = main::strftime("%H:%M:%S", localtime);
-            if ($self->{auto_refresh}) {
-                my $refresh_rate = $self->{refresh_rate};
-                $self->{last_update_label}->configure(
-                    -text => "LIVE - Updated: $now (every ${refresh_rate}s)"
+            if ($result->{success}) {
+                $self->{vm_data} = $result->{data};
+                $self->filter_vms();
+                
+                my $now = main::strftime("%H:%M:%S", localtime);
+                if ($self->{auto_refresh}) {
+                    my $refresh_rate = $self->{refresh_rate};
+                    $self->{last_update_label}->configure(
+                        -text => "LIVE - Updated: $now (every ${refresh_rate}s)"
+                    );
+                } else {
+                    $self->{last_update_label}->configure(-text => "Updated: $now (paused)");
+                }
+                
+                $self->{connection_label}->configure(
+                    -text => "Connected",
+                    -foreground => '#27ae60',
                 );
+                $self->update_led_color($self->{connection_led}, '#27ae60');
+                
+                # Update temperatures in background too
+                $self->update_node_temperatures_async();
+                
+                main::log_message('INFO', "Data refresh completed successfully");
             } else {
-                $self->{last_update_label}->configure(-text => "Updated: $now (paused)");
+                my $error = $result->{error} || "Unknown error";
+                main::log_message('ERROR', "Refresh failed: $error");
+                $self->{status_label}->configure(-text => "Error: $error");
+                $self->{connection_label}->configure(
+                    -text => "Error",
+                    -foreground => '#e74c3c',
+                );
+                $self->update_led_color($self->{connection_led}, '#e74c3c');
             }
-            
-            $self->{connection_label}->configure(
-                -text => "Connected",
-                -foreground => '#27ae60',
-            );
-            $self->update_led_color($self->{connection_led}, '#27ae60');
-            
-            # Update temperatures
-            $self->update_node_temperatures();
+        } elsif ($check_count >= $max_checks) {
+            # Timeout
+            $self->{poll_timer}->cancel() if $self->{poll_timer};
+            $self->{is_loading} = 0;
+            main::log_message('ERROR', "Refresh timeout after 30 seconds");
+            $self->{status_label}->configure(-text => "Timeout - data fetch took too long");
         }
     });
+}
+
+sub fetch_single_vm_data_threaded {
+    my ($api, $node, $vm, $vm_type) = @_;
+    
+    my $n = $node->{node};
+    my $endpoint = $vm_type eq 'VM' ? 'qemu' : 'lxc';
+    my $vmid = $vm->{vmid};
+    
+    # Initialize with defaults
+    my $cores = 'N/A';
+    my $memory = 'N/A';
+    my $total_disk = 'N/A';
+    my $sockets = 'N/A';
+    my $cpu_type = 'N/A';
+    
+    # Get config
+    my $cfg;
+    eval {
+        $cfg = $api->get("/nodes/$n/$endpoint/$vmid/config");
+    };
+    
+    return undef if $@ || !$cfg;
+    
+    # Extract cores
+    eval { $cores = $cfg->{cores} || 'N/A'; };
+    
+    # Memory
+    eval {
+        if ($vm_type eq 'VM') {
+            my $memory_val = $cfg->{memory} || 0;
+            $memory_val = int($memory_val) if $memory_val;
+            
+            if (exists $cfg->{balloon}) {
+                my $balloon_val = int($cfg->{balloon} || $memory_val);
+                my $minmem = int($balloon_val);
+                my $maxmem = int($memory_val);
+                
+                if ($minmem > 0 && $maxmem > 0) {
+                    my $minmem_str = format_bytes_simple($minmem * 1024 * 1024);
+                    my $maxmem_str = format_bytes_simple($maxmem * 1024 * 1024);
+                    $memory = "$minmem_str-$maxmem_str";
+                } else {
+                    $memory = $memory_val ? format_bytes_simple($memory_val * 1024 * 1024) : 'N/A';
+                }
+            } else {
+                $memory = $memory_val ? format_bytes_simple($memory_val * 1024 * 1024) : 'N/A';
+            }
+        } else {
+            my $memory_mb = int($cfg->{memory} || 0);
+            my $swap_mb = int($cfg->{swap} || 0);
+            
+            if ($memory_mb > 0) {
+                my $mem_str = format_bytes_simple($memory_mb * 1024 * 1024);
+                if ($swap_mb > 0) {
+                    my $swap_str = format_bytes_simple($swap_mb * 1024 * 1024);
+                    $memory = "$mem_str+$swap_str";
+                } else {
+                    $memory = $mem_str;
+                }
+            }
+        }
+    };
+    
+    # Disk size
+    eval {
+        if ($vm_type eq 'VM') {
+            foreach my $key (keys %$cfg) {
+                if ($key =~ /^(scsi|virtio|sata|ide)\d+$/) {
+                    my $disk_str = $cfg->{$key};
+                    if ($disk_str =~ /size=(\d+)([KMGT]?)/) {
+                        my ($size, $unit) = ($1, $2 || '');
+                        my $bytes = $size;
+                        $bytes *= 1024 if $unit eq 'K';
+                        $bytes *= 1024 * 1024 if $unit eq 'M';
+                        $bytes *= 1024 * 1024 * 1024 if $unit eq 'G';
+                        $bytes *= 1024 * 1024 * 1024 * 1024 if $unit eq 'T';
+                        $total_disk = format_bytes_simple($bytes);
+                        last;
+                    }
+                }
+            }
+        } else {
+            if (exists $cfg->{rootfs}) {
+                my $rootfs = $cfg->{rootfs};
+                if ($rootfs =~ /size=(\d+)([KMGT]?)/) {
+                    my ($size, $unit) = ($1, $2 || 'G');
+                    my $bytes = $size;
+                    $bytes *= 1024 if $unit eq 'K';
+                    $bytes *= 1024 * 1024 if $unit eq 'M';
+                    $bytes *= 1024 * 1024 * 1024 if $unit eq 'G';
+                    $bytes *= 1024 * 1024 * 1024 * 1024 if $unit eq 'T';
+                    $total_disk = format_bytes_simple($bytes);
+                }
+            }
+        }
+    };
+    
+    # Sockets and CPU type
+    eval {
+        if ($vm_type eq 'VM') {
+            $sockets = $cfg->{sockets} || 1;
+            $cpu_type = $cfg->{cpu} || 'N/A';
+            $cpu_type = 'host' if $cpu_type eq 'host';
+        } else {
+            $sockets = 1;
+            $cpu_type = 'N/A';
+        }
+    };
+    
+    # Filesystem info - only if running
+    my ($free_disk, $free_pct, $total_fs) = ('N/A', 'N/A', 'N/A');
+    
+    if ($vm->{status} eq 'running') {
+        if ($vm_type eq 'VM') {
+            # Try status API first for VMs
+            eval {
+                my $stat = $api->get("/nodes/$n/qemu/$vmid/status/current");
+                my $disk_used = $stat->{disk} || 0;
+                my $disk_max = $stat->{maxdisk} || 0;
+                
+                if ($disk_max > 0 && $disk_used >= 0) {
+                    $total_fs = format_bytes_simple($disk_max);
+                    my $free_bytes = $disk_max - $disk_used;
+                    if ($free_bytes >= 0) {
+                        $free_disk = format_bytes_simple($free_bytes);
+                        $free_pct = sprintf("%.1f%%", ($free_bytes / $disk_max * 100));
+                    }
+                }
+            };
+        } else {
+            # CT - use status API
+            eval {
+                my $stat = $api->get("/nodes/$n/lxc/$vmid/status/current");
+                my $disk_used = $stat->{disk} || 0;
+                my $disk_max = $stat->{maxdisk} || 0;
+                
+                if ($disk_max > 0 && $disk_used >= 0) {
+                    $total_fs = format_bytes_simple($disk_max);
+                    my $free_bytes = $disk_max - $disk_used;
+                    if ($free_bytes >= 0) {
+                        $free_disk = format_bytes_simple($free_bytes);
+                        $free_pct = sprintf("%.1f%%", ($free_bytes / $disk_max * 100));
+                    }
+                }
+            };
+        }
+    }
+    
+    return {
+        id => $vmid,
+        type => $vm_type,
+        status => $vm->{status} || 'unknown',
+        name => $vm->{name} || "VM $vmid",
+        node => $n,
+        cores => $cores,
+        sockets => $sockets,
+        cpu => $cpu_type,
+        memory => $memory,
+        disk => $total_disk,
+        total_fs => $total_fs,
+        free_disk => $free_disk,
+        free_pct => $free_pct,
+    };
+}
+
+sub format_bytes_simple {
+    my ($bytes_val) = @_;
+    
+    return 'N/A' unless defined $bytes_val && $bytes_val ne 'N/A';
+    
+    eval {
+        $bytes_val = 0 + $bytes_val;
+        return 'N/A' if $bytes_val < 0;
+        
+        my @units = ('B', 'KiB', 'MiB', 'GiB', 'TiB', 'PiB');
+        
+        foreach my $unit (@units) {
+            if ($bytes_val < 1024 || $unit eq 'PiB') {
+                return sprintf("%.1f %s", $bytes_val, $unit);
+            }
+            $bytes_val /= 1024;
+        }
+    };
+    
+    return 'N/A';
 }
 
 sub _fetch_vm_data_serial {
@@ -3049,28 +3395,70 @@ sub start_selected {
     my $vm = $self->get_selected_vm();
     return unless $vm;
     
-    $self->show_loading("Starting $vm->{type} $vm->{id}...");
+    $self->{status_label}->configure(-text => "Starting $vm->{type} $vm->{id}...");
     
-    eval {
-        my $endpoint = $vm->{type} eq 'VM' ? 'qemu' : 'lxc';
-        $self->{api}->post("/nodes/$vm->{node}/$endpoint/$vm->{id}/status/start");
-        AuditLogger::log_vm_action("START", $vm->{id}, $vm->{type}, $vm->{name}, 1);
-        
-        $self->hide_loading();
-        $self->{status_label}->configure(-text => "Started $vm->{type} $vm->{id} ($vm->{name})");
-        $self->{root}->after(2000, sub { $self->refresh_data_async() });
-    };
+    # Get API credentials for thread
+    my $host = $self->{api}->{host};
+    my $token_id = $self->{api}->{token_id};
+    my $token_secret = $self->{api}->{token_secret};
+    my $vm_node = $vm->{node};
+    my $vm_id = $vm->{id};
+    my $vm_type = $vm->{type};
+    my $vm_name = $vm->{name};
     
-    if ($@) {
-        AuditLogger::log_vm_action("START", $vm->{id}, $vm->{type}, $vm->{name}, 0, $@);
-        $self->hide_loading();
-        $self->{root}->messageBox(
-            -title => "Error",
-            -message => "Failed to start:\n$@",
-            -type => 'OK',
-            -icon => 'error',
-        );
+    # Create action queue if needed
+    unless ($self->{action_queue}) {
+        $self->{action_queue} = Thread::Queue->new();
     }
+    
+    my $queue = $self->{action_queue};
+    
+    # Spawn thread for action
+    my $worker = threads->create(sub {
+        my $result = { success => 0, error => undef };
+        eval {
+            my $api = ProxmoxAPI->new($host, $token_id, $token_secret);
+            my $endpoint = $vm_type eq 'VM' ? 'qemu' : 'lxc';
+            $api->post("/nodes/$vm_node/$endpoint/$vm_id/status/start");
+            $result->{success} = 1;
+        };
+        if ($@) {
+            $result->{error} = "$@";
+        }
+        $queue->enqueue($result);
+    });
+    
+    $worker->detach();
+    
+    # Poll for result
+    my $check_timer;
+    my $check_count = 0;
+    $check_timer = $self->{root}->repeat(100, sub {
+        $check_count++;
+        
+        if (my $result = $queue->dequeue_nb()) {
+            $check_timer->cancel();
+            
+            if ($result->{success}) {
+                AuditLogger::log_vm_action("START", $vm_id, $vm_type, $vm_name, 1);
+                $self->{status_label}->configure(-text => "Started $vm_type $vm_id ($vm_name)");
+                $self->{root}->after(2000, sub { $self->refresh_data_async() });
+            } else {
+                my $error = $result->{error};
+                AuditLogger::log_vm_action("START", $vm_id, $vm_type, $vm_name, 0, $error);
+                $self->{root}->messageBox(
+                    -title => "Error",
+                    -message => "Failed to start:\n$error",
+                    -type => 'OK',
+                    -icon => 'error',
+                );
+            }
+        } elsif ($check_count >= 100) {
+            # 10 second timeout
+            $check_timer->cancel();
+            $self->{status_label}->configure(-text => "Start operation timeout");
+        }
+    });
 }
 
 sub stop_selected {
@@ -3088,28 +3476,70 @@ sub stop_selected {
     
     return unless $response eq 'Yes';
     
-    $self->show_loading("Stopping $vm->{type} $vm->{id}...");
+    $self->{status_label}->configure(-text => "Stopping $vm->{type} $vm->{id}...");
     
-    eval {
-        my $endpoint = $vm->{type} eq 'VM' ? 'qemu' : 'lxc';
-        $self->{api}->post("/nodes/$vm->{node}/$endpoint/$vm->{id}/status/stop");
-        AuditLogger::log_vm_action("STOP", $vm->{id}, $vm->{type}, $vm->{name}, 1);
-        
-        $self->hide_loading();
-        $self->{status_label}->configure(-text => "Stopped $vm->{type} $vm->{id} ($vm->{name})");
-        $self->{root}->after(2000, sub { $self->refresh_data_async() });
-    };
+    # Get API credentials for thread
+    my $host = $self->{api}->{host};
+    my $token_id = $self->{api}->{token_id};
+    my $token_secret = $self->{api}->{token_secret};
+    my $vm_node = $vm->{node};
+    my $vm_id = $vm->{id};
+    my $vm_type = $vm->{type};
+    my $vm_name = $vm->{name};
     
-    if ($@) {
-        AuditLogger::log_vm_action("STOP", $vm->{id}, $vm->{type}, $vm->{name}, 0, $@);
-        $self->hide_loading();
-        $self->{root}->messageBox(
-            -title => "Error",
-            -message => "Failed to stop:\n$@",
-            -type => 'OK',
-            -icon => 'error',
-        );
+    # Create action queue if needed
+    unless ($self->{action_queue}) {
+        $self->{action_queue} = Thread::Queue->new();
     }
+    
+    my $queue = $self->{action_queue};
+    
+    # Spawn thread for action
+    my $worker = threads->create(sub {
+        my $result = { success => 0, error => undef };
+        eval {
+            my $api = ProxmoxAPI->new($host, $token_id, $token_secret);
+            my $endpoint = $vm_type eq 'VM' ? 'qemu' : 'lxc';
+            $api->post("/nodes/$vm_node/$endpoint/$vm_id/status/stop");
+            $result->{success} = 1;
+        };
+        if ($@) {
+            $result->{error} = "$@";
+        }
+        $queue->enqueue($result);
+    });
+    
+    $worker->detach();
+    
+    # Poll for result
+    my $check_timer;
+    my $check_count = 0;
+    $check_timer = $self->{root}->repeat(100, sub {
+        $check_count++;
+        
+        if (my $result = $queue->dequeue_nb()) {
+            $check_timer->cancel();
+            
+            if ($result->{success}) {
+                AuditLogger::log_vm_action("STOP", $vm_id, $vm_type, $vm_name, 1);
+                $self->{status_label}->configure(-text => "Stopped $vm_type $vm_id ($vm_name)");
+                $self->{root}->after(2000, sub { $self->refresh_data_async() });
+            } else {
+                my $error = $result->{error};
+                AuditLogger::log_vm_action("STOP", $vm_id, $vm_type, $vm_name, 0, $error);
+                $self->{root}->messageBox(
+                    -title => "Error",
+                    -message => "Failed to stop:\n$error",
+                    -type => 'OK',
+                    -icon => 'error',
+                );
+            }
+        } elsif ($check_count >= 100) {
+            # 10 second timeout
+            $check_timer->cancel();
+            $self->{status_label}->configure(-text => "Stop operation timeout");
+        }
+    });
 }
 
 sub change_credentials {
@@ -3284,26 +3714,64 @@ sub start_all_stopped {
     
     return unless $response eq 'Yes';
     
-    $self->show_loading("Starting " . scalar(@stopped) . " VMs/CTs...");
+    my $count = scalar(@stopped);
+    $self->{status_label}->configure(-text => "Starting $count VMs/CTs...");
     
-    my $success_count = 0;
+    # Get API credentials for thread
+    my $host = $self->{api}->{host};
+    my $token_id = $self->{api}->{token_id};
+    my $token_secret = $self->{api}->{token_secret};
+    my @stopped_copy = @stopped;  # Copy for thread
     
-    foreach my $vm (@stopped) {
-        eval {
-            my $endpoint = $vm->{type} eq 'VM' ? 'qemu' : 'lxc';
-            $self->{api}->post("/nodes/$vm->{node}/$endpoint/$vm->{id}/status/start");
-            AuditLogger::log_vm_action("START_ALL", $vm->{id}, $vm->{type}, $vm->{name}, 1);
-            $success_count++;
-        };
-        
-        if ($@) {
-            AuditLogger::log_vm_action("START_ALL", $vm->{id}, $vm->{type}, $vm->{name}, 0, $@);
-        }
+    # Create action queue if needed
+    unless ($self->{action_queue}) {
+        $self->{action_queue} = Thread::Queue->new();
     }
     
-    $self->hide_loading();
-    $self->{status_label}->configure(-text => "Started $success_count/" . scalar(@stopped) . " VMs/CTs");
-    $self->{root}->after(3000, sub { $self->refresh_data_async() });
+    my $queue = $self->{action_queue};
+    
+    # Spawn thread for bulk action
+    my $worker = threads->create(sub {
+        my $success_count = 0;
+        my $api = ProxmoxAPI->new($host, $token_id, $token_secret);
+        
+        foreach my $vm (@stopped_copy) {
+            eval {
+                my $endpoint = $vm->{type} eq 'VM' ? 'qemu' : 'lxc';
+                $api->post("/nodes/$vm->{node}/$endpoint/$vm->{id}/status/start");
+                AuditLogger::log_vm_action("START_ALL", $vm->{id}, $vm->{type}, $vm->{name}, 1);
+                $success_count++;
+            };
+            
+            if ($@) {
+                AuditLogger::log_vm_action("START_ALL", $vm->{id}, $vm->{type}, $vm->{name}, 0, $@);
+            }
+        }
+        
+        $queue->enqueue({ success_count => $success_count, total => scalar(@stopped_copy) });
+    });
+    
+    $worker->detach();
+    
+    # Poll for result
+    my $check_timer;
+    my $check_count = 0;
+    $check_timer = $self->{root}->repeat(100, sub {
+        $check_count++;
+        
+        if (my $result = $queue->dequeue_nb()) {
+            $check_timer->cancel();
+            
+            $self->{status_label}->configure(
+                -text => "Started $result->{success_count}/$result->{total} VMs/CTs"
+            );
+            $self->{root}->after(3000, sub { $self->refresh_data_async() });
+        } elsif ($check_count >= 300) {
+            # 30 second timeout
+            $check_timer->cancel();
+            $self->{status_label}->configure(-text => "Start all operation timeout");
+        }
+    });
 }
 
 sub toggle_auto_refresh {
@@ -3364,8 +3832,50 @@ sub start_auto_refresh {
 sub on_closing {
     my ($self) = @_;
     
+    main::log_message('INFO', "Closing dashboard, cleaning up...");
+    
+    # Stop auto-refresh
     $self->{auto_refresh} = 0;
-    sleep(0.5);
+    
+    # Cancel any active timers
+    if ($self->{poll_timer}) {
+        eval { $self->{poll_timer}->cancel(); };
+    }
+    if ($self->{temp_poll_timer}) {
+        eval { $self->{temp_poll_timer}->cancel(); };
+    }
+    
+    # Mark as loading to prevent new operations
+    $self->{is_loading} = 1;
+    $self->{temp_loading} = 1;
+    
+    # Give threads a moment to finish
+    sleep(0.3);
+    
+    # Clean up queues
+    if ($self->{result_queue}) {
+        eval {
+            while ($self->{result_queue}->pending()) {
+                $self->{result_queue}->dequeue_nb();
+            }
+        };
+    }
+    if ($self->{temp_queue}) {
+        eval {
+            while ($self->{temp_queue}->pending()) {
+                $self->{temp_queue}->dequeue_nb();
+            }
+        };
+    }
+    if ($self->{action_queue}) {
+        eval {
+            while ($self->{action_queue}->pending()) {
+                $self->{action_queue}->dequeue_nb();
+            }
+        };
+    }
+    
+    main::log_message('INFO', "Dashboard cleanup complete");
     $self->{root}->destroy();
 }
 
