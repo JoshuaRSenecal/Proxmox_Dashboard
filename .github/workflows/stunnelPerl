@@ -1339,16 +1339,13 @@ sub update_node_temperatures_async {
     
     $self->{temp_loading} = 1;
     
-    # Create temp queue if needed
-    unless ($self->{temp_queue}) {
-        $self->{temp_queue} = Thread::Queue->new();
-    }
-    
     # Get data needed for thread
     my $host = $self->{api}->{host};
     my $token_id = $self->{api}->{token_id};
     my $token_secret = $self->{api}->{token_secret};
-    my $queue = $self->{temp_queue};
+    
+    # Use temp file for communication
+    my $temp_file = "/tmp/proxmox_dashboard_temp_$$.json";
     
     # Spawn thread to fetch temperatures
     my $worker = threads->create(sub {
@@ -1361,9 +1358,15 @@ sub update_node_temperatures_async {
             $nodes = $thread_api->get('/nodes');
         };
         
-        return { success => 0, error => "$@" } if $@;
+        if ($@) {
+            # Write error result
+            open(my $fh, '>', $temp_file);
+            print $fh JSON::encode_json({ success => 0, error => "$@" });
+            close($fh);
+            return;
+        }
         
-        # Store node addresses
+        # Store node addresses and fetch temps
         foreach my $node (@$nodes) {
             my $node_name = $node->{node};
             my $node_ip = $host;
@@ -1391,8 +1394,10 @@ sub update_node_temperatures_async {
             }
         }
         
-        # Send result
-        $queue->enqueue({ success => 1, data => \%node_temps });
+        # Write result
+        open(my $fh, '>', $temp_file);
+        print $fh JSON::encode_json({ success => 1, data => \%node_temps });
+        close($fh);
     });
     
     $worker->detach();
@@ -1402,17 +1407,33 @@ sub update_node_temperatures_async {
     $self->{temp_poll_timer} = $self->{root}->repeat(100, sub {
         $temp_check_count++;
         
-        if (my $result = $queue->dequeue_nb()) {
+        if (-e $temp_file) {
             $self->{temp_poll_timer}->cancel() if $self->{temp_poll_timer};
             $self->{temp_loading} = 0;
             
-            if ($result->{success}) {
-                $self->_update_temp_ui($result->{data});
+            eval {
+                open(my $fh, '<', $temp_file);
+                my $json = do { local $/; <$fh> };
+                close($fh);
+                
+                my $result = JSON::decode_json($json);
+                
+                if ($result->{success}) {
+                    $self->_update_temp_ui($result->{data});
+                }
+                
+                unlink($temp_file);
+            };
+            
+            if ($@) {
+                main::log_message('ERROR', "Failed to process temp result: $@");
+                unlink($temp_file) if -e $temp_file;
             }
         } elsif ($temp_check_count >= 30) {
             # 3 second timeout for temps
             $self->{temp_poll_timer}->cancel() if $self->{temp_poll_timer};
             $self->{temp_loading} = 0;
+            unlink($temp_file) if -e $temp_file;
         }
     });
 }
@@ -2977,26 +2998,23 @@ sub refresh_data_async {
     $self->{is_loading} = 1;
     $self->{status_label}->configure(-text => "Fetching data...");
     
-    # Create a result queue if it doesn't exist
-    unless ($self->{result_queue}) {
-        $self->{result_queue} = Thread::Queue->new();
-    }
-    
     # Get API credentials for the thread
     my $host = $self->{api}->{host};
     my $token_id = $self->{api}->{token_id};
     my $token_secret = $self->{api}->{token_secret};
-    my $queue = $self->{result_queue};
+    
+    # Use a temp file for thread communication (more reliable than Thread::Queue for complex data)
+    my $temp_file = "/tmp/proxmox_dashboard_refresh_$$.json";
     
     # Spawn worker thread
     my $worker = threads->create(sub {
-        # Thread-local API object
-        my $thread_api = ProxmoxAPI->new($host, $token_id, $token_secret);
-        
-        my $result;
+        my $result_data;
         my $error;
         
         eval {
+            # Thread-local API object
+            my $thread_api = ProxmoxAPI->new($host, $token_id, $token_secret);
+            
             # Fetch all VM data
             my @vm_data;
             my $nodes = $thread_api->get('/nodes');
@@ -3005,12 +3023,16 @@ sub refresh_data_async {
                 die "Failed to get nodes list or invalid response";
             }
             
+            main::log_message('DEBUG', "Thread: Got " . scalar(@$nodes) . " nodes");
+            
             foreach my $node (@$nodes) {
                 my $n = $node->{node};
+                main::log_message('DEBUG', "Thread: Processing node $n");
                 
                 # Get VMs
                 my $vms = $thread_api->get("/nodes/$n/qemu");
                 if ($vms && ref($vms) eq 'ARRAY') {
+                    main::log_message('DEBUG', "Thread: Got " . scalar(@$vms) . " VMs on $n");
                     foreach my $vm (@$vms) {
                         my $vm_data = fetch_single_vm_data_threaded($thread_api, $node, $vm, 'VM');
                         push @vm_data, $vm_data if $vm_data;
@@ -3020,6 +3042,7 @@ sub refresh_data_async {
                 # Get containers
                 my $cts = $thread_api->get("/nodes/$n/lxc");
                 if ($cts && ref($cts) eq 'ARRAY') {
+                    main::log_message('DEBUG', "Thread: Got " . scalar(@$cts) . " CTs on $n");
                     foreach my $ct (@$cts) {
                         my $ct_data = fetch_single_vm_data_threaded($thread_api, $node, $ct, 'CT');
                         push @vm_data, $ct_data if $ct_data;
@@ -3027,66 +3050,108 @@ sub refresh_data_async {
                 }
             }
             
-            $result = \@vm_data;
+            $result_data = \@vm_data;
+            main::log_message('DEBUG', "Thread: Collected " . scalar(@vm_data) . " total VMs/CTs");
         };
         
         if ($@) {
             $error = "$@";
+            main::log_message('ERROR', "Thread error: $error");
         }
         
-        # Send result through queue
-        $queue->enqueue({ success => !$error, data => $result, error => $error });
+        # Write result to temp file as JSON
+        eval {
+            open(my $fh, '>', $temp_file) or die "Cannot write to $temp_file: $!";
+            my $json_data = JSON::encode_json({
+                success => !$error,
+                data => $result_data,
+                error => $error,
+            });
+            print $fh $json_data;
+            close($fh);
+            main::log_message('DEBUG', "Thread: Wrote result to $temp_file");
+        };
+        
+        if ($@) {
+            main::log_message('ERROR', "Thread: Failed to write result file: $@");
+        }
     });
     
     # Detach thread so it cleans up automatically
     $worker->detach();
     
-    # Set up polling to check for results in queue
+    main::log_message('DEBUG', "Main: Thread spawned, starting polling");
+    
+    # Set up polling to check for results in temp file
     my $check_count = 0;
     my $max_checks = 300; # 30 seconds max (300 * 100ms)
     
     $self->{poll_timer} = $self->{root}->repeat(100, sub {
         $check_count++;
         
-        # Check queue for results (non-blocking)
-        if (my $result = $queue->dequeue_nb()) {
+        # Check if temp file exists (thread completed)
+        if (-e $temp_file) {
+            main::log_message('DEBUG', "Main: Result file found, reading...");
+            
             # Stop polling
             $self->{poll_timer}->cancel() if $self->{poll_timer};
             $self->{is_loading} = 0;
             
-            if ($result->{success}) {
-                $self->{vm_data} = $result->{data};
-                $self->filter_vms();
+            eval {
+                # Read result
+                open(my $fh, '<', $temp_file) or die "Cannot read $temp_file: $!";
+                my $json = do { local $/; <$fh> };
+                close($fh);
                 
-                my $now = main::strftime("%H:%M:%S", localtime);
-                if ($self->{auto_refresh}) {
-                    my $refresh_rate = $self->{refresh_rate};
-                    $self->{last_update_label}->configure(
-                        -text => "LIVE - Updated: $now (every ${refresh_rate}s)"
+                my $result = JSON::decode_json($json);
+                main::log_message('DEBUG', "Main: Decoded JSON result");
+                
+                if ($result->{success}) {
+                    main::log_message('INFO', "Main: Processing " . scalar(@{$result->{data}}) . " VMs/CTs");
+                    $self->{vm_data} = $result->{data};
+                    $self->filter_vms();
+                    
+                    my $now = main::strftime("%H:%M:%S", localtime);
+                    if ($self->{auto_refresh}) {
+                        my $refresh_rate = $self->{refresh_rate};
+                        $self->{last_update_label}->configure(
+                            -text => "LIVE - Updated: $now (every ${refresh_rate}s)"
+                        );
+                    } else {
+                        $self->{last_update_label}->configure(-text => "Updated: $now (paused)");
+                    }
+                    
+                    $self->{connection_label}->configure(
+                        -text => "Connected",
+                        -foreground => '#27ae60',
                     );
+                    $self->update_led_color($self->{connection_led}, '#27ae60');
+                    
+                    # Update temperatures in background
+                    $self->{root}->after(100, sub {
+                        $self->update_node_temperatures_async();
+                    });
+                    
+                    main::log_message('INFO', "Data refresh completed successfully");
                 } else {
-                    $self->{last_update_label}->configure(-text => "Updated: $now (paused)");
+                    my $error = $result->{error} || "Unknown error";
+                    main::log_message('ERROR', "Refresh failed: $error");
+                    $self->{status_label}->configure(-text => "Error: $error");
+                    $self->{connection_label}->configure(
+                        -text => "Error",
+                        -foreground => '#e74c3c',
+                    );
+                    $self->update_led_color($self->{connection_led}, '#e74c3c');
                 }
                 
-                $self->{connection_label}->configure(
-                    -text => "Connected",
-                    -foreground => '#27ae60',
-                );
-                $self->update_led_color($self->{connection_led}, '#27ae60');
-                
-                # Update temperatures in background too
-                $self->update_node_temperatures_async();
-                
-                main::log_message('INFO', "Data refresh completed successfully");
-            } else {
-                my $error = $result->{error} || "Unknown error";
-                main::log_message('ERROR', "Refresh failed: $error");
-                $self->{status_label}->configure(-text => "Error: $error");
-                $self->{connection_label}->configure(
-                    -text => "Error",
-                    -foreground => '#e74c3c',
-                );
-                $self->update_led_color($self->{connection_led}, '#e74c3c');
+                # Clean up temp file
+                unlink($temp_file);
+            };
+            
+            if ($@) {
+                main::log_message('ERROR', "Failed to process refresh result: $@");
+                $self->{status_label}->configure(-text => "Error processing data");
+                unlink($temp_file) if -e $temp_file;
             }
         } elsif ($check_count >= $max_checks) {
             # Timeout
@@ -3094,6 +3159,7 @@ sub refresh_data_async {
             $self->{is_loading} = 0;
             main::log_message('ERROR', "Refresh timeout after 30 seconds");
             $self->{status_label}->configure(-text => "Timeout - data fetch took too long");
+            unlink($temp_file) if -e $temp_file;
         }
     });
 }
@@ -3406,12 +3472,8 @@ sub start_selected {
     my $vm_type = $vm->{type};
     my $vm_name = $vm->{name};
     
-    # Create action queue if needed
-    unless ($self->{action_queue}) {
-        $self->{action_queue} = Thread::Queue->new();
-    }
-    
-    my $queue = $self->{action_queue};
+    # Use temp file for communication
+    my $temp_file = "/tmp/proxmox_dashboard_start_$$.json";
     
     # Spawn thread for action
     my $worker = threads->create(sub {
@@ -3425,38 +3487,56 @@ sub start_selected {
         if ($@) {
             $result->{error} = "$@";
         }
-        $queue->enqueue($result);
+        
+        open(my $fh, '>', $temp_file);
+        print $fh JSON::encode_json($result);
+        close($fh);
     });
     
     $worker->detach();
     
     # Poll for result
-    my $check_timer;
     my $check_count = 0;
+    my $check_timer;
     $check_timer = $self->{root}->repeat(100, sub {
         $check_count++;
         
-        if (my $result = $queue->dequeue_nb()) {
+        if (-e $temp_file) {
             $check_timer->cancel();
             
-            if ($result->{success}) {
-                AuditLogger::log_vm_action("START", $vm_id, $vm_type, $vm_name, 1);
-                $self->{status_label}->configure(-text => "Started $vm_type $vm_id ($vm_name)");
-                $self->{root}->after(2000, sub { $self->refresh_data_async() });
-            } else {
-                my $error = $result->{error};
-                AuditLogger::log_vm_action("START", $vm_id, $vm_type, $vm_name, 0, $error);
-                $self->{root}->messageBox(
-                    -title => "Error",
-                    -message => "Failed to start:\n$error",
-                    -type => 'OK',
-                    -icon => 'error',
-                );
+            eval {
+                open(my $fh, '<', $temp_file);
+                my $json = do { local $/; <$fh> };
+                close($fh);
+                my $result = JSON::decode_json($json);
+                
+                if ($result->{success}) {
+                    AuditLogger::log_vm_action("START", $vm_id, $vm_type, $vm_name, 1);
+                    $self->{status_label}->configure(-text => "Started $vm_type $vm_id ($vm_name)");
+                    $self->{root}->after(2000, sub { $self->refresh_data_async() });
+                } else {
+                    my $error = $result->{error};
+                    AuditLogger::log_vm_action("START", $vm_id, $vm_type, $vm_name, 0, $error);
+                    $self->{root}->messageBox(
+                        -title => "Error",
+                        -message => "Failed to start:\n$error",
+                        -type => 'OK',
+                        -icon => 'error',
+                    );
+                }
+                
+                unlink($temp_file);
+            };
+            
+            if ($@) {
+                main::log_message('ERROR', "Failed to process start result: $@");
+                unlink($temp_file) if -e $temp_file;
             }
         } elsif ($check_count >= 100) {
             # 10 second timeout
             $check_timer->cancel();
             $self->{status_label}->configure(-text => "Start operation timeout");
+            unlink($temp_file) if -e $temp_file;
         }
     });
 }
@@ -3487,12 +3567,8 @@ sub stop_selected {
     my $vm_type = $vm->{type};
     my $vm_name = $vm->{name};
     
-    # Create action queue if needed
-    unless ($self->{action_queue}) {
-        $self->{action_queue} = Thread::Queue->new();
-    }
-    
-    my $queue = $self->{action_queue};
+    # Use temp file for communication
+    my $temp_file = "/tmp/proxmox_dashboard_stop_$$.json";
     
     # Spawn thread for action
     my $worker = threads->create(sub {
@@ -3506,38 +3582,56 @@ sub stop_selected {
         if ($@) {
             $result->{error} = "$@";
         }
-        $queue->enqueue($result);
+        
+        open(my $fh, '>', $temp_file);
+        print $fh JSON::encode_json($result);
+        close($fh);
     });
     
     $worker->detach();
     
     # Poll for result
-    my $check_timer;
     my $check_count = 0;
+    my $check_timer;
     $check_timer = $self->{root}->repeat(100, sub {
         $check_count++;
         
-        if (my $result = $queue->dequeue_nb()) {
+        if (-e $temp_file) {
             $check_timer->cancel();
             
-            if ($result->{success}) {
-                AuditLogger::log_vm_action("STOP", $vm_id, $vm_type, $vm_name, 1);
-                $self->{status_label}->configure(-text => "Stopped $vm_type $vm_id ($vm_name)");
-                $self->{root}->after(2000, sub { $self->refresh_data_async() });
-            } else {
-                my $error = $result->{error};
-                AuditLogger::log_vm_action("STOP", $vm_id, $vm_type, $vm_name, 0, $error);
-                $self->{root}->messageBox(
-                    -title => "Error",
-                    -message => "Failed to stop:\n$error",
-                    -type => 'OK',
-                    -icon => 'error',
-                );
+            eval {
+                open(my $fh, '<', $temp_file);
+                my $json = do { local $/; <$fh> };
+                close($fh);
+                my $result = JSON::decode_json($json);
+                
+                if ($result->{success}) {
+                    AuditLogger::log_vm_action("STOP", $vm_id, $vm_type, $vm_name, 1);
+                    $self->{status_label}->configure(-text => "Stopped $vm_type $vm_id ($vm_name)");
+                    $self->{root}->after(2000, sub { $self->refresh_data_async() });
+                } else {
+                    my $error = $result->{error};
+                    AuditLogger::log_vm_action("STOP", $vm_id, $vm_type, $vm_name, 0, $error);
+                    $self->{root}->messageBox(
+                        -title => "Error",
+                        -message => "Failed to stop:\n$error",
+                        -type => 'OK',
+                        -icon => 'error',
+                    );
+                }
+                
+                unlink($temp_file);
+            };
+            
+            if ($@) {
+                main::log_message('ERROR', "Failed to process stop result: $@");
+                unlink($temp_file) if -e $temp_file;
             }
         } elsif ($check_count >= 100) {
             # 10 second timeout
             $check_timer->cancel();
             $self->{status_label}->configure(-text => "Stop operation timeout");
+            unlink($temp_file) if -e $temp_file;
         }
     });
 }
@@ -3723,12 +3817,8 @@ sub start_all_stopped {
     my $token_secret = $self->{api}->{token_secret};
     my @stopped_copy = @stopped;  # Copy for thread
     
-    # Create action queue if needed
-    unless ($self->{action_queue}) {
-        $self->{action_queue} = Thread::Queue->new();
-    }
-    
-    my $queue = $self->{action_queue};
+    # Use temp file for communication
+    my $temp_file = "/tmp/proxmox_dashboard_startall_$$.json";
     
     # Spawn thread for bulk action
     my $worker = threads->create(sub {
@@ -3748,28 +3838,45 @@ sub start_all_stopped {
             }
         }
         
-        $queue->enqueue({ success_count => $success_count, total => scalar(@stopped_copy) });
+        open(my $fh, '>', $temp_file);
+        print $fh JSON::encode_json({ success_count => $success_count, total => scalar(@stopped_copy) });
+        close($fh);
     });
     
     $worker->detach();
     
     # Poll for result
-    my $check_timer;
     my $check_count = 0;
+    my $check_timer;
     $check_timer = $self->{root}->repeat(100, sub {
         $check_count++;
         
-        if (my $result = $queue->dequeue_nb()) {
+        if (-e $temp_file) {
             $check_timer->cancel();
             
-            $self->{status_label}->configure(
-                -text => "Started $result->{success_count}/$result->{total} VMs/CTs"
-            );
-            $self->{root}->after(3000, sub { $self->refresh_data_async() });
+            eval {
+                open(my $fh, '<', $temp_file);
+                my $json = do { local $/; <$fh> };
+                close($fh);
+                my $result = JSON::decode_json($json);
+                
+                $self->{status_label}->configure(
+                    -text => "Started $result->{success_count}/$result->{total} VMs/CTs"
+                );
+                $self->{root}->after(3000, sub { $self->refresh_data_async() });
+                
+                unlink($temp_file);
+            };
+            
+            if ($@) {
+                main::log_message('ERROR', "Failed to process start all result: $@");
+                unlink($temp_file) if -e $temp_file;
+            }
         } elsif ($check_count >= 300) {
             # 30 second timeout
             $check_timer->cancel();
             $self->{status_label}->configure(-text => "Start all operation timeout");
+            unlink($temp_file) if -e $temp_file;
         }
     });
 }
@@ -3852,28 +3959,19 @@ sub on_closing {
     # Give threads a moment to finish
     sleep(0.3);
     
-    # Clean up queues
-    if ($self->{result_queue}) {
-        eval {
-            while ($self->{result_queue}->pending()) {
-                $self->{result_queue}->dequeue_nb();
-            }
-        };
-    }
-    if ($self->{temp_queue}) {
-        eval {
-            while ($self->{temp_queue}->pending()) {
-                $self->{temp_queue}->dequeue_nb();
-            }
-        };
-    }
-    if ($self->{action_queue}) {
-        eval {
-            while ($self->{action_queue}->pending()) {
-                $self->{action_queue}->dequeue_nb();
-            }
-        };
-    }
+    # Clean up any temp files
+    eval {
+        my $pid = $$;
+        foreach my $pattern (
+            "/tmp/proxmox_dashboard_refresh_${pid}.json",
+            "/tmp/proxmox_dashboard_temp_${pid}.json",
+            "/tmp/proxmox_dashboard_start_${pid}.json",
+            "/tmp/proxmox_dashboard_stop_${pid}.json",
+            "/tmp/proxmox_dashboard_startall_${pid}.json",
+        ) {
+            unlink($pattern) if -e $pattern;
+        }
+    };
     
     main::log_message('INFO', "Dashboard cleanup complete");
     $self->{root}->destroy();
