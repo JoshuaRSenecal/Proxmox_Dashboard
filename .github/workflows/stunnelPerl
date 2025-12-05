@@ -2500,27 +2500,32 @@ sub format_bytes {
     
     return 'N/A' unless defined $bytes_val && $bytes_val ne 'N/A';
     
+    my $result;
     eval {
         $bytes_val = 0 + $bytes_val;  # Force numeric
         
         if ($bytes_val < 0) {
-            return 'N/A';
+            $result = 'N/A';
+            return;
         }
         
         my @units = ('B', 'KiB', 'MiB', 'GiB', 'TiB', 'PiB');
         
         foreach my $unit (@units) {
             if ($bytes_val < 1024 || $unit eq 'PiB') {
-                return sprintf("%.1f %s", $bytes_val, $unit);
+                $result = sprintf("%.1f%s", $bytes_val, $unit);
+                return;
             }
             $bytes_val /= 1024;
         }
     };
     
     if ($@) {
-        main::log_message('ERROR', "Error formatting bytes value '$bytes_val': $@");
+        main::log_message('ERROR', "Error formatting bytes value: $@");
         return 'N/A';
     }
+    
+    return $result || 'N/A';
 }
 
 sub fetch_single_vm_data {
@@ -2700,10 +2705,19 @@ sub fetch_single_vm_data {
                     eval {
                         main::log_message('ERROR', "DEBUG VM $vmid: Trying status API fallback");
                         my $stat = $self->{api}->get("/nodes/$n/qemu/$vmid/status/current");
+                        
+                        # Log the full status response to see what we're getting
+                        if ($stat) {
+                            main::log_message('ERROR', "DEBUG VM $vmid: Status API returned - disk=" . ($stat->{disk} // 'undef') . 
+                                ", maxdisk=" . ($stat->{maxdisk} // 'undef'));
+                        } else {
+                            main::log_message('ERROR', "DEBUG VM $vmid: Status API returned undef/empty");
+                        }
+                        
                         my $disk_used = $stat->{disk} || 0;
                         my $disk_max = $stat->{maxdisk} || 0;
                         
-                        main::log_message('ERROR', "DEBUG VM $vmid: Status API - disk_used=$disk_used, disk_max=$disk_max");
+                        main::log_message('ERROR', "DEBUG VM $vmid: After defaults - disk_used=$disk_used, disk_max=$disk_max");
                         
                         if ($disk_max > 0 && $disk_used >= 0) {
                             $total_fs = $self->format_bytes($disk_max);
@@ -2713,11 +2727,13 @@ sub fetch_single_vm_data {
                                 $free_pct = sprintf("%.1f%%", ($free_bytes / $disk_max * 100));
                                 main::log_message('ERROR', "DEBUG VM $vmid: Status API success - TotalFS=$total_fs, FreeDisk=$free_disk");
                             }
+                        } else {
+                            main::log_message('ERROR', "DEBUG VM $vmid: Status API disk_max is 0, cannot calculate filesystem usage");
                         }
                     };
                     
                     if ($@) {
-                        main::log_message('ERROR', "DEBUG VM $vmid: Status API also failed - $@");
+                        main::log_message('ERROR', "DEBUG VM $vmid: Status API failed with error - $@");
                     }
                 }
             } else {
@@ -2725,10 +2741,19 @@ sub fetch_single_vm_data {
                 eval {
                     main::log_message('ERROR', "DEBUG CT $vmid: Trying status API");
                     my $stat = $self->{api}->get("/nodes/$n/lxc/$vmid/status/current");
+                    
+                    # Log what we got
+                    if ($stat) {
+                        main::log_message('ERROR', "DEBUG CT $vmid: Status API returned - disk=" . ($stat->{disk} // 'undef') . 
+                            ", maxdisk=" . ($stat->{maxdisk} // 'undef'));
+                    } else {
+                        main::log_message('ERROR', "DEBUG CT $vmid: Status API returned undef/empty");
+                    }
+                    
                     my $disk_used = $stat->{disk} || 0;
                     my $disk_max = $stat->{maxdisk} || 0;
                     
-                    main::log_message('ERROR', "DEBUG CT $vmid: Status API - disk_used=$disk_used, disk_max=$disk_max");
+                    main::log_message('ERROR', "DEBUG CT $vmid: After defaults - disk_used=$disk_used, disk_max=$disk_max");
                     
                     if ($disk_max > 0 && $disk_used >= 0) {
                         $total_fs = $self->format_bytes($disk_max);
@@ -2738,11 +2763,13 @@ sub fetch_single_vm_data {
                             $free_pct = sprintf("%.1f%%", ($free_bytes / $disk_max * 100));
                             main::log_message('ERROR', "DEBUG CT $vmid: Status API success - TotalFS=$total_fs, FreeDisk=$free_disk");
                         }
+                    } else {
+                        main::log_message('ERROR', "DEBUG CT $vmid: Status API disk_max is 0, cannot calculate filesystem usage");
                     }
                 };
                 
                 if ($@) {
-                    main::log_message('ERROR', "DEBUG CT $vmid: Status API failed - $@");
+                    main::log_message('ERROR', "DEBUG CT $vmid: Status API failed with error - $@");
                 }
             }
         } else {
