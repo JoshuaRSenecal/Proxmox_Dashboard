@@ -1140,48 +1140,6 @@ sub get_temp_color {
     }
 }
 
-sub check_temperature_api_status {
-    my ($self) = @_;
-    
-    return unless $self->{api};
-    
-    my $thr = threads->create(sub {
-        my ($api_host) = @_;
-        
-        eval {
-            my $ua = LWP::UserAgent->new(
-                ssl_opts => { verify_hostname => 0, SSL_verify_mode => 0 },
-                timeout => 5,
-            );
-            
-            # For single-node setups, use the API host
-            my %node_addresses;
-            
-            # Try to get cluster status for node IPs
-            eval {
-                # We can't use $self->{api} here in the thread, so we'll skip this part
-                # and just use the host from the API
-            };
-            
-            # Check nodes (we'll pass node info from parent thread)
-            my @results;
-            
-            # For now, just return empty results
-            # The parent thread will handle this differently
-            
-            return JSON::encode_json(\@results);
-        };
-        
-        if ($@) {
-            main::log_message('ERROR', "Failed to check temperature API status: $@");
-            return JSON::encode_json([]);
-        }
-    }, $self->{api}->{host});
-    
-    # Since threading with Tk is complex, we'll do a simpler approach
-    # Just log that we're checking
-}
-
 sub get_all_node_temperatures {
     my ($self) = @_;
     
@@ -2593,6 +2551,8 @@ sub fetch_single_vm_data {
             my $memory_val = $cfg->{memory} || 0;
             $memory_val = int($memory_val) if $memory_val;
             
+            main::log_message('ERROR', "DEBUG VM $vmid: Raw memory value = $memory_val, balloon = " . ($cfg->{balloon} // 'none'));
+            
             if (exists $cfg->{balloon}) {
                 my $balloon_val = int($cfg->{balloon} || $memory_val);
                 my $minmem = int($balloon_val);
@@ -2602,15 +2562,19 @@ sub fetch_single_vm_data {
                     my $minmem_str = $self->format_bytes($minmem * 1024 * 1024);
                     my $maxmem_str = $self->format_bytes($maxmem * 1024 * 1024);
                     $memory = "$minmem_str-$maxmem_str";
+                    main::log_message('ERROR', "DEBUG VM $vmid: Memory formatted as $memory");
                 } else {
                     $memory = $memory_val ? $self->format_bytes($memory_val * 1024 * 1024) : 'N/A';
                 }
             } else {
                 $memory = $memory_val ? $self->format_bytes($memory_val * 1024 * 1024) : 'N/A';
+                main::log_message('ERROR', "DEBUG VM $vmid: No balloon, memory = $memory");
             }
         } else {
             my $memory_mb = int($cfg->{memory} || 0);
             my $swap_mb = int($cfg->{swap} || 0);
+            
+            main::log_message('ERROR', "DEBUG CT $vmid: memory=$memory_mb MB, swap=$swap_mb MB");
             
             if ($memory_mb > 0) {
                 my $mem_str = $self->format_bytes($memory_mb * 1024 * 1024);
@@ -2623,6 +2587,7 @@ sub fetch_single_vm_data {
             } else {
                 $memory = 'N/A';
             }
+            main::log_message('ERROR', "DEBUG CT $vmid: Final memory = $memory");
         }
     };
     
@@ -2664,13 +2629,17 @@ sub fetch_single_vm_data {
     my ($free_disk, $free_pct, $total_fs) = ('N/A', 'N/A', 'N/A');
         
         if ($vm->{status} eq 'running') {
+            main::log_message('ERROR', "DEBUG $vm_type $vmid: VM is running, checking filesystem data");
+            
             if ($vm_type eq 'VM') {
                 # Try guest agent first (may fail if not installed/running)
                 eval {
+                    main::log_message('ERROR', "DEBUG VM $vmid: Trying guest agent get-fsinfo");
                     my $fsinfo = $self->{api}->get("/nodes/$n/qemu/$vmid/agent/get-fsinfo");
                     
                     if ($fsinfo && $fsinfo->{result}) {
                         my @filesystems = @{$fsinfo->{result}};
+                        main::log_message('ERROR', "DEBUG VM $vmid: Guest agent returned " . scalar(@filesystems) . " filesystems");
                         
                         my %excluded_types = map { $_ => 1 } qw(iso9660 udf tmpfs devtmpfs);
                         my %included_mountpoints = map { $_ => 1 } qw(/ /boot /home /var /tmp /usr);
@@ -2692,6 +2661,7 @@ sub fetch_single_vm_data {
                                 if ($fs_total > 0) {
                                     $total_bytes_sum += $fs_total;
                                     $used_bytes_sum += $fs_used;
+                                    main::log_message('ERROR', "DEBUG VM $vmid: Added filesystem $mountpoint: total=$fs_total, used=$fs_used");
                                 }
                             }
                         }
@@ -2702,26 +2672,30 @@ sub fetch_single_vm_data {
                             if ($free_bytes >= 0) {
                                 $free_disk = $self->format_bytes($free_bytes);
                                 $free_pct = sprintf("%.1f%%", ($free_bytes / $total_bytes_sum * 100));
+                                main::log_message('ERROR', "DEBUG VM $vmid: Guest agent success - TotalFS=$total_fs, FreeDisk=$free_disk, Free%=$free_pct");
                             }
+                        } else {
+                            main::log_message('ERROR', "DEBUG VM $vmid: Guest agent returned filesystems but total_bytes_sum = 0");
                         }
+                    } else {
+                        main::log_message('ERROR', "DEBUG VM $vmid: Guest agent returned no result");
                     }
                 };
                 
                 if ($@) {
                     # Guest agent errors are expected when agent is not installed/running
-                    # Only log if it's a different error
-                    unless ($@ =~ /guest agent|QEMU.*agent/) {
-                        main::log_message('ERROR', "Failed to get guest agent fsinfo for $vm_type $vmid: $@");
-                    }
+                    main::log_message('ERROR', "DEBUG VM $vmid: Guest agent failed - $@");
                 }
                 
                 # Fallback to status if guest agent fails or returns no data
                 if ($total_fs eq 'N/A') {
                     eval {
+                        main::log_message('ERROR', "DEBUG VM $vmid: Trying status API fallback");
                         my $stat = $self->{api}->get("/nodes/$n/qemu/$vmid/status/current");
                         my $disk_used = $stat->{disk} || 0;
                         my $disk_max = $stat->{maxdisk} || 0;
                         
+                        main::log_message('ERROR', "DEBUG VM $vmid: Status API - disk_used=$disk_used, disk_max=$disk_max");
                         
                         if ($disk_max > 0 && $disk_used >= 0) {
                             $total_fs = $self->format_bytes($disk_max);
@@ -2729,23 +2703,24 @@ sub fetch_single_vm_data {
                             if ($free_bytes >= 0) {
                                 $free_disk = $self->format_bytes($free_bytes);
                                 $free_pct = sprintf("%.1f%%", ($free_bytes / $disk_max * 100));
+                                main::log_message('ERROR', "DEBUG VM $vmid: Status API success - TotalFS=$total_fs, FreeDisk=$free_disk");
                             }
                         }
                     };
                     
                     if ($@) {
-                        # Only log if it's not a common operational error
-                        unless ($@ =~ /stopped|not running/i) {
-                            main::log_message('ERROR', "Failed to get status for VM $vmid: $@");
-                        }
+                        main::log_message('ERROR', "DEBUG VM $vmid: Status API also failed - $@");
                     }
                 }
             } else {
                 # CT - use status API
                 eval {
+                    main::log_message('ERROR', "DEBUG CT $vmid: Trying status API");
                     my $stat = $self->{api}->get("/nodes/$n/lxc/$vmid/status/current");
                     my $disk_used = $stat->{disk} || 0;
                     my $disk_max = $stat->{maxdisk} || 0;
+                    
+                    main::log_message('ERROR', "DEBUG CT $vmid: Status API - disk_used=$disk_used, disk_max=$disk_max");
                     
                     if ($disk_max > 0 && $disk_used >= 0) {
                         $total_fs = $self->format_bytes($disk_max);
@@ -2753,17 +2728,17 @@ sub fetch_single_vm_data {
                         if ($free_bytes >= 0) {
                             $free_disk = $self->format_bytes($free_bytes);
                             $free_pct = sprintf("%.1f%%", ($free_bytes / $disk_max * 100));
+                            main::log_message('ERROR', "DEBUG CT $vmid: Status API success - TotalFS=$total_fs, FreeDisk=$free_disk");
                         }
                     }
                 };
                 
                 if ($@) {
-                    # Only log if it's not a common operational error
-                    unless ($@ =~ /stopped|not running/i) {
-                        main::log_message('ERROR', "Failed to get status for CT $vmid: $@");
-                    }
+                    main::log_message('ERROR', "DEBUG CT $vmid: Status API failed - $@");
                 }
             }
+        } else {
+            main::log_message('ERROR', "DEBUG $vm_type $vmid: VM is stopped, skipping filesystem data");
         }
         
         # Extract sockets and CPU type safely
@@ -2777,7 +2752,7 @@ sub fetch_single_vm_data {
         }
         
         # Return VM data
-        return {
+        my $result = {
             id => $vmid,
             type => $vm_type,
             status => $vm->{status},
@@ -2792,6 +2767,10 @@ sub fetch_single_vm_data {
             free_disk => $free_disk,
             free_pct => $free_pct,
         };
+        
+        main::log_message('ERROR', "DEBUG $vm_type $vmid: FINAL DATA - memory=$memory, total_fs=$total_fs, free_disk=$free_disk");
+        
+        return $result;
 }
 
 sub refresh_data_async {
