@@ -283,8 +283,10 @@ sub _api_request {
             # Check if this is an operational error (expected conditions)
             if ($last_error =~ /Operational condition:|guest agent|QEMU.*agent/i) {
                 # This is expected (VM stopped, agent not running, etc.)
-                # Don't log as ERROR, don't retry, just fail silently
-                die $last_error;
+                # Don't retry, just let the error propagate to caller's eval block
+                # The first die at line 254 was already caught by our eval
+                # We just need to break out of retry loop and re-throw it
+                last;  # Exit retry loop
             }
             
             if ($last_error =~ /Authentication failed/) {
@@ -302,6 +304,12 @@ sub _api_request {
             # Success - exit loop
             last;
         }
+    }
+    
+    # After the retry loop, check if we had an error
+    if ($last_error) {
+        # Re-throw the error for the calling code's eval to catch
+        die $last_error;
     }
     
     # If we have a result, return it
@@ -2810,9 +2818,16 @@ sub refresh_data_async {
                 # Get VMs
                 my $vms = $self->{api}->get("/nodes/$n/qemu");
                 if ($vms && ref($vms) eq 'ARRAY') {
+                    main::log_message('ERROR', "DEBUG: Processing " . scalar(@$vms) . " VMs on node $n");
                     foreach my $vm (@$vms) {
+                        main::log_message('ERROR', "DEBUG: Calling fetch_single_vm_data for VM " . $vm->{vmid});
                         my $vm_data = $self->fetch_single_vm_data($node, $vm, 'VM');
-                        push @vm_data, $vm_data if $vm_data;
+                        if ($vm_data) {
+                            push @vm_data, $vm_data;
+                            main::log_message('ERROR', "DEBUG: Successfully added VM " . $vm_data->{id} . " to array");
+                        } else {
+                            main::log_message('ERROR', "DEBUG: fetch_single_vm_data returned undef for VM " . $vm->{vmid});
+                        }
                     }
                 }
                 
@@ -2833,6 +2848,9 @@ sub refresh_data_async {
         if ($@) {
             $error = $@;
             main::log_message('ERROR', "Data fetch failed: $error");
+            main::log_message('ERROR', "DEBUG: vm_data array has " . scalar(@vm_data) . " items before error handling");
+        } else {
+            main::log_message('ERROR', "DEBUG: Data fetch completed successfully, vm_data array has " . scalar(@vm_data) . " items");
         }
         
         $self->{is_loading} = 0;
