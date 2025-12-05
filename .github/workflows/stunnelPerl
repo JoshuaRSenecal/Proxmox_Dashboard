@@ -2768,27 +2768,6 @@ sub refresh_data_async {
     
     eval {
         my $nodes = $self->{api}->get('/nodes');
-sub refresh_data_async {
-    my ($self) = @_;
-    
-    return if $self->{is_loading};
-    
-    unless ($self->{api}) {
-        $self->{status_label}->configure(-text => "Not connected");
-        $self->{connection_label}->configure(-text => "Disconnected", -foreground => '#e74c3c');
-        $self->update_led_color($self->{connection_led}, '#e74c3c');
-        return;
-    }
-    
-    $self->{is_loading} = 1;
-    $self->{status_label}->configure(-text => "Fetching data...");
-    
-    # Fetch data immediately (blocks briefly but necessary)
-    my @vm_data;
-    my $error;
-    
-    eval {
-        my $nodes = $self->{api}->get('/nodes');
         
         unless ($nodes && ref($nodes) eq 'ARRAY') {
             main::log_message('ERROR', "API /nodes did not return array: " . (ref($nodes) || 'undef'));
