@@ -2855,7 +2855,6 @@ sub refresh_data_async {
         }
     });
 }
-}
 
 sub get_selected_vm {
     my ($self) = @_;
