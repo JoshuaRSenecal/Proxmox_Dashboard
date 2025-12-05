@@ -14,12 +14,9 @@ use JSON;
 use MIME::Base64;
 use File::Path qw(make_path);
 use File::Spec;
-use POSIX qw(strftime WNOHANG);
+use POSIX qw(strftime);
 use Time::HiRes qw(sleep time);
 use List::Util qw(min);
-use threads;
-use threads::shared;
-use Thread::Queue;
 use Digest::SHA;
 use Crypt::PBKDF2;
 use Crypt::AuthEnc::GCM;
@@ -139,9 +136,6 @@ package ProxmoxAPI;
 sub new {
     my ($class, $host, $token_id, $token_secret) = @_;
     
-    main::log_message('INFO', "Creating ProxmoxAPI connection to $host");
-    main::log_message('DEBUG', "Token ID: $token_id");
-    main::log_message('DEBUG', "SSL CA cert: $main::PROXMOX_CA_CERT");
     
     my $self = {
         base => "https://$host:8006/api2/json",
@@ -154,7 +148,6 @@ sub new {
     
     bless $self, $class;
     
-    main::log_message('DEBUG', "Base URL: $self->{base}");
     
     # Create LWP UserAgent with SSL verification
     $self->{ua} = LWP::UserAgent->new(
@@ -166,14 +159,11 @@ sub new {
         timeout => 10,
     );
     
-    main::log_message('DEBUG', "LWP UserAgent created with SSL verification");
     
     # Test authentication
     eval {
-        main::log_message('INFO', "Testing authentication with /version endpoint...");
         $self->_api_request('GET', '/version');
         AuditLogger::log_authentication($host, $token_id, 1);
-        main::log_message('INFO', "Successfully authenticated with token: $token_id");
     };
     
     if ($@) {
@@ -202,7 +192,6 @@ sub _api_request {
             my $url = $self->{base} . $path;
             my $req;
             
-            main::log_message('DEBUG', "API Request: $method $url (attempt $attempt/$retries)");
             
             if ($method eq 'GET') {
                 $req = HTTP::Request->new(GET => $url);
@@ -216,15 +205,12 @@ sub _api_request {
             
             # Add API token authentication header
             my $auth_header = "PVEAPIToken=$self->{token_id}=$self->{token_secret}";
-            main::log_message('DEBUG', "Auth header: PVEAPIToken=$self->{token_id}=<secret>");
             $req->header('Authorization' => $auth_header);
             
             my $response = $self->{ua}->request($req);
             
-            main::log_message('DEBUG', "Response code: " . $response->code . " - " . $response->status_line);
             
             if ($response->is_success || $response->code == 201) {
-                main::log_message('DEBUG', "Request succeeded, storing response");
                 $result = $response;  # Store result instead of returning
                 return;  # Exit eval successfully
             } elsif ($response->code == 401) {
@@ -254,11 +240,9 @@ sub _api_request {
                     if ($content) {
                         $error_msg .= " - " . substr($content, 0, 200);
                     }
-                    main::log_message('DEBUG', $error_msg);
                     die $error_msg;
                 } elsif ($attempt < $retries) {
                     # Real server error - retry with backoff
-                    main::log_message('WARN', "Server error, retrying...");
                     my $delay = $main::RETRY_DELAY * (2 ** ($attempt - 1));
                     sleep($delay);
                     die "Server error, will retry";  # Trigger retry
@@ -294,7 +278,6 @@ sub _api_request {
                 die $last_error;
             }
             
-            main::log_message('WARN', "Request failed, will retry: $last_error");
             my $delay = $main::RETRY_DELAY * (2 ** ($attempt - 1));
             sleep($delay);
         } else {
@@ -305,7 +288,6 @@ sub _api_request {
     
     # If we have a result, return it
     if ($result) {
-        main::log_message('DEBUG', "Returning successful response");
         return $result;
     }
     
@@ -337,7 +319,6 @@ sub get {
     
     # Ensure we return something valid (at minimum an empty hash or array)
     unless (defined $data) {
-        main::log_message('WARNING', "API returned undefined data for $path, returning empty hash");
         return {};
     }
     
@@ -381,7 +362,6 @@ sub get_key_from_password {
     my $key = $pbkdf2->PBKDF2($main::SALT, $password);
     
     my $key_len = length($key);
-    main::log_message('DEBUG', "PBKDF2 generated key length: $key_len bytes");
     
     if ($key_len != 32) {
         main::log_message('ERROR', "PBKDF2 generated wrong key length: $key_len");
@@ -403,10 +383,8 @@ sub save_credentials {
         };
         
         my $json = JSON::encode_json($credentials);
-        main::log_message('DEBUG', "JSON to encrypt length: " . length($json));
         
         my $key = get_key_from_password($master_password);
-        main::log_message('DEBUG', "Derived key for encryption, length: " . length($key));
         
         # Use AES-256-GCM for authenticated encryption (more reliable than CBC)
         # Generate random 12-byte IV
@@ -418,8 +396,6 @@ sub save_credentials {
         # Store: IV (12 bytes) + tag (16 bytes) + ciphertext
         my $encrypted = $iv . $tag . $ciphertext;
         
-        main::log_message('DEBUG', "Encrypted data length: " . length($encrypted));
-        main::log_message('DEBUG', "  IV: 12 bytes, Tag: 16 bytes, Ciphertext: " . length($ciphertext) . " bytes");
         
         # Write to temporary file first, then rename (atomic operation)
         my $temp_file = $main::CREDENTIALS_FILE . '.tmp';
@@ -440,7 +416,6 @@ sub save_credentials {
             die "Credentials file does not exist after save";
         }
         
-        main::log_message('INFO', "Credentials saved successfully for $host");
     };
     
     if ($@) {
@@ -453,11 +428,9 @@ sub load_credentials {
     my ($master_password) = @_;
     
     unless (-e $main::CREDENTIALS_FILE) {
-        main::log_message('INFO', "Credentials file does not exist: $main::CREDENTIALS_FILE");
         return undef;
     }
     
-    main::log_message('INFO', "Loading credentials from: $main::CREDENTIALS_FILE");
     
     my $creds;
     eval {
@@ -467,21 +440,18 @@ sub load_credentials {
         close($fh);
         
         my $encrypted_len = length($encrypted);
-        main::log_message('DEBUG', "Loaded encrypted data, length: $encrypted_len bytes");
         
         if ($encrypted_len < 28) {  # Minimum: 12 (IV) + 16 (tag) + some data
             die "Credentials file is too small or corrupted";
         }
         
         my $key = get_key_from_password($master_password);
-        main::log_message('DEBUG', "Derived key for decryption, length: " . length($key));
         
         # Extract: IV (12 bytes) + tag (16 bytes) + ciphertext
         my $iv = substr($encrypted, 0, 12);
         my $tag = substr($encrypted, 12, 16);
         my $ciphertext = substr($encrypted, 28);
         
-        main::log_message('DEBUG', "Extracting: IV(12) + Tag(16) + Ciphertext(" . length($ciphertext) . ")");
         
         # Decrypt using GCM mode
         my $decrypted = gcm_decrypt_verify('AES', $key, $iv, '', $ciphertext, $tag);
@@ -490,16 +460,12 @@ sub load_credentials {
             die "Decryption failed - wrong password or corrupted data";
         }
         
-        main::log_message('DEBUG', "Decrypted data length: " . length($decrypted));
         
         # Show preview
         my $preview = substr($decrypted, 0, 100);
         $preview =~ s/[^[:print:]]/?/g;
-        main::log_message('DEBUG', "Decrypted preview: $preview");
         
-        main::log_message('DEBUG', "Attempting JSON decode...");
         $creds = JSON::decode_json($decrypted);
-        main::log_message('INFO', "Successfully decoded credentials for host: " . ($creds->{host} || 'unknown'));
     };
     
     if ($@) {
@@ -970,8 +936,6 @@ sub new {
         root => $root,
         api => undef,
         auto_refresh => 1,
-        refresh_thread => undef,
-        health_check_thread => undef,
         vm_data => [],
         filtered_vm_data => [],
         search_query => "",
@@ -984,7 +948,6 @@ sub new {
         node_temps_full_data => {},
         tooltips_enabled => 0,
         window_ready => 0,
-        task_queue => Thread::Queue->new(),
         refresh_rate => $main::REFRESH_INTERVAL,
     };
     
@@ -1005,16 +968,13 @@ sub new {
     
     # Mark window as ready
     $self->{window_ready} = 1;
-    main::log_message('INFO', "Dashboard window created successfully");
     
     # Add cleanup handler for window close
     $self->{root}->protocol('WM_DELETE_WINDOW', sub { $self->on_closing() });
     
-    main::log_message('INFO', "Calling authenticate()...");
     my $auth_result;
     eval {
         $auth_result = $self->authenticate();
-        main::log_message('INFO', "authenticate() returned: " . ($auth_result ? "success" : "failure"));
     };
     
     if ($@) {
@@ -1024,18 +984,14 @@ sub new {
     }
     
     unless ($auth_result) {
-        main::log_message('INFO', "Authentication failed or cancelled, destroying window");
         $self->{root}->destroy();
         return undef;
     }
     
-    main::log_message('INFO', "Authentication completed successfully, starting dashboard services...");
     
     # Start task processor FIRST
     eval {
-        main::log_message('DEBUG', "Starting task processor...");
         $self->start_task_processor();
-        main::log_message('DEBUG', "Task processor started successfully");
     };
     if ($@) {
         main::log_message('ERROR', "Failed to start task processor: $@");
@@ -1044,7 +1000,6 @@ sub new {
     
     # Delay temperature check
     eval {
-        main::log_message('DEBUG', "Scheduling temperature check...");
         $self->{root}->after(2000, sub {
             eval {
                 $self->check_temperature_api_status();
@@ -1053,7 +1008,6 @@ sub new {
                 main::log_message('ERROR', "Temperature check failed: $@");
             }
         });
-        main::log_message('DEBUG', "Temperature check scheduled successfully");
     };
     if ($@) {
         main::log_message('ERROR', "Failed to schedule temperature check: $@");
@@ -1062,9 +1016,7 @@ sub new {
     
     # Start auto-refresh
     eval {
-        main::log_message('DEBUG', "Starting auto-refresh...");
         $self->start_auto_refresh();
-        main::log_message('DEBUG', "Auto-refresh started successfully");
     };
     if ($@) {
         main::log_message('CRITICAL', "Failed to start auto-refresh: $@");
@@ -1079,16 +1031,13 @@ sub new {
     
     # Start health check
     eval {
-        main::log_message('DEBUG', "Starting health check...");
         $self->start_health_check();
-        main::log_message('DEBUG', "Health check started successfully");
     };
     if ($@) {
         main::log_message('ERROR', "Failed to start health check: $@");
         # Non-fatal, continue
     }
     
-    main::log_message('INFO', "Dashboard initialization complete - returning to MainLoop");
     
     return $self;
 }
@@ -1213,7 +1162,6 @@ sub check_temperature_api_status {
     
     # Since threading with Tk is complex, we'll do a simpler approach
     # Just log that we're checking
-    main::log_message('INFO', "Temperature API check scheduled");
 }
 
 sub get_all_node_temperatures {
@@ -1229,11 +1177,9 @@ sub get_all_node_temperatures {
         # Validate that nodes is an array ref
         unless (ref($nodes) eq 'ARRAY') {
             my $type = ref($nodes) || 'scalar';
-            main::log_message('WARNING', "Expected array ref from /nodes in temperature check, got $type");
             return {};  # Return empty hash
         }
         
-        main::log_message('DEBUG', "get_all_node_temperatures: Fetching temps for " . scalar(@$nodes) . " nodes");
         
         # For single-node setups, use the API host
         foreach my $node (@$nodes) {
@@ -1304,89 +1250,8 @@ sub update_node_temperatures {
     
     return unless $self->{api};
     
-    # Get temperatures
     my $node_temps = $self->get_all_node_temperatures();
-    
-    # Update UI
     $self->_update_temp_ui($node_temps);
-}
-
-sub update_node_temperatures_async {
-    my ($self) = @_;
-    
-    return unless $self->{api};
-    return if $self->{temp_loading};
-    
-    $self->{temp_loading} = 1;
-    
-    my $host = $self->{api}->{host};
-    my $token_id = $self->{api}->{token_id};
-    my $token_secret = $self->{api}->{token_secret};
-    my $temp_file = "/tmp/proxmox_dashboard_temp_$$.json";
-    
-    my $worker = threads->create(sub {
-        my $thread_api = ProxmoxAPI->new($host, $token_id, $token_secret);
-        my %node_temps;
-        
-        eval {
-            my $nodes = $thread_api->get('/nodes');
-            
-            foreach my $node (@$nodes) {
-                my $node_name = $node->{node};
-                my $url = "https://$host:8898/temperature";
-                
-                my $ua = LWP::UserAgent->new(
-                    ssl_opts => { verify_hostname => 0, SSL_verify_mode => 0 },
-                    timeout => 1.5,
-                );
-                
-                my $response = $ua->get($url);
-                
-                if ($response->is_success) {
-                    my $data = eval { JSON::decode_json($response->content); };
-                    $node_temps{$node_name} = ($data && ref($data) eq 'HASH') 
-                        ? $data 
-                        : { status => 'error', sensors => [] };
-                } else {
-                    $node_temps{$node_name} = { status => 'not_installed', sensors => [] };
-                }
-            }
-        };
-        
-        open(my $fh, '>', $temp_file);
-        print $fh JSON::encode_json({ success => !$@, data => \%node_temps, error => $@ });
-        close($fh);
-    });
-    
-    $worker->detach();
-    
-    my $temp_check_count = 0;
-    $self->{temp_poll_timer} = $self->{root}->repeat(100, sub {
-        $temp_check_count++;
-        
-        if (-e $temp_file && -s $temp_file) {
-            $self->{temp_poll_timer}->cancel() if $self->{temp_poll_timer};
-            $self->{temp_loading} = 0;
-            
-            eval {
-                sleep(0.05);
-                open(my $fh, '<', $temp_file);
-                my $json = do { local $/; <$fh> };
-                close($fh);
-                
-                my $result = JSON::decode_json($json);
-                $self->_update_temp_ui($result->{data}) if $result->{success};
-                
-                unlink($temp_file);
-            };
-            
-            unlink($temp_file) if $@ && -e $temp_file;
-        } elsif ($temp_check_count >= 30) {
-            $self->{temp_poll_timer}->cancel() if $self->{temp_poll_timer};
-            $self->{temp_loading} = 0;
-            unlink($temp_file) if -e $temp_file;
-        }
-    });
 }
 
 sub _update_temp_ui {
@@ -2175,14 +2040,12 @@ sub create_widgets {
 sub authenticate {
     my ($self) = @_;
     
-    main::log_message('INFO', "=== Starting authentication process ===");
     
     # Track authentication result outside eval
     my $auth_result = 0;
     
     eval {
         if (-e $main::CREDENTIALS_FILE) {
-            main::log_message('INFO', "Credentials file exists, attempting to load...");
             
             while (1) {
                 my $dialog = $self->{root}->DialogBox(
@@ -2197,14 +2060,12 @@ sub authenticate {
                 my $answer = $dialog->Show();
                 
                 if ($answer eq "Cancel") {
-                    main::log_message('INFO', "User cancelled authentication");
                     $auth_result = 0;
                     return;  # Exit eval - user cancelled
                 }
                 
                 my $master_password = $entry->get();
                 
-                main::log_message('DEBUG', "Attempting to load credentials...");
                 
                 # Try to decrypt credentials
                 my $creds;
@@ -2234,7 +2095,6 @@ sub authenticate {
                     next;
                 }
                 
-                main::log_message('INFO', "Credentials loaded successfully, attempting API connection...");
                 
                 # Try to authenticate
                 eval {
@@ -2244,12 +2104,10 @@ sub authenticate {
                         $creds->{token_secret},
                     );
                     
-                    main::log_message('INFO', "ProxmoxAPI object created successfully");
                     
                     $self->{status_label}->configure(-text => "Connected to $creds->{host}");
                     $self->{ssl_label}->configure(-text => "SSL: " . $self->{api}->{ssl_status});
                     $self->{connection_healthy} = 1;
-                    main::log_message('INFO', "Successfully authenticated to $creds->{host}");
                 };
                 
                 if ($@) {
@@ -2267,7 +2125,6 @@ sub authenticate {
                     if ($response eq 'Yes') {
                         eval {
                             unlink $main::CREDENTIALS_FILE;
-                            main::log_message('INFO', "Deleted invalid credentials file");
                         };
                         
                         if ($@) {
@@ -2287,7 +2144,6 @@ sub authenticate {
                     }
                 } else {
                     # Authentication successful
-                    main::log_message('INFO', "=== Authentication with stored credentials successful ===");
                     $auth_result = 1;
                     return;  # Exit eval successfully
                 }
@@ -2295,7 +2151,6 @@ sub authenticate {
         }
         
         # No credentials file - setup flow
-        main::log_message('INFO', "No credentials file, starting setup flow...");
         
         $self->{root}->messageBox(
             -title => "Setup Required",
@@ -2315,7 +2170,6 @@ sub authenticate {
         if ($dialog->{result}) {
             my $result = $dialog->{result};
             
-            main::log_message('INFO', "User provided new credentials, attempting connection...");
             
             # First authenticate with API
             $self->{api} = ProxmoxAPI->new(
@@ -2324,7 +2178,6 @@ sub authenticate {
                 $result->{token_secret},
             );
             
-            main::log_message('INFO', "API authentication successful, saving credentials...");
             
             # Then save credentials
             CredentialManager::save_credentials(
@@ -2340,14 +2193,12 @@ sub authenticate {
             }
             
             my $file_size = -s $main::CREDENTIALS_FILE;
-            main::log_message('INFO', "Credentials file created, size: $file_size bytes");
             
             if ($file_size == 0) {
                 die "Credentials file is empty";
             }
             
             # Try to read it back immediately to verify it works
-            main::log_message('DEBUG', "Verifying credentials can be decrypted...");
             my $verify_creds = CredentialManager::load_credentials($result->{master});
             
             unless ($verify_creds) {
@@ -2358,7 +2209,6 @@ sub authenticate {
                 die "Credential verification failed - host mismatch";
             }
             
-            main::log_message('INFO', "Credentials verified successfully");
             
             $self->{root}->messageBox(
                 -title => "Success",
@@ -2370,20 +2220,16 @@ sub authenticate {
             $self->{status_label}->configure(-text => "Connected to $result->{host}");
             $self->{ssl_label}->configure(-text => "SSL: " . $self->{api}->{ssl_status});
             $self->{connection_healthy} = 1;
-            main::log_message('INFO', "Successfully set up connection to $result->{host}");
-            main::log_message('INFO', "=== Authentication with new credentials successful ===");
             $auth_result = 1;
             return;  # Exit eval successfully
         }
         
-        main::log_message('INFO', "User cancelled credential setup");
         $auth_result = 0;
         return;  # Exit eval - user cancelled
     };
     
     # Handle Tk exit specially - this is normal when dialogs close
     if ($@ && $@ =~ /_TK_EXIT_/) {
-        main::log_message('DEBUG', "Tk window exit detected, checking auth result");
         return $auth_result;
     }
     
@@ -2654,7 +2500,6 @@ sub format_bytes {
         $bytes_val = 0 + $bytes_val;  # Force numeric
         
         if ($bytes_val < 0) {
-            main::log_message('DEBUG', "format_bytes: negative value $bytes_val, returning N/A");
             return 'N/A';
         }
         
@@ -2774,7 +2619,6 @@ sub fetch_single_vm_data {
     };
     
     if ($@) {
-        main::log_message('DEBUG', "Error parsing disk size for $vm_type $vmid: $@");
     }
     
     # Free disk - only if running
@@ -2825,7 +2669,6 @@ sub fetch_single_vm_data {
                 };
                 
                 if ($@) {
-                    main::log_message('DEBUG', "Guest agent not available for VM $vmid: $@");
                 }
                 
                 # Fallback to status if guest agent fails or returns no data
@@ -2847,7 +2690,6 @@ sub fetch_single_vm_data {
                     };
                     
                     if ($@) {
-                        main::log_message('DEBUG', "Status API failed for VM $vmid: $@");
                     }
                 }
             } else {
@@ -2868,7 +2710,6 @@ sub fetch_single_vm_data {
                 };
                 
                 if ($@) {
-                    main::log_message('DEBUG', "Status API failed for CT $vmid: $@");
                 }
             }
         }
@@ -2880,7 +2721,6 @@ sub fetch_single_vm_data {
         };
         
         if ($@) {
-            main::log_message('DEBUG', "Error parsing sockets/cpu for $vm_type $vmid: $@");
         }
         
         # Return VM data
@@ -2907,7 +2747,7 @@ sub refresh_data_async {
     return if $self->{is_loading};
     
     unless ($self->{api}) {
-        $self->{status_label}->configure(-text => "Not connected - waiting for credentials");
+        $self->{status_label}->configure(-text => "Not connected");
         $self->{connection_label}->configure(-text => "Disconnected", -foreground => '#e74c3c');
         $self->update_led_color($self->{connection_led}, '#e74c3c');
         return;
@@ -2916,385 +2756,74 @@ sub refresh_data_async {
     $self->{is_loading} = 1;
     $self->{status_label}->configure(-text => "Fetching data...");
     
-    my $host = $self->{api}->{host};
-    my $token_id = $self->{api}->{token_id};
-    my $token_secret = $self->{api}->{token_secret};
-    my $temp_file = "/tmp/proxmox_dashboard_refresh_$$.json";
+    # Fetch data immediately (blocks briefly but necessary)
+    my @vm_data;
+    my $error;
     
-    # Spawn worker thread
-    my $worker = threads->create(sub {
-        my $result_data;
-        my $error;
+    eval {
+        my $nodes = $self->{api}->get('/nodes');
         
-        eval {
-            my $thread_api = ProxmoxAPI->new($host, $token_id, $token_secret);
-            my @vm_data;
-            my $nodes = $thread_api->get('/nodes');
-            
-            die "Failed to get nodes list" unless ($nodes && ref($nodes) eq 'ARRAY');
+        if ($nodes && ref($nodes) eq 'ARRAY') {
+            $self->{node_count} = scalar(@$nodes);
+            $self->{node_label}->configure(-text => "Nodes: $self->{node_count}");
             
             foreach my $node (@$nodes) {
                 my $n = $node->{node};
                 
-                my $vms = $thread_api->get("/nodes/$n/qemu");
+                # Get VMs
+                my $vms = $self->{api}->get("/nodes/$n/qemu");
                 if ($vms && ref($vms) eq 'ARRAY') {
                     foreach my $vm (@$vms) {
-                        my $vm_data = fetch_single_vm_data_threaded($thread_api, $node, $vm, 'VM');
+                        my $vm_data = $self->fetch_single_vm_data($node, $vm, 'VM');
                         push @vm_data, $vm_data if $vm_data;
                     }
                 }
                 
-                my $cts = $thread_api->get("/nodes/$n/lxc");
+                # Get containers
+                my $cts = $self->{api}->get("/nodes/$n/lxc");
                 if ($cts && ref($cts) eq 'ARRAY') {
                     foreach my $ct (@$cts) {
-                        my $ct_data = fetch_single_vm_data_threaded($thread_api, $node, $ct, 'CT');
+                        my $ct_data = $self->fetch_single_vm_data($node, $ct, 'CT');
                         push @vm_data, $ct_data if $ct_data;
                     }
                 }
             }
-            
-            $result_data = \@vm_data;
-        };
-        
-        if ($@) {
-            $error = "$@";
-        }
-        
-        # Write result with proper flushing
-        open(my $fh, '>', $temp_file) or die "Cannot write to $temp_file: $!";
-        print $fh JSON::encode_json({
-            success => !$error,
-            data => $result_data,
-            error => $error,
-        });
-        close($fh);
-    });
-    
-    $worker->detach();
-    
-    # Poll for results
-    my $check_count = 0;
-    my $max_checks = 300;
-    
-    $self->{poll_timer} = $self->{root}->repeat(100, sub {
-        $check_count++;
-        
-        if (-e $temp_file && -s $temp_file) {
-            $self->{poll_timer}->cancel() if $self->{poll_timer};
-            $self->{is_loading} = 0;
-            
-            eval {
-                sleep(0.05); # Brief delay to ensure file is fully written
-                open(my $fh, '<', $temp_file) or die "Cannot read $temp_file: $!";
-                my $json = do { local $/; <$fh> };
-                close($fh);
-                
-                my $result = JSON::decode_json($json);
-                
-                if ($result->{success}) {
-                    $self->{vm_data} = $result->{data};
-                    $self->filter_vms();
-                    
-                    my $now = main::strftime("%H:%M:%S", localtime);
-                    if ($self->{auto_refresh}) {
-                        my $refresh_rate = $self->{refresh_rate};
-                        $self->{last_update_label}->configure(
-                            -text => "LIVE - Updated: $now (every ${refresh_rate}s)"
-                        );
-                    } else {
-                        $self->{last_update_label}->configure(-text => "Updated: $now (paused)");
-                    }
-                    
-                    $self->{connection_label}->configure(-text => "Connected", -foreground => '#27ae60');
-                    $self->update_led_color($self->{connection_led}, '#27ae60');
-                    
-                    $self->{root}->after(100, sub { $self->update_node_temperatures_async(); });
-                } else {
-                    my $error = $result->{error} || "Unknown error";
-                    $self->{status_label}->configure(-text => "Error: $error");
-                    $self->{connection_label}->configure(-text => "Error", -foreground => '#e74c3c');
-                    $self->update_led_color($self->{connection_led}, '#e74c3c');
-                }
-                
-                unlink($temp_file);
-            };
-            
-            if ($@) {
-                $self->{status_label}->configure(-text => "Error processing data: $@");
-                unlink($temp_file) if -e $temp_file;
-            }
-        } elsif ($check_count >= $max_checks) {
-            $self->{poll_timer}->cancel() if $self->{poll_timer};
-            $self->{is_loading} = 0;
-            $self->{status_label}->configure(-text => "Timeout - data fetch took too long");
-            unlink($temp_file) if -e $temp_file;
-        }
-    });
-}
-
-sub fetch_single_vm_data_threaded {
-    my ($api, $node, $vm, $vm_type) = @_;
-    
-    my $n = $node->{node};
-    my $endpoint = $vm_type eq 'VM' ? 'qemu' : 'lxc';
-    my $vmid = $vm->{vmid};
-    
-    # Initialize with defaults
-    my $cores = 'N/A';
-    my $memory = 'N/A';
-    my $total_disk = 'N/A';
-    my $sockets = 'N/A';
-    my $cpu_type = 'N/A';
-    
-    # Get config
-    my $cfg;
-    eval {
-        $cfg = $api->get("/nodes/$n/$endpoint/$vmid/config");
-    };
-    
-    return undef if $@ || !$cfg;
-    
-    # Extract cores
-    eval { $cores = $cfg->{cores} || 'N/A'; };
-    
-    # Memory
-    eval {
-        if ($vm_type eq 'VM') {
-            my $memory_val = $cfg->{memory} || 0;
-            $memory_val = int($memory_val) if $memory_val;
-            
-            if (exists $cfg->{balloon}) {
-                my $balloon_val = int($cfg->{balloon} || $memory_val);
-                my $minmem = int($balloon_val);
-                my $maxmem = int($memory_val);
-                
-                if ($minmem > 0 && $maxmem > 0) {
-                    my $minmem_str = format_bytes_simple($minmem * 1024 * 1024);
-                    my $maxmem_str = format_bytes_simple($maxmem * 1024 * 1024);
-                    $memory = "$minmem_str-$maxmem_str";
-                } else {
-                    $memory = $memory_val ? format_bytes_simple($memory_val * 1024 * 1024) : 'N/A';
-                }
-            } else {
-                $memory = $memory_val ? format_bytes_simple($memory_val * 1024 * 1024) : 'N/A';
-            }
         } else {
-            my $memory_mb = int($cfg->{memory} || 0);
-            my $swap_mb = int($cfg->{swap} || 0);
-            
-            if ($memory_mb > 0) {
-                my $mem_str = format_bytes_simple($memory_mb * 1024 * 1024);
-                if ($swap_mb > 0) {
-                    my $swap_str = format_bytes_simple($swap_mb * 1024 * 1024);
-                    $memory = "$mem_str+$swap_str";
-                } else {
-                    $memory = $mem_str;
-                }
-            }
+            die "Failed to get nodes list";
         }
-    };
-    
-    # Disk size
-    eval {
-        if ($vm_type eq 'VM') {
-            foreach my $key (keys %$cfg) {
-                if ($key =~ /^(scsi|virtio|sata|ide)\d+$/) {
-                    my $disk_str = $cfg->{$key};
-                    if ($disk_str =~ /size=(\d+)([KMGT]?)/) {
-                        my ($size, $unit) = ($1, $2 || '');
-                        my $bytes = $size;
-                        $bytes *= 1024 if $unit eq 'K';
-                        $bytes *= 1024 * 1024 if $unit eq 'M';
-                        $bytes *= 1024 * 1024 * 1024 if $unit eq 'G';
-                        $bytes *= 1024 * 1024 * 1024 * 1024 if $unit eq 'T';
-                        $total_disk = format_bytes_simple($bytes);
-                        last;
-                    }
-                }
-            }
-        } else {
-            if (exists $cfg->{rootfs}) {
-                my $rootfs = $cfg->{rootfs};
-                if ($rootfs =~ /size=(\d+)([KMGT]?)/) {
-                    my ($size, $unit) = ($1, $2 || 'G');
-                    my $bytes = $size;
-                    $bytes *= 1024 if $unit eq 'K';
-                    $bytes *= 1024 * 1024 if $unit eq 'M';
-                    $bytes *= 1024 * 1024 * 1024 if $unit eq 'G';
-                    $bytes *= 1024 * 1024 * 1024 * 1024 if $unit eq 'T';
-                    $total_disk = format_bytes_simple($bytes);
-                }
-            }
-        }
-    };
-    
-    # Sockets and CPU type
-    eval {
-        if ($vm_type eq 'VM') {
-            $sockets = $cfg->{sockets} || 1;
-            $cpu_type = $cfg->{cpu} || 'N/A';
-            $cpu_type = 'host' if $cpu_type eq 'host';
-        } else {
-            $sockets = 1;
-            $cpu_type = 'N/A';
-        }
-    };
-    
-    # Filesystem info - only if running
-    my ($free_disk, $free_pct, $total_fs) = ('N/A', 'N/A', 'N/A');
-    
-    if ($vm->{status} eq 'running') {
-        if ($vm_type eq 'VM') {
-            # Try status API first for VMs
-            eval {
-                my $stat = $api->get("/nodes/$n/qemu/$vmid/status/current");
-                my $disk_used = $stat->{disk} || 0;
-                my $disk_max = $stat->{maxdisk} || 0;
-                
-                if ($disk_max > 0 && $disk_used >= 0) {
-                    $total_fs = format_bytes_simple($disk_max);
-                    my $free_bytes = $disk_max - $disk_used;
-                    if ($free_bytes >= 0) {
-                        $free_disk = format_bytes_simple($free_bytes);
-                        $free_pct = sprintf("%.1f%%", ($free_bytes / $disk_max * 100));
-                    }
-                }
-            };
-        } else {
-            # CT - use status API
-            eval {
-                my $stat = $api->get("/nodes/$n/lxc/$vmid/status/current");
-                my $disk_used = $stat->{disk} || 0;
-                my $disk_max = $stat->{maxdisk} || 0;
-                
-                if ($disk_max > 0 && $disk_used >= 0) {
-                    $total_fs = format_bytes_simple($disk_max);
-                    my $free_bytes = $disk_max - $disk_used;
-                    if ($free_bytes >= 0) {
-                        $free_disk = format_bytes_simple($free_bytes);
-                        $free_pct = sprintf("%.1f%%", ($free_bytes / $disk_max * 100));
-                    }
-                }
-            };
-        }
-    }
-    
-    return {
-        id => $vmid,
-        type => $vm_type,
-        status => $vm->{status} || 'unknown',
-        name => $vm->{name} || "VM $vmid",
-        node => $n,
-        cores => $cores,
-        sockets => $sockets,
-        cpu => $cpu_type,
-        memory => $memory,
-        disk => $total_disk,
-        total_fs => $total_fs,
-        free_disk => $free_disk,
-        free_pct => $free_pct,
-    };
-}
-
-sub format_bytes_simple {
-    my ($bytes_val) = @_;
-    
-    return 'N/A' unless defined $bytes_val && $bytes_val ne 'N/A';
-    
-    eval {
-        $bytes_val = 0 + $bytes_val;
-        return 'N/A' if $bytes_val < 0;
-        
-        my @units = ('B', 'KiB', 'MiB', 'GiB', 'TiB', 'PiB');
-        
-        foreach my $unit (@units) {
-            if ($bytes_val < 1024 || $unit eq 'PiB') {
-                return sprintf("%.1f %s", $bytes_val, $unit);
-            }
-            $bytes_val /= 1024;
-        }
-    };
-    
-    return 'N/A';
-}
-
-sub _fetch_vm_data_serial {
-    my ($self) = @_;
-    
-    my @vm_data;
-    
-    my $nodes;
-    eval {
-        $nodes = $self->{api}->get('/nodes');
     };
     
     if ($@) {
-        main::log_message('ERROR', "Failed to get nodes list: $@");
-        die "Failed to get nodes list: $@";
+        $error = $@;
     }
     
-    # Validate that $nodes is an array reference
-    unless (ref($nodes) eq 'ARRAY') {
-        my $type = ref($nodes) || 'scalar';
-        main::log_message('ERROR', "Expected array ref from /nodes, got $type");
-        main::log_message('ERROR', "Nodes data: " . (defined $nodes ? substr("$nodes", 0, 200) : 'undef'));
-        die "API /nodes did not return an array (got $type)";
-    }
+    $self->{is_loading} = 0;
     
-    $self->{node_count} = scalar(@$nodes);
-    
-    # Update node count
-    $self->{node_label}->configure(-text => "Nodes: $self->{node_count}");
-    
-    foreach my $node (@$nodes) {
-        my $n = $node->{node};
+    if ($error) {
+        $self->{status_label}->configure(-text => "Error: $error");
+        $self->{connection_label}->configure(-text => "Error", -foreground => '#e74c3c');
+        $self->update_led_color($self->{connection_led}, '#e74c3c');
+    } else {
+        $self->{vm_data} = \@vm_data;
+        $self->filter_vms();
         
-        # Get VMs
-        eval {
-            my $vms = $self->{api}->get("/nodes/$n/qemu");
-            
-            # Validate VMs is an array ref
-            unless (ref($vms) eq 'ARRAY') {
-                my $type = ref($vms) || 'scalar';
-                main::log_message('WARNING', "Expected array ref from /nodes/$n/qemu, got $type - skipping");
-                $vms = [];  # Use empty array
-            }
-            
-            foreach my $vm (@$vms) {
-                my $vm_info = $self->fetch_single_vm_data($node, $vm, 'VM');
-                push @vm_data, $vm_info if $vm_info;
-            }
-        };
-        
-        if ($@) {
-            main::log_message('ERROR', "Error getting VMs from node $n: $@");
+        my $now = main::strftime("%H:%M:%S", localtime);
+        if ($self->{auto_refresh}) {
+            my $refresh_rate = $self->{refresh_rate};
+            $self->{last_update_label}->configure(-text => "LIVE - Updated: $now (every ${refresh_rate}s)");
+        } else {
+            $self->{last_update_label}->configure(-text => "Updated: $now (paused)");
         }
         
-        # Get CTs
-        eval {
-            my $cts = $self->{api}->get("/nodes/$n/lxc");
-            
-            # Validate CTs is an array ref
-            unless (ref($cts) eq 'ARRAY') {
-                my $type = ref($cts) || 'scalar';
-                main::log_message('WARNING', "Expected array ref from /nodes/$n/lxc, got $type - skipping");
-                $cts = [];  # Use empty array
-            }
-            
-            foreach my $ct (@$cts) {
-                my $ct_info = $self->fetch_single_vm_data($node, $ct, 'CT');
-                push @vm_data, $ct_info if $ct_info;
-            }
-        };
+        $self->{connection_label}->configure(-text => "Connected", -foreground => '#27ae60');
+        $self->update_led_color($self->{connection_led}, '#27ae60');
         
-        if ($@) {
-            main::log_message('ERROR', "Error getting CTs from node $n: $@");
-        }
+        # Update temperatures
+        $self->update_node_temperatures();
     }
-    
-    @vm_data = sort { $a->{id} <=> $b->{id} } @vm_data;
-    
-    return \@vm_data;
+}
+
+    return 'N/A';
 }
 
 sub get_selected_vm {
@@ -3330,81 +2859,25 @@ sub start_selected {
     return unless $vm;
     
     $self->{status_label}->configure(-text => "Starting $vm->{type} $vm->{id}...");
+    $self->{root}->update();
     
-    # Get API credentials for thread
-    my $host = $self->{api}->{host};
-    my $token_id = $self->{api}->{token_id};
-    my $token_secret = $self->{api}->{token_secret};
-    my $vm_node = $vm->{node};
-    my $vm_id = $vm->{id};
-    my $vm_type = $vm->{type};
-    my $vm_name = $vm->{name};
-    
-    # Use temp file for communication
-    my $temp_file = "/tmp/proxmox_dashboard_start_$$.json";
-    
-    # Spawn thread for action
-    my $worker = threads->create(sub {
-        my $result = { success => 0, error => undef };
+    $self->{root}->after(50, sub {
         eval {
-            my $api = ProxmoxAPI->new($host, $token_id, $token_secret);
-            my $endpoint = $vm_type eq 'VM' ? 'qemu' : 'lxc';
-            $api->post("/nodes/$vm_node/$endpoint/$vm_id/status/start");
-            $result->{success} = 1;
+            my $endpoint = $vm->{type} eq 'VM' ? 'qemu' : 'lxc';
+            $self->{api}->post("/nodes/$vm->{node}/$endpoint/$vm->{id}/status/start");
+            AuditLogger::log_vm_action("START", $vm->{id}, $vm->{type}, $vm->{name}, 1);
+            $self->{status_label}->configure(-text => "Started $vm->{type} $vm->{id} ($vm->{name})");
+            $self->{root}->after(2000, sub { $self->refresh_data_async() });
         };
+        
         if ($@) {
-            $result->{error} = "$@";
-        }
-        
-        open(my $fh, '>', $temp_file);
-        print $fh JSON::encode_json($result);
-        close($fh);
-    });
-    
-    $worker->detach();
-    
-    # Poll for result
-    my $check_count = 0;
-    my $check_timer;
-    $check_timer = $self->{root}->repeat(100, sub {
-        $check_count++;
-        
-        if (-e $temp_file) {
-            $check_timer->cancel();
-            
-            eval {
-                open(my $fh, '<', $temp_file);
-                my $json = do { local $/; <$fh> };
-                close($fh);
-                my $result = JSON::decode_json($json);
-                
-                if ($result->{success}) {
-                    AuditLogger::log_vm_action("START", $vm_id, $vm_type, $vm_name, 1);
-                    $self->{status_label}->configure(-text => "Started $vm_type $vm_id ($vm_name)");
-                    $self->{root}->after(2000, sub { $self->refresh_data_async() });
-                } else {
-                    my $error = $result->{error};
-                    AuditLogger::log_vm_action("START", $vm_id, $vm_type, $vm_name, 0, $error);
-                    $self->{root}->messageBox(
-                        -title => "Error",
-                        -message => "Failed to start:\n$error",
-                        -type => 'OK',
-                        -icon => 'error',
-                    );
-                }
-                
-                unlink($temp_file);
-            };
-            
-            if ($@) {
-                main::log_message('ERROR', "Failed to process start result: $@");
-                unlink($temp_file) if -e $temp_file;
-            }
-        } elsif ($check_count >= 100) {
-            # 10 second timeout
-            $check_timer->cancel();
-            $self->{status_label}->configure(-text => "Start operation timeout");
-            unlink($temp_file) if -e $temp_file;
+            AuditLogger::log_vm_action("START", $vm->{id}, $vm->{type}, $vm->{name}, 0, $@);
+            $self->{root}->messageBox(
+                -title => "Error",
+                -message => "Failed to start:\n$@",
+                -type => 'OK',
+                -icon => 'error',
+            );
         }
     });
 }
@@ -3425,81 +2898,25 @@ sub stop_selected {
     return unless $response eq 'Yes';
     
     $self->{status_label}->configure(-text => "Stopping $vm->{type} $vm->{id}...");
+    $self->{root}->update();
     
-    # Get API credentials for thread
-    my $host = $self->{api}->{host};
-    my $token_id = $self->{api}->{token_id};
-    my $token_secret = $self->{api}->{token_secret};
-    my $vm_node = $vm->{node};
-    my $vm_id = $vm->{id};
-    my $vm_type = $vm->{type};
-    my $vm_name = $vm->{name};
-    
-    # Use temp file for communication
-    my $temp_file = "/tmp/proxmox_dashboard_stop_$$.json";
-    
-    # Spawn thread for action
-    my $worker = threads->create(sub {
-        my $result = { success => 0, error => undef };
+    $self->{root}->after(50, sub {
         eval {
-            my $api = ProxmoxAPI->new($host, $token_id, $token_secret);
-            my $endpoint = $vm_type eq 'VM' ? 'qemu' : 'lxc';
-            $api->post("/nodes/$vm_node/$endpoint/$vm_id/status/stop");
-            $result->{success} = 1;
+            my $endpoint = $vm->{type} eq 'VM' ? 'qemu' : 'lxc';
+            $self->{api}->post("/nodes/$vm->{node}/$endpoint/$vm->{id}/status/stop");
+            AuditLogger::log_vm_action("STOP", $vm->{id}, $vm->{type}, $vm->{name}, 1);
+            $self->{status_label}->configure(-text => "Stopped $vm->{type} $vm->{id} ($vm->{name})");
+            $self->{root}->after(2000, sub { $self->refresh_data_async() });
         };
+        
         if ($@) {
-            $result->{error} = "$@";
-        }
-        
-        open(my $fh, '>', $temp_file);
-        print $fh JSON::encode_json($result);
-        close($fh);
-    });
-    
-    $worker->detach();
-    
-    # Poll for result
-    my $check_count = 0;
-    my $check_timer;
-    $check_timer = $self->{root}->repeat(100, sub {
-        $check_count++;
-        
-        if (-e $temp_file) {
-            $check_timer->cancel();
-            
-            eval {
-                open(my $fh, '<', $temp_file);
-                my $json = do { local $/; <$fh> };
-                close($fh);
-                my $result = JSON::decode_json($json);
-                
-                if ($result->{success}) {
-                    AuditLogger::log_vm_action("STOP", $vm_id, $vm_type, $vm_name, 1);
-                    $self->{status_label}->configure(-text => "Stopped $vm_type $vm_id ($vm_name)");
-                    $self->{root}->after(2000, sub { $self->refresh_data_async() });
-                } else {
-                    my $error = $result->{error};
-                    AuditLogger::log_vm_action("STOP", $vm_id, $vm_type, $vm_name, 0, $error);
-                    $self->{root}->messageBox(
-                        -title => "Error",
-                        -message => "Failed to stop:\n$error",
-                        -type => 'OK',
-                        -icon => 'error',
-                    );
-                }
-                
-                unlink($temp_file);
-            };
-            
-            if ($@) {
-                main::log_message('ERROR', "Failed to process stop result: $@");
-                unlink($temp_file) if -e $temp_file;
-            }
-        } elsif ($check_count >= 100) {
-            # 10 second timeout
-            $check_timer->cancel();
-            $self->{status_label}->configure(-text => "Stop operation timeout");
-            unlink($temp_file) if -e $temp_file;
+            AuditLogger::log_vm_action("STOP", $vm->{id}, $vm->{type}, $vm->{name}, 0, $@);
+            $self->{root}->messageBox(
+                -title => "Error",
+                -message => "Failed to stop:\n$@",
+                -type => 'OK',
+                -icon => 'error',
+            );
         }
     });
 }
@@ -3523,15 +2940,12 @@ sub change_credentials {
     eval {
         if (-e $main::CREDENTIALS_FILE) {
             unlink $main::CREDENTIALS_FILE;
-            main::log_message('INFO', "Old credentials file deleted");
         }
     };
     
     if ($@ && $@ =~ /_TK_EXIT_/) {
         # Tk window exit during deletion dialog - check if deletion succeeded
-        main::log_message('DEBUG', "Tk window exit during credential deletion");
         if (! -e $main::CREDENTIALS_FILE) {
-            main::log_message('INFO', "Credentials deleted successfully despite Tk exit");
             $@ = undef;  # Clear the error
         }
     }
@@ -3608,7 +3022,6 @@ sub change_credentials {
             $self->{status_label}->configure(-text => "Connected to $result->{host}");
             $self->{ssl_label}->configure(-text => "SSL: " . $self->{api}->{ssl_status});
             $self->{connection_healthy} = 1;
-            main::log_message('INFO', "Successfully changed credentials to $result->{host}");
             
             # Re-enable auto-refresh
             $self->{auto_refresh} = 1;
@@ -3622,9 +3035,7 @@ sub change_credentials {
         
         if ($@ && $@ =~ /_TK_EXIT_/) {
             # Tk window exit - ignore this, check if we succeeded
-            main::log_message('DEBUG', "Tk window exit detected in credential change");
             if ($self->{api} && $self->{connection_healthy}) {
-                main::log_message('INFO', "Credential change completed successfully despite Tk exit");
                 return;
             }
         }
@@ -3641,7 +3052,6 @@ sub change_credentials {
             $self->{root}->destroy();
         }
     } else {
-        main::log_message('WARNING', "User cancelled credential change");
         $self->{root}->messageBox(
             -title => "Cancelled",
             -message => "Credential change cancelled.\n\nYour old credentials were already deleted.\nYou'll need to restart the dashboard and set up credentials to continue.",
@@ -3678,25 +3088,15 @@ sub start_all_stopped {
     
     my $count = scalar(@stopped);
     $self->{status_label}->configure(-text => "Starting $count VMs/CTs...");
+    $self->{root}->update();
     
-    # Get API credentials for thread
-    my $host = $self->{api}->{host};
-    my $token_id = $self->{api}->{token_id};
-    my $token_secret = $self->{api}->{token_secret};
-    my @stopped_copy = @stopped;  # Copy for thread
-    
-    # Use temp file for communication
-    my $temp_file = "/tmp/proxmox_dashboard_startall_$$.json";
-    
-    # Spawn thread for bulk action
-    my $worker = threads->create(sub {
+    $self->{root}->after(50, sub {
         my $success_count = 0;
-        my $api = ProxmoxAPI->new($host, $token_id, $token_secret);
         
-        foreach my $vm (@stopped_copy) {
+        foreach my $vm (@stopped) {
             eval {
                 my $endpoint = $vm->{type} eq 'VM' ? 'qemu' : 'lxc';
-                $api->post("/nodes/$vm->{node}/$endpoint/$vm->{id}/status/start");
+                $self->{api}->post("/nodes/$vm->{node}/$endpoint/$vm->{id}/status/start");
                 AuditLogger::log_vm_action("START_ALL", $vm->{id}, $vm->{type}, $vm->{name}, 1);
                 $success_count++;
             };
@@ -3706,46 +3106,8 @@ sub start_all_stopped {
             }
         }
         
-        open(my $fh, '>', $temp_file);
-        print $fh JSON::encode_json({ success_count => $success_count, total => scalar(@stopped_copy) });
-        close($fh);
-    });
-    
-    $worker->detach();
-    
-    # Poll for result
-    my $check_count = 0;
-    my $check_timer;
-    $check_timer = $self->{root}->repeat(100, sub {
-        $check_count++;
-        
-        if (-e $temp_file) {
-            $check_timer->cancel();
-            
-            eval {
-                open(my $fh, '<', $temp_file);
-                my $json = do { local $/; <$fh> };
-                close($fh);
-                my $result = JSON::decode_json($json);
-                
-                $self->{status_label}->configure(
-                    -text => "Started $result->{success_count}/$result->{total} VMs/CTs"
-                );
-                $self->{root}->after(3000, sub { $self->refresh_data_async() });
-                
-                unlink($temp_file);
-            };
-            
-            if ($@) {
-                main::log_message('ERROR', "Failed to process start all result: $@");
-                unlink($temp_file) if -e $temp_file;
-            }
-        } elsif ($check_count >= 300) {
-            # 30 second timeout
-            $check_timer->cancel();
-            $self->{status_label}->configure(-text => "Start all operation timeout");
-            unlink($temp_file) if -e $temp_file;
-        }
+        $self->{status_label}->configure(-text => "Started $success_count/$count VMs/CTs");
+        $self->{root}->after(3000, sub { $self->refresh_data_async() });
     });
 }
 
@@ -3765,7 +3127,6 @@ sub toggle_auto_refresh {
         );
         $self->update_led_color($self->{live_led}, '#27ae60');
         $self->{status_label}->configure(-text => "Live feed enabled");
-        main::log_message('INFO', "Live feed enabled");
     } else {
         $self->{pause_resume_btn}->configure(
             -text => "Resume Live",
@@ -3777,7 +3138,6 @@ sub toggle_auto_refresh {
         );
         $self->update_led_color($self->{live_led}, '#95a5a6');
         $self->{status_label}->configure(-text => "Live feed paused");
-        main::log_message('INFO', "Live feed paused");
     }
 }
 
@@ -3785,7 +3145,6 @@ sub update_refresh_rate {
     my ($self) = @_;
     
     my $new_rate = $self->{refresh_rate};
-    main::log_message('INFO', "Refresh rate changed to $new_rate seconds");
     $self->{status_label}->configure(-text => "Update interval set to ${new_rate}s");
 }
 
@@ -3801,40 +3160,12 @@ sub start_auto_refresh {
         }
     });
     
-    main::log_message('INFO', "Live feed started with $main::REFRESH_INTERVAL" . "s refresh rate");
 }
 
 sub on_closing {
     my ($self) = @_;
     
     $self->{auto_refresh} = 0;
-    
-    if ($self->{poll_timer}) {
-        eval { $self->{poll_timer}->cancel(); };
-    }
-    if ($self->{temp_poll_timer}) {
-        eval { $self->{temp_poll_timer}->cancel(); };
-    }
-    
-    $self->{is_loading} = 1;
-    $self->{temp_loading} = 1;
-    
-    sleep(0.3);
-    
-    # Clean up temp files
-    eval {
-        my $pid = $$;
-        foreach my $file (
-            "/tmp/proxmox_dashboard_refresh_${pid}.json",
-            "/tmp/proxmox_dashboard_temp_${pid}.json",
-            "/tmp/proxmox_dashboard_start_${pid}.json",
-            "/tmp/proxmox_dashboard_stop_${pid}.json",
-            "/tmp/proxmox_dashboard_startall_${pid}.json",
-        ) {
-            unlink($file) if -e $file;
-        }
-    };
-    
     $self->{root}->destroy();
 }
 
