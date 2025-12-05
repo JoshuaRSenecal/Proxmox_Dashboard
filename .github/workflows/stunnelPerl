@@ -188,6 +188,13 @@ sub _api_request {
     my ($self, $method, $path, $retries, %params) = @_;
     $retries = $main::MAX_RETRIES unless defined $retries;
     
+    # Error handling strategy:
+    # - Operational errors (VM stopped, guest agent not running): fail immediately, no retry, no ERROR log
+    # - Authentication errors: fail immediately, no retry
+    # - Server errors (5xx): retry with exponential backoff
+    # - Client errors (4xx): fail immediately, no retry
+    # - Network errors: retry with exponential backoff
+    
     my $last_error;
     my $result;
     
@@ -273,6 +280,13 @@ sub _api_request {
         $last_error = $@;
         
         if ($last_error) {
+            # Check if this is an operational error (expected conditions)
+            if ($last_error =~ /Operational condition:|guest agent|QEMU.*agent/i) {
+                # This is expected (VM stopped, agent not running, etc.)
+                # Don't log as ERROR, don't retry, just fail silently
+                die $last_error;
+            }
+            
             if ($last_error =~ /Authentication failed/) {
                 die $last_error;  # Don't retry auth failures
             }
@@ -2694,8 +2708,12 @@ sub fetch_single_vm_data {
                 };
                 
                 if ($@) {
-        main::log_message('ERROR', "Failed to get guest agent fsinfo for $vm_type $vmid: $@");
-    }
+                    # Guest agent errors are expected when agent is not installed/running
+                    # Only log if it's a different error
+                    unless ($@ =~ /guest agent|QEMU.*agent/) {
+                        main::log_message('ERROR', "Failed to get guest agent fsinfo for $vm_type $vmid: $@");
+                    }
+                }
                 
                 # Fallback to status if guest agent fails or returns no data
                 if ($total_fs eq 'N/A') {
@@ -2716,7 +2734,10 @@ sub fetch_single_vm_data {
                     };
                     
                     if ($@) {
-                        main::log_message('ERROR', "Failed to get status for VM $vmid: $@");
+                        # Only log if it's not a common operational error
+                        unless ($@ =~ /stopped|not running/i) {
+                            main::log_message('ERROR', "Failed to get status for VM $vmid: $@");
+                        }
                     }
                 }
             } else {
@@ -2737,7 +2758,10 @@ sub fetch_single_vm_data {
                 };
                 
                 if ($@) {
-                    main::log_message('ERROR', "Failed to get status for CT $vmid: $@");
+                    # Only log if it's not a common operational error
+                    unless ($@ =~ /stopped|not running/i) {
+                        main::log_message('ERROR', "Failed to get status for CT $vmid: $@");
+                    }
                 }
             }
         }
