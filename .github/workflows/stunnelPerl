@@ -1153,6 +1153,8 @@ sub get_all_node_temperatures {
     
     return {} unless $self->{api};
     
+    main::log_message('ERROR', "TEMP DEBUG: Starting temperature fetch");
+    
     my %node_temps;
     
     eval {
@@ -1161,22 +1163,28 @@ sub get_all_node_temperatures {
         # Validate that nodes is an array ref
         unless (ref($nodes) eq 'ARRAY') {
             my $type = ref($nodes) || 'scalar';
+            main::log_message('ERROR', "TEMP DEBUG: /nodes returned non-array: $type");
             return {};  # Return empty hash
         }
         
+        main::log_message('ERROR', "TEMP DEBUG: Got " . scalar(@$nodes) . " nodes");
         
         # For single-node setups, use the API host
         foreach my $node (@$nodes) {
             my $node_name = $node->{node};
             $self->{node_addresses}->{$node_name} = $self->{api}->{host};
+            main::log_message('ERROR', "TEMP DEBUG: Node $node_name will use API host: " . $self->{api}->{host});
         }
         
         # Check each node
         foreach my $node (@$nodes) {
             my $node_name = $node->{node};
             
+            main::log_message('ERROR', "TEMP DEBUG: Checking temperature for node: $node_name");
+            
             if (exists $self->{node_temp_api_available}->{$node_name} && 
                 !$self->{node_temp_api_available}->{$node_name}) {
+                main::log_message('ERROR', "TEMP DEBUG: Node $node_name previously marked as unavailable, skipping");
                 $node_temps{$node_name} = {
                     status => 'not_installed',
                     sensors => [],
@@ -1187,9 +1195,13 @@ sub get_all_node_temperatures {
             my $result = $self->_get_node_temperature_direct($node_name, 1.5);
             
             if ($result && $result->{status} eq 'ok') {
+                main::log_message('ERROR', "TEMP DEBUG: Node $node_name temperature fetch SUCCESS - " . 
+                    scalar(@{$result->{sensors} || []}) . " sensors found");
                 $node_temps{$node_name} = $result;
                 $self->{node_temp_api_available}->{$node_name} = 1;
             } else {
+                my $status = $result ? $result->{status} : 'no result';
+                main::log_message('ERROR', "TEMP DEBUG: Node $node_name temperature fetch FAILED - status: $status");
                 $node_temps{$node_name} = $result || { status => 'error', sensors => [] };
                 $self->{node_temp_api_available}->{$node_name} = 0;
             }
@@ -1197,8 +1209,10 @@ sub get_all_node_temperatures {
     };
     
     if ($@) {
-        main::log_message('ERROR', "Failed to get node temperatures: $@");
+        main::log_message('ERROR', "TEMP DEBUG: Failed to get node temperatures: $@");
     }
+    
+    main::log_message('ERROR', "TEMP DEBUG: Returning temperature data for " . scalar(keys %node_temps) . " nodes");
     
     return \%node_temps;
 }
@@ -1212,6 +1226,8 @@ sub _get_node_temperature_direct {
         my $node_ip = $self->{node_addresses}->{$node_name} || $self->{api}->{host};
         my $url = "https://$node_ip:8898/temperature";
         
+        main::log_message('ERROR', "TEMP DEBUG: Fetching from URL: $url");
+        
         my $ua = LWP::UserAgent->new(
             ssl_opts => { verify_hostname => 0, SSL_verify_mode => 0 },
             timeout => $timeout,
@@ -1219,26 +1235,39 @@ sub _get_node_temperature_direct {
         
         my $response = $ua->get($url);
         
+        main::log_message('ERROR', "TEMP DEBUG: HTTP response code: " . $response->code);
+        
         if ($response->is_success) {
             my $content = $response->content;
+            main::log_message('ERROR', "TEMP DEBUG: Response content length: " . length($content));
+            
             my $data = JSON::decode_json($content);
             if ($data && ref($data) eq 'HASH') {
+                main::log_message('ERROR', "TEMP DEBUG: JSON decoded successfully, status=" . ($data->{status} // 'undef'));
+                if ($data->{sensors}) {
+                    main::log_message('ERROR', "TEMP DEBUG: Found " . scalar(@{$data->{sensors}}) . " sensors");
+                }
                 $result = $data;
             } else {
-                main::log_message('ERROR', "Temperature API for $node_name returned non-hash data");
+                main::log_message('ERROR', "TEMP DEBUG: Temperature API returned non-hash data");
             }
         } else {
             # Temperature API not available - this is common and not an error
+            my $code = $response->code;
+            my $message = $response->message;
+            main::log_message('ERROR', "TEMP DEBUG: Temperature API not available - HTTP $code: $message");
+            
             # Only log at first failure
             unless (exists $self->{temp_api_logged}->{$node_name}) {
-                main::log_message('ERROR', "Temperature API not available on $node_name:8898 (HTTP " . $response->code . ")");
+                main::log_message('ERROR', "Temperature API not available on $node_name:8898 (HTTP $code)");
+                main::log_message('ERROR', "This is normal if you haven't installed a temperature monitoring service");
                 $self->{temp_api_logged}->{$node_name} = 1;
             }
         }
     };
     
     if ($@) {
-        main::log_message('ERROR', "Temperature fetch error for $node_name: $@");
+        main::log_message('ERROR', "TEMP DEBUG: Temperature fetch error - $@");
     }
     
     return $result;
@@ -1249,17 +1278,30 @@ sub update_node_temperatures {
     
     return unless $self->{api};
     
+    main::log_message('ERROR', "TEMP DEBUG: update_node_temperatures called");
+    
     my $node_temps = $self->get_all_node_temperatures();
+    
+    main::log_message('ERROR', "TEMP DEBUG: get_all_node_temperatures returned " . 
+        scalar(keys %$node_temps) . " nodes");
+    
     $self->_update_temp_ui($node_temps);
+    
+    main::log_message('ERROR', "TEMP DEBUG: _update_temp_ui completed");
 }
 
 sub _update_temp_ui {
     my ($self, $node_temps) = @_;
     
+    main::log_message('ERROR', "TEMP DEBUG: _update_temp_ui called with " . 
+        scalar(keys %$node_temps) . " nodes");
+    
     $self->{node_temps_full_data} = $node_temps;
     
     # Clear existing temperature labels
     my @children = $self->{node_temp_frame}->children();
+    main::log_message('ERROR', "TEMP DEBUG: Found " . scalar(@children) . " existing widgets in temp frame");
+    
     foreach my $widget (@children) {
         if ($widget->can('cget') && eval { $widget->cget('-text') }) {
             $widget->destroy() if $widget->{is_temp_label};
@@ -1270,7 +1312,10 @@ sub _update_temp_ui {
         my $temp_info = $node_temps->{$node_name};
         my $status = $temp_info->{status};
         
+        main::log_message('ERROR', "TEMP DEBUG: Processing node $node_name with status: $status");
+        
         if ($status ne 'ok') {
+            main::log_message('ERROR', "TEMP DEBUG: Node $node_name status is not 'ok', showing N/A");
             my $label = $self->{node_temp_frame}->Label(
                 -text => "$node_name: N/A",
                 -font => ['Arial', 9, 'bold'],
@@ -1283,6 +1328,8 @@ sub _update_temp_ui {
         }
         
         my $sensors = $temp_info->{sensors} || [];
+        main::log_message('ERROR', "TEMP DEBUG: Node $node_name has " . scalar(@$sensors) . " sensors");
+        
         next unless @$sensors;
         
         # Show only CPU Package or highest core temp
@@ -1291,6 +1338,8 @@ sub _update_temp_ui {
         
         foreach my $sensor (@$sensors) {
             my $sensor_type = $sensor->{type} || 'unknown';
+            main::log_message('ERROR', "TEMP DEBUG: Sensor type=$sensor_type, label=" . 
+                ($sensor->{label} // 'none') . ", temp=" . ($sensor->{temperature} // 'none'));
             
             if ($sensor_type eq 'cpu_package') {
                 $cpu_package = $sensor;
@@ -1303,11 +1352,14 @@ sub _update_temp_ui {
         my $display_sensor = $cpu_package;
         if (!$display_sensor && @cpu_cores) {
             $display_sensor = (sort { $b->{temperature} <=> $a->{temperature} } @cpu_cores)[0];
+            main::log_message('ERROR', "TEMP DEBUG: Using highest core temp: " . $display_sensor->{temperature});
         }
         
         if ($display_sensor) {
             my $temp = $display_sensor->{temperature};
             my $label_text = $display_sensor->{label} || 'CPU';
+            
+            main::log_message('ERROR', "TEMP DEBUG: Creating label for $node_name: ${temp}°C");
             
             if (length($label_text) > 20) {
                 $label_text = substr($label_text, 0, 17) . "...";
@@ -1325,8 +1377,11 @@ sub _update_temp_ui {
             $sensor_label->{is_temp_label} = 1;
             $sensor_label->pack(-side => 'left', -padx => 10);
             
+            main::log_message('ERROR', "TEMP DEBUG: Label created and packed for $node_name");
+            
             $sensor_label->bind('<Button-1>', sub { $self->show_temperature_details($node_name) });
         } else {
+            main::log_message('ERROR', "TEMP DEBUG: No display sensor found for $node_name, showing N/A");
             my $label = $self->{node_temp_frame}->Label(
                 -text => "$node_name: N/A",
                 -font => ['Arial', 9, 'bold'],
@@ -1955,7 +2010,14 @@ sub create_widgets {
         -selectforeground => 'white',
         -indent => 10,
         -font => ['Arial', 11],
+        -gap => 8,  # Add vertical spacing between rows
     )->pack(-fill => 'both', -expand => 1);
+    
+    # Create a centered text style for table cells
+    $self->{centered_style} = $self->{tree}->ItemStyle('text',
+        -anchor => 'center',
+        -font => ['Arial', 11],
+    );
     
     # Configure columns with larger widths to require scrolling
     my @columns = (
@@ -2410,20 +2472,20 @@ sub filter_vms {
             # Add to tree
             my $entry = $self->{tree}->add($vm->{id});
             
-            # Create all items WITHOUT styles first (styles don't work in itemCreate)
-            $self->{tree}->itemCreate($entry, 0, -itemtype => 'text', -text => $vm->{id});
-            $self->{tree}->itemCreate($entry, 1, -itemtype => 'text', -text => $vm->{type});
-            $self->{tree}->itemCreate($entry, 2, -itemtype => 'text', -text => $vm->{status});
-            $self->{tree}->itemCreate($entry, 3, -itemtype => 'text', -text => $vm->{name});
-            $self->{tree}->itemCreate($entry, 4, -itemtype => 'text', -text => $vm->{node});
-            $self->{tree}->itemCreate($entry, 5, -itemtype => 'text', -text => $vm->{cores} || 'N/A');
-            $self->{tree}->itemCreate($entry, 6, -itemtype => 'text', -text => $vm->{sockets} || 'N/A');
-            $self->{tree}->itemCreate($entry, 7, -itemtype => 'text', -text => $vm->{cpu} || 'N/A');
-            $self->{tree}->itemCreate($entry, 8, -itemtype => 'text', -text => $vm->{memory} || 'N/A');
-            $self->{tree}->itemCreate($entry, 9, -itemtype => 'text', -text => $vm->{disk} || 'N/A');
-            $self->{tree}->itemCreate($entry, 10, -itemtype => 'text', -text => $vm->{total_fs} || 'N/A');
-            $self->{tree}->itemCreate($entry, 11, -itemtype => 'text', -text => $vm->{free_disk} || 'N/A');
-            $self->{tree}->itemCreate($entry, 12, -itemtype => 'text', -text => $vm->{free_pct} || 'N/A');
+            # Create all items with centered style
+            $self->{tree}->itemCreate($entry, 0, -itemtype => 'text', -text => $vm->{id}, -style => $self->{centered_style});
+            $self->{tree}->itemCreate($entry, 1, -itemtype => 'text', -text => $vm->{type}, -style => $self->{centered_style});
+            $self->{tree}->itemCreate($entry, 2, -itemtype => 'text', -text => $vm->{status}, -style => $self->{centered_style});
+            $self->{tree}->itemCreate($entry, 3, -itemtype => 'text', -text => $vm->{name}, -style => $self->{centered_style});
+            $self->{tree}->itemCreate($entry, 4, -itemtype => 'text', -text => $vm->{node}, -style => $self->{centered_style});
+            $self->{tree}->itemCreate($entry, 5, -itemtype => 'text', -text => $vm->{cores} || 'N/A', -style => $self->{centered_style});
+            $self->{tree}->itemCreate($entry, 6, -itemtype => 'text', -text => $vm->{sockets} || 'N/A', -style => $self->{centered_style});
+            $self->{tree}->itemCreate($entry, 7, -itemtype => 'text', -text => $vm->{cpu} || 'N/A', -style => $self->{centered_style});
+            $self->{tree}->itemCreate($entry, 8, -itemtype => 'text', -text => $vm->{memory} || 'N/A', -style => $self->{centered_style});
+            $self->{tree}->itemCreate($entry, 9, -itemtype => 'text', -text => $vm->{disk} || 'N/A', -style => $self->{centered_style});
+            $self->{tree}->itemCreate($entry, 10, -itemtype => 'text', -text => $vm->{total_fs} || 'N/A', -style => $self->{centered_style});
+            $self->{tree}->itemCreate($entry, 11, -itemtype => 'text', -text => $vm->{free_disk} || 'N/A', -style => $self->{centered_style});
+            $self->{tree}->itemCreate($entry, 12, -itemtype => 'text', -text => $vm->{free_pct} || 'N/A', -style => $self->{centered_style});
             
             # Now apply the appropriate colors based on status
             my $style = 'normal';
