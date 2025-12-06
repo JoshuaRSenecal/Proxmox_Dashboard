@@ -1169,11 +1169,14 @@ sub get_all_node_temperatures {
         
         main::log_message('ERROR', "TEMP DEBUG: Got " . scalar(@$nodes) . " nodes");
         
-        # For single-node setups, use the API host
+        # Map each node to its own hostname/IP for temperature API requests
+        # Each node should check its OWN temperature service, not the primary API host
         foreach my $node (@$nodes) {
             my $node_name = $node->{node};
-            $self->{node_addresses}->{$node_name} = $self->{api}->{host};
-            main::log_message('ERROR', "TEMP DEBUG: Node $node_name will use API host: " . $self->{api}->{host});
+            # Use the node's actual hostname, NOT the API host
+            # This ensures each node queries its own temperature service
+            $self->{node_addresses}->{$node_name} = $node_name;
+            main::log_message('ERROR', "TEMP DEBUG: Node $node_name will use its own address: $node_name");
         }
         
         # Check each node
