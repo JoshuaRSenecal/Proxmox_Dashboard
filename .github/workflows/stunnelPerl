@@ -2120,12 +2120,11 @@ sub create_widgets {
         -drawbranch => 0,  # Don't draw branch lines/boxes
     )->pack(-fill => 'both', -expand => 1);
     
-    # Create a centered text style for table cells with no borders/relief
+    # Create a centered text style for table cells
+    # ItemStyle only supports: -anchor, -font, -foreground, -background
     $self->{centered_style} = $self->{tree}->ItemStyle('text',
         -anchor => 'center',
         -font => ['Arial', 11],
-        -relief => 'flat',
-        -borderwidth => 0,
     );
     
     # Set column widths to match header labels
