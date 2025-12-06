@@ -1186,12 +1186,26 @@ sub get_all_node_temperatures {
             # This ensures we retry if the service becomes available or was temporarily down
             my $result = $self->_get_node_temperature_direct($node_name, 1.5);
             
-            if ($result && $result->{status} eq 'ok') {
+            # Check if we got valid temperature data
+            # Accept if: status='ok' OR (no status but sensors present)
+            my $has_valid_data = 0;
+            if ($result) {
+                if ($result->{status} && $result->{status} eq 'ok') {
+                    $has_valid_data = 1;
+                } elsif ($result->{sensors} && ref($result->{sensors}) eq 'ARRAY' && @{$result->{sensors}} > 0) {
+                    # No status field or status is undef, but we have sensors - treat as success
+                    main::log_message('ERROR', "TEMP DEBUG: No status='ok' but found " . scalar(@{$result->{sensors}}) . " sensors, treating as success");
+                    $result->{status} = 'ok';  # Set it for consistency
+                    $has_valid_data = 1;
+                }
+            }
+            
+            if ($has_valid_data) {
                 main::log_message('ERROR', "TEMP DEBUG: Node $node_name temperature fetch SUCCESS - " . 
                     scalar(@{$result->{sensors} || []}) . " sensors found");
                 $node_temps{$node_name} = $result;
             } else {
-                my $status = $result ? $result->{status} : 'no result';
+                my $status = $result ? ($result->{status} // 'no status field') : 'no result';
                 main::log_message('ERROR', "TEMP DEBUG: Node $node_name temperature fetch FAILED - status: $status");
                 $node_temps{$node_name} = $result || { status => 'error', sensors => [] };
             }
@@ -1230,20 +1244,33 @@ sub _get_node_temperature_direct {
         if ($response->is_success) {
             my $content = $response->content;
             main::log_message('ERROR', "TEMP DEBUG: Response content length: " . length($content));
+            main::log_message('ERROR', "TEMP DEBUG: Raw JSON response: " . substr($content, 0, 500));
             
             my $data = JSON::decode_json($content);
             if ($data && ref($data) eq 'HASH') {
-                main::log_message('ERROR', "TEMP DEBUG: JSON decoded successfully, status=" . ($data->{status} // 'undef'));
-                if ($data->{sensors}) {
-                    main::log_message('ERROR', "TEMP DEBUG: Found " . scalar(@{$data->{sensors}}) . " sensors");
+                # Log the actual structure we received
+                main::log_message('ERROR', "TEMP DEBUG: JSON keys present: " . join(", ", keys %$data));
+                main::log_message('ERROR', "TEMP DEBUG: status field = " . ($data->{status} // 'MISSING'));
+                
+                # Check if we have sensor data, even if status field is missing
+                if ($data->{sensors} && ref($data->{sensors}) eq 'ARRAY') {
+                    main::log_message('ERROR', "TEMP DEBUG: Found sensors array with " . scalar(@{$data->{sensors}}) . " sensors");
+                    
+                    # If we have sensors, treat it as success even if status is missing
+                    if (!$data->{status} && @{$data->{sensors}} > 0) {
+                        main::log_message('ERROR', "TEMP DEBUG: Status missing but sensors present - adding status='ok'");
+                        $data->{status} = 'ok';
+                    }
                 }
+                
+                main::log_message('ERROR', "TEMP DEBUG: Final status after processing = " . ($data->{status} // 'undef'));
                 
                 # Reset fail count on success
                 $self->{temp_api_fail_count}->{$node_name} = 0;
                 
                 $result = $data;
             } else {
-                main::log_message('ERROR', "TEMP DEBUG: Temperature API returned non-hash data");
+                main::log_message('ERROR', "TEMP DEBUG: Temperature API returned non-hash data, type: " . ref($data));
             }
         } else {
             # Temperature API not available - this is common and not an error
@@ -1994,10 +2021,48 @@ sub create_widgets {
         -pady => 10,
     );
     
-    # Use HList for table-like display
+    # Create custom header row with centered labels
+    # (HList native headers don't support centering)
+    my $header_frame = $table_container->Frame(
+        -background => '#3498db',
+        -relief => 'raised',
+        -borderwidth => 2,
+    )->pack(-fill => 'x', -side => 'top');
+    
+    my @columns = (
+        ['ID', 10],
+        ['Type', 10],
+        ['Status', 12],
+        ['Name', 35],
+        ['Node', 18],
+        ['Cores', 10],
+        ['Sockets', 10],
+        ['CPU', 20],
+        ['Memory', 25],
+        ['Disk', 18],
+        ['TotalFS', 18],
+        ['FreeDisk', 18],
+        ['Free%', 12],
+    );
+    
+    # Create centered header labels
+    foreach my $col_def (@columns) {
+        my ($col_name, $col_width) = @$col_def;
+        my $label = $header_frame->Label(
+            -text => $col_name,
+            -font => ['Arial', 11, 'bold'],
+            -background => '#3498db',
+            -foreground => 'white',
+            -width => $col_width,
+            -anchor => 'center',
+            -relief => 'flat',
+        )->pack(-side => 'left', -fill => 'both', -expand => 0);
+    }
+    
+    # Use HList for table-like display (without native headers now)
     $self->{tree} = $table_container->Scrolled(
         'HList',
-        -header => 1,
+        -header => 0,  # Disable native headers, we created custom ones above
         -columns => 13,
         -scrollbars => 'se',
         -width => 200,
@@ -2020,41 +2085,13 @@ sub create_widgets {
         -font => ['Arial', 11],
     );
     
-    # Configure columns with larger widths to require scrolling
-    my @columns = (
-        ['ID', 10],
-        ['Type', 10],
-        ['Status', 12],
-        ['Name', 35],
-        ['Node', 18],
-        ['Cores', 10],
-        ['Sockets', 10],
-        ['CPU', 20],
-        ['Memory', 25],
-        ['Disk', 18],
-        ['TotalFS', 18],
-        ['FreeDisk', 18],
-        ['Free%', 12],
-    );
-    
-    # Configure column headers
-    # HList headers don't support -anchor, so we manually center by padding text
+    # Set column widths to match header labels
     for my $i (0..$#columns) {
         my ($col_name, $col_width) = @{$columns[$i]};
-        
-        # Center the header text by padding with spaces
-        my $text_length = length($col_name);
-        my $padding = int(($col_width - $text_length) / 2);
-        $padding = 0 if $padding < 0;
-        my $centered_text = (' ' x $padding) . $col_name;
-        
-        $self->{tree}->header('create', $i, 
-            -text => $centered_text,
-            -headerbackground => '#3498db',
-            -borderwidth => 2,
-        );
         $self->{tree}->column('width', $i, -char => $col_width);
     }
+    
+    # Store column definitions for later use
     
     # Store color mappings for direct application
     $self->{status_colors} = {
