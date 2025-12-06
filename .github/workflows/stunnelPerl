@@ -1182,28 +1182,18 @@ sub get_all_node_temperatures {
             
             main::log_message('ERROR', "TEMP DEBUG: Checking temperature for node: $node_name");
             
-            if (exists $self->{node_temp_api_available}->{$node_name} && 
-                !$self->{node_temp_api_available}->{$node_name}) {
-                main::log_message('ERROR', "TEMP DEBUG: Node $node_name previously marked as unavailable, skipping");
-                $node_temps{$node_name} = {
-                    status => 'not_installed',
-                    sensors => [],
-                };
-                next;
-            }
-            
+            # Always try to fetch temperature - don't skip based on previous failures
+            # This ensures we retry if the service becomes available or was temporarily down
             my $result = $self->_get_node_temperature_direct($node_name, 1.5);
             
             if ($result && $result->{status} eq 'ok') {
                 main::log_message('ERROR', "TEMP DEBUG: Node $node_name temperature fetch SUCCESS - " . 
                     scalar(@{$result->{sensors} || []}) . " sensors found");
                 $node_temps{$node_name} = $result;
-                $self->{node_temp_api_available}->{$node_name} = 1;
             } else {
                 my $status = $result ? $result->{status} : 'no result';
                 main::log_message('ERROR', "TEMP DEBUG: Node $node_name temperature fetch FAILED - status: $status");
                 $node_temps{$node_name} = $result || { status => 'error', sensors => [] };
-                $self->{node_temp_api_available}->{$node_name} = 0;
             }
         }
     };
@@ -1247,6 +1237,10 @@ sub _get_node_temperature_direct {
                 if ($data->{sensors}) {
                     main::log_message('ERROR', "TEMP DEBUG: Found " . scalar(@{$data->{sensors}}) . " sensors");
                 }
+                
+                # Reset fail count on success
+                $self->{temp_api_fail_count}->{$node_name} = 0;
+                
                 $result = $data;
             } else {
                 main::log_message('ERROR', "TEMP DEBUG: Temperature API returned non-hash data");
@@ -1257,11 +1251,18 @@ sub _get_node_temperature_direct {
             my $message = $response->message;
             main::log_message('ERROR', "TEMP DEBUG: Temperature API not available - HTTP $code: $message");
             
-            # Only log at first failure
-            unless (exists $self->{temp_api_logged}->{$node_name}) {
-                main::log_message('ERROR', "Temperature API not available on $node_name:8898 (HTTP $code)");
-                main::log_message('ERROR', "This is normal if you haven't installed a temperature monitoring service");
-                $self->{temp_api_logged}->{$node_name} = 1;
+            # Only log user-facing message periodically (every 10 attempts)
+            $self->{temp_api_fail_count}->{$node_name} //= 0;
+            $self->{temp_api_fail_count}->{$node_name}++;
+            
+            if ($self->{temp_api_fail_count}->{$node_name} == 1 || 
+                $self->{temp_api_fail_count}->{$node_name} % 10 == 0) {
+                main::log_message('ERROR', "Temperature API not available on $node_name:8898 (HTTP $code) - attempt " . 
+                    $self->{temp_api_fail_count}->{$node_name});
+                if ($self->{temp_api_fail_count}->{$node_name} == 1) {
+                    main::log_message('ERROR', "This is normal if you haven't installed a temperature monitoring service");
+                    main::log_message('ERROR', "Install lm-sensors and a temperature API service on the Proxmox node to enable temperature monitoring");
+                }
             }
         }
     };
@@ -2037,14 +2038,18 @@ sub create_widgets {
     );
     
     # Configure column headers
-    # NOTE: Tk::HList header() has limited styling support compared to modern widgets
-    # Supported options: -text, -headerbackground, -borderwidth
-    # NOT supported: -foreground (text color), -font, -anchor (centering)
-    # The blue background distinguishes headers, but text remains default color
+    # HList headers don't support -anchor, so we manually center by padding text
     for my $i (0..$#columns) {
         my ($col_name, $col_width) = @{$columns[$i]};
+        
+        # Center the header text by padding with spaces
+        my $text_length = length($col_name);
+        my $padding = int(($col_width - $text_length) / 2);
+        $padding = 0 if $padding < 0;
+        my $centered_text = (' ' x $padding) . $col_name;
+        
         $self->{tree}->header('create', $i, 
-            -text => $col_name,
+            -text => $centered_text,
             -headerbackground => '#3498db',
             -borderwidth => 2,
         );
