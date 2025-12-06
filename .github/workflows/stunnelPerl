@@ -1254,22 +1254,40 @@ sub _get_node_temperature_direct {
         if ($response->is_success) {
             my $content = $response->content;
             main::log_message('ERROR', "TEMP DEBUG: Response content length: " . length($content));
-            main::log_message('ERROR', "TEMP DEBUG: Raw JSON response: " . substr($content, 0, 500));
             
             eval {
-                my $data = JSON::decode_json($content);
+                my $json_data = JSON::decode_json($content);
                 
-                if ($data && ref($data) eq 'HASH') {
-                    # Log the actual structure we received
-                    main::log_message('ERROR', "TEMP DEBUG: JSON keys present: " . join(", ", sort keys %$data));
+                if ($json_data && ref($json_data) eq 'HASH') {
+                    # Check if sensors are nested inside a "data" object
+                    my $data;
+                    if ($json_data->{data} && ref($json_data->{data}) eq 'HASH') {
+                        main::log_message('ERROR', "TEMP DEBUG: Found nested 'data' object, extracting it");
+                        $data = $json_data->{data};
+                    } else {
+                        main::log_message('ERROR', "TEMP DEBUG: Using top-level JSON object");
+                        $data = $json_data;
+                    }
+                    
+                    # Log the actual structure
+                    main::log_message('ERROR', "TEMP DEBUG: Data keys present: " . join(", ", sort keys %$data));
                     main::log_message('ERROR', "TEMP DEBUG: status field = " . ($data->{status} // 'MISSING'));
                     
-                    # Check if we have sensor data, even if status field is missing
+                    # Check if we have sensor data
                     if ($data->{sensors} && ref($data->{sensors}) eq 'ARRAY') {
                         my $sensor_count = scalar(@{$data->{sensors}});
-                        main::log_message('ERROR', "TEMP DEBUG: Found sensors array with $sensor_count sensors");
+                        main::log_message('ERROR', "TEMP DEBUG: ✓ Found sensors array with $sensor_count sensors");
                         
-                        # If we have sensors, ALWAYS set status to 'ok' (even if it's missing or has wrong value)
+                        # DUMP FIRST SENSOR
+                        if ($sensor_count > 0) {
+                            my $first_sensor = $data->{sensors}[0];
+                            main::log_message('ERROR', "TEMP DEBUG: First sensor keys: " . join(", ", sort keys %$first_sensor));
+                            main::log_message('ERROR', "TEMP DEBUG: First sensor: type=" . ($first_sensor->{type} // 'missing') .
+                                ", label=" . ($first_sensor->{label} // 'missing') .
+                                ", temperature=" . ($first_sensor->{temperature} // 'missing'));
+                        }
+                        
+                        # If we have sensors, ALWAYS set status to 'ok'
                         if ($sensor_count > 0) {
                             if (!$data->{status} || $data->{status} ne 'ok') {
                                 main::log_message('ERROR', "TEMP DEBUG: Setting status='ok' because we have $sensor_count sensors");
@@ -1277,7 +1295,7 @@ sub _get_node_temperature_direct {
                             }
                         }
                     } else {
-                        main::log_message('ERROR', "TEMP DEBUG: No sensors array found or it's not an array");
+                        main::log_message('ERROR', "TEMP DEBUG: ✗ No sensors array found or it's not an array");
                         # No sensors - set error status
                         $data->{status} = 'error' unless $data->{status};
                         $data->{sensors} = [];
@@ -1290,7 +1308,7 @@ sub _get_node_temperature_direct {
                     
                     $result = $data;
                 } else {
-                    main::log_message('ERROR', "TEMP DEBUG: Temperature API returned non-hash data, type: " . (ref($data) || 'scalar'));
+                    main::log_message('ERROR', "TEMP DEBUG: Temperature API returned non-hash data, type: " . (ref($json_data) || 'scalar'));
                 }
             };
             
