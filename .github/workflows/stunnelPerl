@@ -2069,34 +2069,51 @@ sub create_widgets {
         -borderwidth => 2,
     )->pack(-fill => 'x', -side => 'top');
     
+    # Column definitions with PIXEL widths for perfect alignment
+    # Pixel width = char_width * 8 (average character width in Arial 11)
     my @columns = (
-        ['ID', 10],
-        ['Type', 10],
-        ['Status', 12],
-        ['Name', 35],
-        ['Node', 18],
-        ['Cores', 10],
-        ['Sockets', 10],
-        ['CPU', 20],
-        ['Memory', 25],
-        ['Disk', 18],
-        ['TotalFS', 18],
-        ['FreeDisk', 18],
-        ['Free%', 12],
+        ['ID', 80],
+        ['Type', 80],
+        ['Status', 96],
+        ['Name', 280],
+        ['Node', 144],
+        ['Cores', 80],
+        ['Sockets', 80],
+        ['CPU', 160],
+        ['Memory', 200],
+        ['Disk', 144],
+        ['TotalFS', 144],
+        ['FreeDisk', 144],
+        ['Free%', 96],
     );
     
-    # Create centered header labels
+    # Create centered header labels with EXACT pixel widths
     foreach my $col_def (@columns) {
-        my ($col_name, $col_width) = @$col_def;
-        my $label = $header_frame->Label(
+        my ($col_name, $pixel_width) = @$col_def;
+        
+        # Create a fixed-width container for each header
+        my $header_container = $header_frame->Frame(
+            -width => $pixel_width,
+            -height => 25,
+            -background => '#3498db',
+        )->pack(
+            -side => 'left',
+            -fill => 'y',
+            -expand => 0,
+        );
+        
+        # Prevent container from shrinking
+        $header_container->packPropagate(0);
+        
+        # Create label inside container
+        my $label = $header_container->Label(
             -text => $col_name,
             -font => ['Arial', 11, 'bold'],
             -background => '#3498db',
             -foreground => 'white',
-            -width => $col_width,
             -anchor => 'center',
             -relief => 'flat',
-        )->pack(-side => 'left', -fill => 'both', -expand => 0);
+        )->pack(-fill => 'both', -expand => 1);
     }
     
     # Use HList for table-like display (without native headers now)
@@ -2127,10 +2144,11 @@ sub create_widgets {
         -font => ['Arial', 11],
     );
     
-    # Set column widths to match header labels
+    # Set column widths to EXACT pixel widths - prevents data from moving
     for my $i (0..$#columns) {
-        my ($col_name, $col_width) = @{$columns[$i]};
-        $self->{tree}->column('width', $i, -char => $col_width);
+        my ($col_name, $pixel_width) = @{$columns[$i]};
+        # Use -width with pixels for fixed columns
+        $self->{tree}->column('width', $i, $pixel_width);
     }
     
     # Store column definitions for later use
