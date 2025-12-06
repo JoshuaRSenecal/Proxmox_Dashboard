@@ -1186,28 +1186,38 @@ sub get_all_node_temperatures {
             # This ensures we retry if the service becomes available or was temporarily down
             my $result = $self->_get_node_temperature_direct($node_name, 1.5);
             
+            main::log_message('ERROR', "TEMP DEBUG: _get_node_temperature_direct returned: " . 
+                (defined $result ? "defined hash" : "undef"));
+            
             # Check if we got valid temperature data
-            # Accept if: status='ok' OR (no status but sensors present)
+            # We accept the result if it has ANY sensors at all, regardless of status field
             my $has_valid_data = 0;
-            if ($result) {
-                if ($result->{status} && $result->{status} eq 'ok') {
+            if ($result && ref($result) eq 'HASH') {
+                # First priority: check for sensors array
+                if ($result->{sensors} && ref($result->{sensors}) eq 'ARRAY' && @{$result->{sensors}} > 0) {
+                    main::log_message('ERROR', "TEMP DEBUG: Result has " . scalar(@{$result->{sensors}}) . " sensors - ACCEPTING");
                     $has_valid_data = 1;
-                } elsif ($result->{sensors} && ref($result->{sensors}) eq 'ARRAY' && @{$result->{sensors}} > 0) {
-                    # No status field or status is undef, but we have sensors - treat as success
-                    main::log_message('ERROR', "TEMP DEBUG: No status='ok' but found " . scalar(@{$result->{sensors}}) . " sensors, treating as success");
-                    $result->{status} = 'ok';  # Set it for consistency
-                    $has_valid_data = 1;
+                    
+                    # Ensure status is set to 'ok' if we have sensors
+                    if (!$result->{status} || $result->{status} ne 'ok') {
+                        main::log_message('ERROR', "TEMP DEBUG: Forcing status='ok' because sensors present");
+                        $result->{status} = 'ok';
+                    }
+                } else {
+                    main::log_message('ERROR', "TEMP DEBUG: Result has no sensors array or it's empty - REJECTING");
                 }
+            } else {
+                main::log_message('ERROR', "TEMP DEBUG: Result is not a hash reference - REJECTING");
             }
             
             if ($has_valid_data) {
-                main::log_message('ERROR', "TEMP DEBUG: Node $node_name temperature fetch SUCCESS - " . 
-                    scalar(@{$result->{sensors} || []}) . " sensors found");
+                main::log_message('ERROR', "TEMP DEBUG: ✓✓✓ Node $node_name temperature fetch SUCCESS - " . 
+                    scalar(@{$result->{sensors}}) . " sensors found");
                 $node_temps{$node_name} = $result;
             } else {
                 my $status = $result ? ($result->{status} // 'no status field') : 'no result';
-                main::log_message('ERROR', "TEMP DEBUG: Node $node_name temperature fetch FAILED - status: $status");
-                $node_temps{$node_name} = $result || { status => 'error', sensors => [] };
+                main::log_message('ERROR', "TEMP DEBUG: ✗✗✗ Node $node_name temperature fetch FAILED - status: $status");
+                $node_temps{$node_name} = { status => 'error', sensors => [] };
             }
         }
     };
@@ -1246,31 +1256,46 @@ sub _get_node_temperature_direct {
             main::log_message('ERROR', "TEMP DEBUG: Response content length: " . length($content));
             main::log_message('ERROR', "TEMP DEBUG: Raw JSON response: " . substr($content, 0, 500));
             
-            my $data = JSON::decode_json($content);
-            if ($data && ref($data) eq 'HASH') {
-                # Log the actual structure we received
-                main::log_message('ERROR', "TEMP DEBUG: JSON keys present: " . join(", ", keys %$data));
-                main::log_message('ERROR', "TEMP DEBUG: status field = " . ($data->{status} // 'MISSING'));
+            eval {
+                my $data = JSON::decode_json($content);
                 
-                # Check if we have sensor data, even if status field is missing
-                if ($data->{sensors} && ref($data->{sensors}) eq 'ARRAY') {
-                    main::log_message('ERROR', "TEMP DEBUG: Found sensors array with " . scalar(@{$data->{sensors}}) . " sensors");
+                if ($data && ref($data) eq 'HASH') {
+                    # Log the actual structure we received
+                    main::log_message('ERROR', "TEMP DEBUG: JSON keys present: " . join(", ", sort keys %$data));
+                    main::log_message('ERROR', "TEMP DEBUG: status field = " . ($data->{status} // 'MISSING'));
                     
-                    # If we have sensors, treat it as success even if status is missing
-                    if (!$data->{status} && @{$data->{sensors}} > 0) {
-                        main::log_message('ERROR', "TEMP DEBUG: Status missing but sensors present - adding status='ok'");
-                        $data->{status} = 'ok';
+                    # Check if we have sensor data, even if status field is missing
+                    if ($data->{sensors} && ref($data->{sensors}) eq 'ARRAY') {
+                        my $sensor_count = scalar(@{$data->{sensors}});
+                        main::log_message('ERROR', "TEMP DEBUG: Found sensors array with $sensor_count sensors");
+                        
+                        # If we have sensors, ALWAYS set status to 'ok' (even if it's missing or has wrong value)
+                        if ($sensor_count > 0) {
+                            if (!$data->{status} || $data->{status} ne 'ok') {
+                                main::log_message('ERROR', "TEMP DEBUG: Setting status='ok' because we have $sensor_count sensors");
+                                $data->{status} = 'ok';
+                            }
+                        }
+                    } else {
+                        main::log_message('ERROR', "TEMP DEBUG: No sensors array found or it's not an array");
+                        # No sensors - set error status
+                        $data->{status} = 'error' unless $data->{status};
+                        $data->{sensors} = [];
                     }
+                    
+                    main::log_message('ERROR', "TEMP DEBUG: Final status after processing = " . ($data->{status} // 'still undef!'));
+                    
+                    # Reset fail count on success
+                    $self->{temp_api_fail_count}->{$node_name} = 0;
+                    
+                    $result = $data;
+                } else {
+                    main::log_message('ERROR', "TEMP DEBUG: Temperature API returned non-hash data, type: " . (ref($data) || 'scalar'));
                 }
-                
-                main::log_message('ERROR', "TEMP DEBUG: Final status after processing = " . ($data->{status} // 'undef'));
-                
-                # Reset fail count on success
-                $self->{temp_api_fail_count}->{$node_name} = 0;
-                
-                $result = $data;
-            } else {
-                main::log_message('ERROR', "TEMP DEBUG: Temperature API returned non-hash data, type: " . ref($data));
+            };
+            
+            if ($@) {
+                main::log_message('ERROR', "TEMP DEBUG: JSON decode failed: $@");
             }
         } else {
             # Temperature API not available - this is common and not an error
@@ -1338,87 +1363,81 @@ sub _update_temp_ui {
     
     foreach my $node_name (sort keys %$node_temps) {
         my $temp_info = $node_temps->{$node_name};
-        my $status = $temp_info->{status};
-        
-        main::log_message('ERROR', "TEMP DEBUG: Processing node $node_name with status: $status");
-        
-        if ($status ne 'ok') {
-            main::log_message('ERROR', "TEMP DEBUG: Node $node_name status is not 'ok', showing N/A");
-            my $label = $self->{node_temp_frame}->Label(
-                -text => "$node_name: N/A",
-                -font => ['Arial', 9, 'bold'],
-                -background => '#34495e',
-                -foreground => '#95a5a6',
-            );
-            $label->{is_temp_label} = 1;
-            $label->pack(-side => 'left', -padx => 8);
-            next;
-        }
-        
+        my $status = $temp_info->{status} // 'no status';
         my $sensors = $temp_info->{sensors} || [];
-        main::log_message('ERROR', "TEMP DEBUG: Node $node_name has " . scalar(@$sensors) . " sensors");
         
-        next unless @$sensors;
+        main::log_message('ERROR', "TEMP DEBUG: Processing node $node_name - status: $status, sensors: " . scalar(@$sensors));
         
-        # Show only CPU Package or highest core temp
-        my $cpu_package;
-        my @cpu_cores;
-        
-        foreach my $sensor (@$sensors) {
-            my $sensor_type = $sensor->{type} || 'unknown';
-            main::log_message('ERROR', "TEMP DEBUG: Sensor type=$sensor_type, label=" . 
-                ($sensor->{label} // 'none') . ", temp=" . ($sensor->{temperature} // 'none'));
+        # PRIORITIZE SENSOR DATA - if we have sensors, use them regardless of status
+        if (@$sensors > 0) {
+            main::log_message('ERROR', "TEMP DEBUG: Node $node_name has " . scalar(@$sensors) . " sensors - processing them");
             
-            if ($sensor_type eq 'cpu_package') {
-                $cpu_package = $sensor;
-                last;
-            } elsif ($sensor_type eq 'cpu_core') {
-                push @cpu_cores, $sensor;
+            # Show only CPU Package or highest core temp
+            my $cpu_package;
+            my @cpu_cores;
+            
+            foreach my $sensor (@$sensors) {
+                my $sensor_type = $sensor->{type} || 'unknown';
+                main::log_message('ERROR', "TEMP DEBUG: Sensor type=$sensor_type, label=" . 
+                    ($sensor->{label} // 'none') . ", temp=" . ($sensor->{temperature} // 'none'));
+                
+                if ($sensor_type eq 'cpu_package') {
+                    $cpu_package = $sensor;
+                    last;
+                } elsif ($sensor_type eq 'cpu_core') {
+                    push @cpu_cores, $sensor;
+                }
+            }
+            
+            my $display_sensor = $cpu_package;
+            if (!$display_sensor && @cpu_cores) {
+                $display_sensor = (sort { $b->{temperature} <=> $a->{temperature} } @cpu_cores)[0];
+                main::log_message('ERROR', "TEMP DEBUG: Using highest core temp: " . $display_sensor->{temperature});
+            }
+            
+            if ($display_sensor && defined $display_sensor->{temperature}) {
+                my $temp = $display_sensor->{temperature};
+                my $label_text = $display_sensor->{label} || 'CPU';
+                
+                main::log_message('ERROR', "TEMP DEBUG: Creating label for $node_name: ${temp}°C");
+                
+                if (length($label_text) > 20) {
+                    $label_text = substr($label_text, 0, 17) . "...";
+                }
+                
+                my $temp_color = $self->get_temp_color($temp);
+                
+                my $sensor_label = $self->{node_temp_frame}->Label(
+                    -text => "$node_name: ${temp}°C",
+                    -font => ['Arial', 10, 'bold'],
+                    -background => '#34495e',
+                    -foreground => $temp_color,
+                    -cursor => 'hand2',
+                );
+                $sensor_label->{is_temp_label} = 1;
+                $sensor_label->pack(-side => 'left', -padx => 10);
+                
+                main::log_message('ERROR', "TEMP DEBUG: Label created and packed for $node_name");
+                
+                $sensor_label->bind('<Button-1>', sub { $self->show_temperature_details($node_name) });
+                
+                # Successfully displayed temperature, continue to next node
+                next;
+            } else {
+                main::log_message('ERROR', "TEMP DEBUG: Have sensors but no valid display sensor with temperature");
             }
         }
         
-        my $display_sensor = $cpu_package;
-        if (!$display_sensor && @cpu_cores) {
-            $display_sensor = (sort { $b->{temperature} <=> $a->{temperature} } @cpu_cores)[0];
-            main::log_message('ERROR', "TEMP DEBUG: Using highest core temp: " . $display_sensor->{temperature});
-        }
-        
-        if ($display_sensor) {
-            my $temp = $display_sensor->{temperature};
-            my $label_text = $display_sensor->{label} || 'CPU';
-            
-            main::log_message('ERROR', "TEMP DEBUG: Creating label for $node_name: ${temp}°C");
-            
-            if (length($label_text) > 20) {
-                $label_text = substr($label_text, 0, 17) . "...";
-            }
-            
-            my $temp_color = $self->get_temp_color($temp);
-            
-            my $sensor_label = $self->{node_temp_frame}->Label(
-                -text => "$node_name: ${temp}°C",
-                -font => ['Arial', 10, 'bold'],
-                -background => '#34495e',
-                -foreground => $temp_color,
-                -cursor => 'hand2',
-            );
-            $sensor_label->{is_temp_label} = 1;
-            $sensor_label->pack(-side => 'left', -padx => 10);
-            
-            main::log_message('ERROR', "TEMP DEBUG: Label created and packed for $node_name");
-            
-            $sensor_label->bind('<Button-1>', sub { $self->show_temperature_details($node_name) });
-        } else {
-            main::log_message('ERROR', "TEMP DEBUG: No display sensor found for $node_name, showing N/A");
-            my $label = $self->{node_temp_frame}->Label(
-                -text => "$node_name: N/A",
-                -font => ['Arial', 9, 'bold'],
-                -background => '#34495e',
-                -foreground => '#95a5a6',
-            );
-            $label->{is_temp_label} = 1;
-            $label->pack(-side => 'left', -padx => 8);
-        }
+        # If we get here, either no sensors or couldn't extract temperature - show N/A
+        main::log_message('ERROR', "TEMP DEBUG: Node $node_name - showing N/A (status=$status, sensors=" . scalar(@$sensors) . ")");
+        my $label = $self->{node_temp_frame}->Label(
+            -text => "$node_name: N/A",
+            -font => ['Arial', 9, 'bold'],
+            -background => '#34495e',
+            -foreground => '#95a5a6',
+        );
+        $label->{is_temp_label} = 1;
+        $label->pack(-side => 'left', -padx => 8);
     }
 }
 
