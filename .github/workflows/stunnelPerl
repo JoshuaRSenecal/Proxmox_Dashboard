@@ -1153,83 +1153,47 @@ sub get_all_node_temperatures {
     
     return {} unless $self->{api};
     
-    main::log_message('ERROR', "TEMP DEBUG: Starting temperature fetch");
-    
     my %node_temps;
     
     eval {
         my $nodes = $self->{api}->get('/nodes');
         
-        # Validate that nodes is an array ref
         unless (ref($nodes) eq 'ARRAY') {
-            my $type = ref($nodes) || 'scalar';
-            main::log_message('ERROR', "TEMP DEBUG: /nodes returned non-array: $type");
-            return {};  # Return empty hash
+            return {};
         }
         
-        main::log_message('ERROR', "TEMP DEBUG: Got " . scalar(@$nodes) . " nodes");
-        
         # Map each node to its own hostname/IP for temperature API requests
-        # Each node should check its OWN temperature service, not the primary API host
         foreach my $node (@$nodes) {
             my $node_name = $node->{node};
-            # Use the node's actual hostname, NOT the API host
-            # This ensures each node queries its own temperature service
             $self->{node_addresses}->{$node_name} = $node_name;
-            main::log_message('ERROR', "TEMP DEBUG: Node $node_name will use its own address: $node_name");
         }
         
         # Check each node
         foreach my $node (@$nodes) {
             my $node_name = $node->{node};
             
-            main::log_message('ERROR', "TEMP DEBUG: Checking temperature for node: $node_name");
-            
-            # Always try to fetch temperature - don't skip based on previous failures
-            # This ensures we retry if the service becomes available or was temporarily down
             my $result = $self->_get_node_temperature_direct($node_name, 1.5);
             
-            main::log_message('ERROR', "TEMP DEBUG: _get_node_temperature_direct returned: " . 
-                (defined $result ? "defined hash" : "undef"));
-            
-            # Check if we got valid temperature data
-            # We accept the result if it has ANY sensors at all, regardless of status field
+            # Accept if we have sensors
             my $has_valid_data = 0;
             if ($result && ref($result) eq 'HASH') {
-                # First priority: check for sensors array
                 if ($result->{sensors} && ref($result->{sensors}) eq 'ARRAY' && @{$result->{sensors}} > 0) {
-                    main::log_message('ERROR', "TEMP DEBUG: Result has " . scalar(@{$result->{sensors}}) . " sensors - ACCEPTING");
                     $has_valid_data = 1;
-                    
-                    # Ensure status is set to 'ok' if we have sensors
-                    if (!$result->{status} || $result->{status} ne 'ok') {
-                        main::log_message('ERROR', "TEMP DEBUG: Forcing status='ok' because sensors present");
-                        $result->{status} = 'ok';
-                    }
-                } else {
-                    main::log_message('ERROR', "TEMP DEBUG: Result has no sensors array or it's empty - REJECTING");
+                    $result->{status} = 'ok' if (!$result->{status} || $result->{status} ne 'ok');
                 }
-            } else {
-                main::log_message('ERROR', "TEMP DEBUG: Result is not a hash reference - REJECTING");
             }
             
             if ($has_valid_data) {
-                main::log_message('ERROR', "TEMP DEBUG: ✓✓✓ Node $node_name temperature fetch SUCCESS - " . 
-                    scalar(@{$result->{sensors}}) . " sensors found");
                 $node_temps{$node_name} = $result;
             } else {
-                my $status = $result ? ($result->{status} // 'no status field') : 'no result';
-                main::log_message('ERROR', "TEMP DEBUG: ✗✗✗ Node $node_name temperature fetch FAILED - status: $status");
                 $node_temps{$node_name} = { status => 'error', sensors => [] };
             }
         }
     };
     
     if ($@) {
-        main::log_message('ERROR', "TEMP DEBUG: Failed to get node temperatures: $@");
+        main::log_message('ERROR', "Failed to get node temperatures: $@");
     }
-    
-    main::log_message('ERROR', "TEMP DEBUG: Returning temperature data for " . scalar(keys %node_temps) . " nodes");
     
     return \%node_temps;
 }
@@ -1243,8 +1207,6 @@ sub _get_node_temperature_direct {
         my $node_ip = $self->{node_addresses}->{$node_name} || $self->{api}->{host};
         my $url = "https://$node_ip:8898/temperature";
         
-        main::log_message('ERROR', "TEMP DEBUG: Fetching from URL: $url");
-        
         my $ua = LWP::UserAgent->new(
             ssl_opts => { verify_hostname => 0, SSL_verify_mode => 0 },
             timeout => $timeout,
@@ -1252,11 +1214,8 @@ sub _get_node_temperature_direct {
         
         my $response = $ua->get($url);
         
-        main::log_message('ERROR', "TEMP DEBUG: HTTP response code: " . $response->code);
-        
         if ($response->is_success) {
             my $content = $response->content;
-            main::log_message('ERROR', "TEMP DEBUG: Response content length: " . length($content));
             
             eval {
                 my $json_data = JSON::decode_json($content);
@@ -1265,71 +1224,40 @@ sub _get_node_temperature_direct {
                     # Check if sensors are nested inside a "data" object
                     my $data;
                     if ($json_data->{data} && ref($json_data->{data}) eq 'HASH') {
-                        main::log_message('ERROR', "TEMP DEBUG: Found nested 'data' object, extracting it");
                         $data = $json_data->{data};
                     } else {
-                        main::log_message('ERROR', "TEMP DEBUG: Using top-level JSON object");
                         $data = $json_data;
                     }
-                    
-                    # Log the actual structure
-                    main::log_message('ERROR', "TEMP DEBUG: Data keys present: " . join(", ", sort keys %$data));
-                    main::log_message('ERROR', "TEMP DEBUG: status field = " . ($data->{status} // 'MISSING'));
                     
                     # Check if we have sensor data
                     if ($data->{sensors} && ref($data->{sensors}) eq 'ARRAY') {
                         my $sensor_count = scalar(@{$data->{sensors}});
-                        main::log_message('ERROR', "TEMP DEBUG: ✓ Found sensors array with $sensor_count sensors");
                         
-                        # DUMP FIRST SENSOR
-                        if ($sensor_count > 0) {
-                            my $first_sensor = $data->{sensors}[0];
-                            main::log_message('ERROR', "TEMP DEBUG: First sensor keys: " . join(", ", sort keys %$first_sensor));
-                            main::log_message('ERROR', "TEMP DEBUG: First sensor: type=" . ($first_sensor->{type} // 'missing') .
-                                ", label=" . ($first_sensor->{label} // 'missing') .
-                                ", temperature=" . ($first_sensor->{temperature} // 'missing'));
-                        }
-                        
-                        # If we have sensors, ALWAYS set status to 'ok'
+                        # If we have sensors, set status to 'ok'
                         if ($sensor_count > 0) {
                             if (!$data->{status} || $data->{status} ne 'ok') {
-                                main::log_message('ERROR', "TEMP DEBUG: Setting status='ok' because we have $sensor_count sensors");
                                 $data->{status} = 'ok';
                             }
                         }
                     } else {
-                        main::log_message('ERROR', "TEMP DEBUG: ✗ No sensors array found or it's not an array");
-                        # No sensors - set error status
                         $data->{status} = 'error' unless $data->{status};
                         $data->{sensors} = [];
                     }
-                    
-                    main::log_message('ERROR', "TEMP DEBUG: Final status after processing = " . ($data->{status} // 'still undef!'));
                     
                     # Reset fail count on success
                     $self->{temp_api_fail_count}->{$node_name} = 0;
                     
                     $result = $data;
-                } else {
-                    main::log_message('ERROR', "TEMP DEBUG: Temperature API returned non-hash data, type: " . (ref($json_data) || 'scalar'));
                 }
             };
-            
-            if ($@) {
-                main::log_message('ERROR', "TEMP DEBUG: JSON decode failed: $@");
-            }
         } else {
-            # Temperature API not available - this is common and not an error
-            my $code = $response->code;
-            my $message = $response->message;
-            main::log_message('ERROR', "TEMP DEBUG: Temperature API not available - HTTP $code: $message");
-            
-            # Only log user-facing message periodically (every 10 attempts)
+            # Temperature API not available
             $self->{temp_api_fail_count}->{$node_name} //= 0;
             $self->{temp_api_fail_count}->{$node_name}++;
             
             if ($self->{temp_api_fail_count}->{$node_name} == 1 || 
                 $self->{temp_api_fail_count}->{$node_name} % 10 == 0) {
+                my $code = $response->code;
                 main::log_message('ERROR', "Temperature API not available on $node_name:8898 (HTTP $code) - attempt " . 
                     $self->{temp_api_fail_count}->{$node_name});
                 if ($self->{temp_api_fail_count}->{$node_name} == 1) {
@@ -1340,10 +1268,6 @@ sub _get_node_temperature_direct {
         }
     };
     
-    if ($@) {
-        main::log_message('ERROR', "TEMP DEBUG: Temperature fetch error - $@");
-    }
-    
     return $result;
 }
 
@@ -1352,29 +1276,17 @@ sub update_node_temperatures {
     
     return unless $self->{api};
     
-    main::log_message('ERROR', "TEMP DEBUG: update_node_temperatures called");
-    
     my $node_temps = $self->get_all_node_temperatures();
-    
-    main::log_message('ERROR', "TEMP DEBUG: get_all_node_temperatures returned " . 
-        scalar(keys %$node_temps) . " nodes");
-    
     $self->_update_temp_ui($node_temps);
-    
-    main::log_message('ERROR', "TEMP DEBUG: _update_temp_ui completed");
 }
 
 sub _update_temp_ui {
     my ($self, $node_temps) = @_;
     
-    main::log_message('ERROR', "TEMP DEBUG: _update_temp_ui called with " . 
-        scalar(keys %$node_temps) . " nodes");
-    
     $self->{node_temps_full_data} = $node_temps;
     
     # Clear existing temperature labels
     my @children = $self->{node_temp_frame}->children();
-    main::log_message('ERROR', "TEMP DEBUG: Found " . scalar(@children) . " existing widgets in temp frame");
     
     foreach my $widget (@children) {
         if ($widget->can('cget') && eval { $widget->cget('-text') }) {
@@ -1387,20 +1299,14 @@ sub _update_temp_ui {
         my $status = $temp_info->{status} // 'no status';
         my $sensors = $temp_info->{sensors} || [];
         
-        main::log_message('ERROR', "TEMP DEBUG: Processing node $node_name - status: $status, sensors: " . scalar(@$sensors));
-        
-        # PRIORITIZE SENSOR DATA - if we have sensors, use them regardless of status
+        # PRIORITIZE SENSOR DATA - if we have sensors, use them
         if (@$sensors > 0) {
-            main::log_message('ERROR', "TEMP DEBUG: Node $node_name has " . scalar(@$sensors) . " sensors - processing them");
-            
             # Show only CPU Package or highest core temp
             my $cpu_package;
             my @cpu_cores;
             
             foreach my $sensor (@$sensors) {
                 my $sensor_type = $sensor->{type} || 'unknown';
-                main::log_message('ERROR', "TEMP DEBUG: Sensor type=$sensor_type, label=" . 
-                    ($sensor->{label} // 'none') . ", temp=" . ($sensor->{temperature} // 'none'));
                 
                 if ($sensor_type eq 'cpu_package') {
                     $cpu_package = $sensor;
@@ -1413,14 +1319,11 @@ sub _update_temp_ui {
             my $display_sensor = $cpu_package;
             if (!$display_sensor && @cpu_cores) {
                 $display_sensor = (sort { $b->{temperature} <=> $a->{temperature} } @cpu_cores)[0];
-                main::log_message('ERROR', "TEMP DEBUG: Using highest core temp: " . $display_sensor->{temperature});
             }
             
             if ($display_sensor && defined $display_sensor->{temperature}) {
                 my $temp = $display_sensor->{temperature};
                 my $label_text = $display_sensor->{label} || 'CPU';
-                
-                main::log_message('ERROR', "TEMP DEBUG: Creating label for $node_name: ${temp}°C");
                 
                 if (length($label_text) > 20) {
                     $label_text = substr($label_text, 0, 17) . "...";
@@ -1438,19 +1341,14 @@ sub _update_temp_ui {
                 $sensor_label->{is_temp_label} = 1;
                 $sensor_label->pack(-side => 'left', -padx => 10);
                 
-                main::log_message('ERROR', "TEMP DEBUG: Label created and packed for $node_name");
-                
                 $sensor_label->bind('<Button-1>', sub { $self->show_temperature_details($node_name) });
                 
-                # Successfully displayed temperature, continue to next node
+                # Successfully displayed temperature
                 next;
-            } else {
-                main::log_message('ERROR', "TEMP DEBUG: Have sensors but no valid display sensor with temperature");
             }
         }
         
-        # If we get here, either no sensors or couldn't extract temperature - show N/A
-        main::log_message('ERROR', "TEMP DEBUG: Node $node_name - showing N/A (status=$status, sensors=" . scalar(@$sensors) . ")");
+        # No sensors or couldn't extract temperature - show N/A
         my $label = $self->{node_temp_frame}->Label(
             -text => "$node_name: N/A",
             -font => ['Arial', 9, 'bold'],
@@ -2061,65 +1959,27 @@ sub create_widgets {
         -pady => 10,
     );
     
-    # Create custom header row with centered labels
-    # (HList native headers don't support centering)
-    my $header_frame = $table_container->Frame(
-        -background => '#3498db',
-        -relief => 'raised',
-        -borderwidth => 2,
-    )->pack(-fill => 'x', -side => 'top');
-    
-    # Column definitions with PIXEL widths for perfect alignment
-    # Pixel width = char_width * 8 (average character width in Arial 11)
+    # Column definitions
     my @columns = (
-        ['ID', 80],
-        ['Type', 80],
-        ['Status', 96],
-        ['Name', 280],
-        ['Node', 144],
-        ['Cores', 80],
-        ['Sockets', 80],
-        ['CPU', 160],
-        ['Memory', 200],
-        ['Disk', 144],
-        ['TotalFS', 144],
-        ['FreeDisk', 144],
-        ['Free%', 96],
+        ['ID', 8],
+        ['Type', 8],
+        ['Status', 10],
+        ['Name', 30],
+        ['Node', 15],
+        ['Cores', 8],
+        ['Sockets', 10],
+        ['CPU', 18],
+        ['Memory', 22],
+        ['Disk', 15],
+        ['TotalFS', 15],
+        ['FreeDisk', 15],
+        ['Free%', 10],
     );
     
-    # Create centered header labels with EXACT pixel widths
-    foreach my $col_def (@columns) {
-        my ($col_name, $pixel_width) = @$col_def;
-        
-        # Create a fixed-width container for each header
-        my $header_container = $header_frame->Frame(
-            -width => $pixel_width,
-            -height => 25,
-            -background => '#3498db',
-        )->pack(
-            -side => 'left',
-            -fill => 'y',
-            -expand => 0,
-        );
-        
-        # Prevent container from shrinking
-        $header_container->packPropagate(0);
-        
-        # Create label inside container
-        my $label = $header_container->Label(
-            -text => $col_name,
-            -font => ['Arial', 11, 'bold'],
-            -background => '#3498db',
-            -foreground => 'white',
-            -anchor => 'center',
-            -relief => 'flat',
-        )->pack(-fill => 'both', -expand => 1);
-    }
-    
-    # Use HList for table-like display (without native headers now)
+    # Use HList with native headers for perfect alignment
     $self->{tree} = $table_container->Scrolled(
         'HList',
-        -header => 0,  # Disable native headers, we created custom ones above
+        -header => 1,
         -columns => 13,
         -scrollbars => 'se',
         -width => 200,
@@ -2131,25 +1991,38 @@ sub create_widgets {
         -itemtype => 'text',
         -selectbackground => '#3498db',
         -selectforeground => 'white',
-        -indent => 10,
+        -indent => 0,  # NO INDENT - prevents alignment issues
         -font => ['Arial', 11],
-        -gap => 8,  # Add vertical spacing between rows
-        -drawbranch => 0,  # Don't draw branch lines/boxes
+        -gap => 8,
+        -drawbranch => 0,
     )->pack(-fill => 'both', -expand => 1);
     
-    # Create a centered text style for table cells
-    # ItemStyle only supports: -anchor, -font, -foreground, -background
+    # Configure headers and columns with exact same widths
+    for my $i (0..$#columns) {
+        my ($col_name, $col_width) = @{$columns[$i]};
+        
+        # Center header text with padding
+        my $text_len = length($col_name);
+        my $pad = int(($col_width - $text_len) / 2);
+        $pad = 0 if $pad < 0;
+        my $centered = (' ' x $pad) . $col_name;
+        
+        # Create header
+        $self->{tree}->header('create', $i,
+            -text => $centered,
+            -headerbackground => '#3498db',
+            -borderwidth => 2,
+        );
+        
+        # Set EXACT column width - same measurement as header
+        $self->{tree}->column('width', $i, -char => $col_width);
+    }
+    
+    # Create centered text style
     $self->{centered_style} = $self->{tree}->ItemStyle('text',
         -anchor => 'center',
         -font => ['Arial', 11],
     );
-    
-    # Set column widths to EXACT pixel widths - prevents data from moving
-    for my $i (0..$#columns) {
-        my ($col_name, $pixel_width) = @{$columns[$i]};
-        # Use -width with pixels for fixed columns
-        $self->{tree}->column('width', $i, $pixel_width);
-    }
     
     # Store column definitions for later use
     
@@ -2728,7 +2601,6 @@ sub fetch_single_vm_data {
             my $memory_val = $cfg->{memory} || 0;
             $memory_val = int($memory_val) if $memory_val;
             
-            main::log_message('ERROR', "DEBUG VM $vmid: Raw memory value = $memory_val, balloon = " . ($cfg->{balloon} // 'none'));
             
             if (exists $cfg->{balloon}) {
                 my $balloon_val = int($cfg->{balloon} || $memory_val);
@@ -2739,19 +2611,16 @@ sub fetch_single_vm_data {
                     my $minmem_str = $self->format_bytes($minmem * 1024 * 1024);
                     my $maxmem_str = $self->format_bytes($maxmem * 1024 * 1024);
                     $memory = "$minmem_str-$maxmem_str";
-                    main::log_message('ERROR', "DEBUG VM $vmid: Memory formatted as $memory");
                 } else {
                     $memory = $memory_val ? $self->format_bytes($memory_val * 1024 * 1024) : 'N/A';
                 }
             } else {
                 $memory = $memory_val ? $self->format_bytes($memory_val * 1024 * 1024) : 'N/A';
-                main::log_message('ERROR', "DEBUG VM $vmid: No balloon, memory = $memory");
             }
         } else {
             my $memory_mb = int($cfg->{memory} || 0);
             my $swap_mb = int($cfg->{swap} || 0);
             
-            main::log_message('ERROR', "DEBUG CT $vmid: memory=$memory_mb MB, swap=$swap_mb MB");
             
             if ($memory_mb > 0) {
                 my $mem_str = $self->format_bytes($memory_mb * 1024 * 1024);
@@ -2764,7 +2633,6 @@ sub fetch_single_vm_data {
             } else {
                 $memory = 'N/A';
             }
-            main::log_message('ERROR', "DEBUG CT $vmid: Final memory = $memory");
         }
     };
     
@@ -2806,17 +2674,14 @@ sub fetch_single_vm_data {
     my ($free_disk, $free_pct, $total_fs) = ('N/A', 'N/A', 'N/A');
         
         if ($vm->{status} eq 'running') {
-            main::log_message('ERROR', "DEBUG $vm_type $vmid: VM is running, checking filesystem data");
             
             if ($vm_type eq 'VM') {
                 # Try guest agent first (may fail if not installed/running)
                 eval {
-                    main::log_message('ERROR', "DEBUG VM $vmid: Trying guest agent get-fsinfo");
                     my $fsinfo = $self->{api}->get("/nodes/$n/qemu/$vmid/agent/get-fsinfo");
                     
                     if ($fsinfo && $fsinfo->{result}) {
                         my @filesystems = @{$fsinfo->{result}};
-                        main::log_message('ERROR', "DEBUG VM $vmid: Guest agent returned " . scalar(@filesystems) . " filesystems");
                         
                         my %excluded_types = map { $_ => 1 } qw(iso9660 udf tmpfs devtmpfs);
                         my %included_mountpoints = map { $_ => 1 } qw(/ /boot /home /var /tmp /usr);
@@ -2838,7 +2703,6 @@ sub fetch_single_vm_data {
                                 if ($fs_total > 0) {
                                     $total_bytes_sum += $fs_total;
                                     $used_bytes_sum += $fs_used;
-                                    main::log_message('ERROR', "DEBUG VM $vmid: Added filesystem $mountpoint: total=$fs_total, used=$fs_used");
                                 }
                             }
                         }
@@ -2849,39 +2713,31 @@ sub fetch_single_vm_data {
                             if ($free_bytes >= 0) {
                                 $free_disk = $self->format_bytes($free_bytes);
                                 $free_pct = sprintf("%.1f%%", ($free_bytes / $total_bytes_sum * 100));
-                                main::log_message('ERROR', "DEBUG VM $vmid: Guest agent success - TotalFS=$total_fs, FreeDisk=$free_disk, Free%=$free_pct");
                             }
                         } else {
-                            main::log_message('ERROR', "DEBUG VM $vmid: Guest agent returned filesystems but total_bytes_sum = 0");
                         }
                     } else {
-                        main::log_message('ERROR', "DEBUG VM $vmid: Guest agent returned no result");
                     }
                 };
                 
                 if ($@) {
                     # Guest agent errors are expected when agent is not installed/running
-                    main::log_message('ERROR', "DEBUG VM $vmid: Guest agent failed - $@");
                 }
                 
                 # Fallback to status if guest agent fails or returns no data
                 if ($total_fs eq 'N/A') {
                     eval {
-                        main::log_message('ERROR', "DEBUG VM $vmid: Trying status API fallback");
                         my $stat = $self->{api}->get("/nodes/$n/qemu/$vmid/status/current");
                         
                         # Log the full status response to see what we're getting
                         if ($stat) {
-                            main::log_message('ERROR', "DEBUG VM $vmid: Status API returned - disk=" . ($stat->{disk} // 'undef') . 
                                 ", maxdisk=" . ($stat->{maxdisk} // 'undef'));
                         } else {
-                            main::log_message('ERROR', "DEBUG VM $vmid: Status API returned undef/empty");
                         }
                         
                         my $disk_used = $stat->{disk} || 0;
                         my $disk_max = $stat->{maxdisk} || 0;
                         
-                        main::log_message('ERROR', "DEBUG VM $vmid: After defaults - disk_used=$disk_used, disk_max=$disk_max");
                         
                         if ($disk_max > 0 && $disk_used >= 0) {
                             $total_fs = $self->format_bytes($disk_max);
@@ -2889,35 +2745,28 @@ sub fetch_single_vm_data {
                             if ($free_bytes >= 0) {
                                 $free_disk = $self->format_bytes($free_bytes);
                                 $free_pct = sprintf("%.1f%%", ($free_bytes / $disk_max * 100));
-                                main::log_message('ERROR', "DEBUG VM $vmid: Status API success - TotalFS=$total_fs, FreeDisk=$free_disk");
                             }
                         } else {
-                            main::log_message('ERROR', "DEBUG VM $vmid: Status API disk_max is 0, cannot calculate filesystem usage");
                         }
                     };
                     
                     if ($@) {
-                        main::log_message('ERROR', "DEBUG VM $vmid: Status API failed with error - $@");
                     }
                 }
             } else {
                 # CT - use status API
                 eval {
-                    main::log_message('ERROR', "DEBUG CT $vmid: Trying status API");
                     my $stat = $self->{api}->get("/nodes/$n/lxc/$vmid/status/current");
                     
                     # Log what we got
                     if ($stat) {
-                        main::log_message('ERROR', "DEBUG CT $vmid: Status API returned - disk=" . ($stat->{disk} // 'undef') . 
                             ", maxdisk=" . ($stat->{maxdisk} // 'undef'));
                     } else {
-                        main::log_message('ERROR', "DEBUG CT $vmid: Status API returned undef/empty");
                     }
                     
                     my $disk_used = $stat->{disk} || 0;
                     my $disk_max = $stat->{maxdisk} || 0;
                     
-                    main::log_message('ERROR', "DEBUG CT $vmid: After defaults - disk_used=$disk_used, disk_max=$disk_max");
                     
                     if ($disk_max > 0 && $disk_used >= 0) {
                         $total_fs = $self->format_bytes($disk_max);
@@ -2925,19 +2774,15 @@ sub fetch_single_vm_data {
                         if ($free_bytes >= 0) {
                             $free_disk = $self->format_bytes($free_bytes);
                             $free_pct = sprintf("%.1f%%", ($free_bytes / $disk_max * 100));
-                            main::log_message('ERROR', "DEBUG CT $vmid: Status API success - TotalFS=$total_fs, FreeDisk=$free_disk");
                         }
                     } else {
-                        main::log_message('ERROR', "DEBUG CT $vmid: Status API disk_max is 0, cannot calculate filesystem usage");
                     }
                 };
                 
                 if ($@) {
-                    main::log_message('ERROR', "DEBUG CT $vmid: Status API failed with error - $@");
                 }
             }
         } else {
-            main::log_message('ERROR', "DEBUG $vm_type $vmid: VM is stopped, skipping filesystem data");
         }
         
         # Extract sockets and CPU type safely
@@ -2967,7 +2812,6 @@ sub fetch_single_vm_data {
             free_pct => $free_pct,
         };
         
-        main::log_message('ERROR', "DEBUG $vm_type $vmid: FINAL DATA - memory=$memory, total_fs=$total_fs, free_disk=$free_disk");
         
         return $result;
 }
